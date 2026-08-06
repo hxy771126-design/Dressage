@@ -18,10 +18,12 @@ from typing import Any, Literal
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
-from transformers import AutoTokenizer
+from transformers import AutoConfig, AutoTokenizer
 
 from dressage.config import (
     DEFAULT_TOKEN_BUILD_MODEL,
+    log_dir,
+    run_name as default_run_name,
     sglang_router_url as default_sglang_router_url,
     token_build_defaults,
 )
@@ -38,6 +40,7 @@ from .last_step import (
     PromptAssistantMaskBuilder,
     create_default_mask_template_registry,
 )
+from .rebalancing import EngineRebalancer, EngineRebalancingConfig
 from .reasoning_parser import ProxyReasoningParser, canonicalize_reasoning_content
 from .session_manager import Route, Session, SessionFinalizedError, SessionManager, StepRecord
 from .sglang_client import SGLangRouterClient
@@ -562,6 +565,12 @@ def create_app(
     use_rollout_routing_replay: bool = False,
     partial_rollout: bool = False,
     max_partial_rollout_preempts: int | None = None,
+    enable_engine_rebalancing: bool = False,
+    engine_rebalancing_config: EngineRebalancingConfig | None = None,
+    engine_rebalancing_model_config: Any | None = None,
+    engine_rebalancing_calibration_benchmark: Any | None = None,
+    engine_rebalancing_snapshot_root: str | os.PathLike[str] | None = None,
+    engine_rebalancing_snapshot_run_name: str = "dressage",
 ) -> FastAPI:
     """Create the Dressage proxy FastAPI app."""
 
@@ -634,6 +643,32 @@ def create_app(
     generation_controller = GenerationController(
         sglang_client,
         partial_rollout=partial_rollout,
+    )
+    rebalancing_config = engine_rebalancing_config or EngineRebalancingConfig(
+        enabled=enable_engine_rebalancing
+    )
+    if enable_engine_rebalancing and not rebalancing_config.enabled:
+        rebalancing_config.enabled = True
+    if rebalancing_config.enabled and engine_rebalancing_model_config is None:
+        try:
+            engine_rebalancing_model_config = AutoConfig.from_pretrained(
+                tokenizer_path,
+                trust_remote_code=True,
+            )
+        except Exception:
+            logger.warning(
+                "could not load model config for engine rebalancing; Mooncake paths "
+                "will use conservative full-prefill estimates",
+                exc_info=True,
+            )
+    engine_rebalancer = EngineRebalancer(
+        sglang_client,
+        config=rebalancing_config,
+        model_id=tokenizer_path or token_build_model,
+        model_config=engine_rebalancing_model_config,
+        calibration_benchmark=engine_rebalancing_calibration_benchmark,
+        calibration_snapshot_root=engine_rebalancing_snapshot_root,
+        calibration_snapshot_run_name=engine_rebalancing_snapshot_run_name,
     )
     tito_tokenizer = None
     effective_model_mask_type = model_mask_type
@@ -791,12 +826,15 @@ def create_app(
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         try:
+            await engine_rebalancer.start()
             yield
         finally:
+            await engine_rebalancer.close()
             await generation_controller.shutdown(timeout_seconds=5.0)
             await sglang_client.close()
 
     app = FastAPI(title="Dressage Proxy", lifespan=lifespan)
+    app.state.engine_rebalancer = engine_rebalancer
 
     chat_template = getattr(tokenizer, "chat_template", None)
     chat_template_fingerprint = (
@@ -1584,6 +1622,11 @@ def create_app(
             )
             configured_max_tokens = sampling_params.get("max_new_tokens")
             max_tokens = int(configured_max_tokens or 0)
+            context_remaining_tokens = (
+                None
+                if context_window is None
+                else max(0, context_window - prompt_tokens - 1)
+            )
 
             if context_window is not None and prompt_tokens >= context_window:
                 return JSONResponse(
@@ -1643,22 +1686,47 @@ def create_app(
                 partial_rollout=partial_rollout,
             )
             try:
-                router_response = await generation_controller.generate_preemptible(
-                    input_ids=input_ids,
-                    sampling_params=sampling_params,
+                routing_lease = await engine_rebalancer.acquire(
                     session_id=session_id,
-                    instance_id=instance_id,
-                    turn_id=effective_turn_id,
-                    routing_key=session_id,
-                    expected_version=expected_version,
-                    expected_epoch=(
-                        request_rollout_epoch
-                        if (not partial_rollout and session.steps)
-                        else None
+                    input_ids=input_ids,
+                    step_max_new_tokens=(
+                        None
+                        if configured_max_tokens is None
+                        else int(sampling_params["max_new_tokens"])
                     ),
-                    logprob_start_len=request_logprob_start_len,
-                    context_window=context_window,
+                    context_remaining_tokens=context_remaining_tokens,
+                    expected_version=expected_version,
                 )
+            except RuntimeError as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail={
+                        "error": "engine_rebalancing_unavailable",
+                        "message": str(exc),
+                    },
+                ) from exc
+            try:
+                try:
+                    router_response = await generation_controller.generate_preemptible(
+                        input_ids=input_ids,
+                        sampling_params=sampling_params,
+                        session_id=session_id,
+                        instance_id=instance_id,
+                        turn_id=effective_turn_id,
+                        routing_key=session_id,
+                        worker_url=routing_lease.worker_url,
+                        expected_version=expected_version,
+                        expected_epoch=(
+                            request_rollout_epoch
+                            if (not partial_rollout and session.steps)
+                            else None
+                        ),
+                        logprob_start_len=request_logprob_start_len,
+                        context_window=context_window,
+                    )
+                except BaseException:
+                    await engine_rebalancer.fail(routing_lease)
+                    raise
             except GenerationVersionMismatch as exc:
                 raise HTTPException(
                     status_code=502,
@@ -1728,6 +1796,19 @@ def create_app(
                     status_code=503,
                     detail={"error": "sglang_upstream_unavailable", "detail": str(exc)},
                 ) from exc
+
+            try:
+                await engine_rebalancer.complete(
+                    routing_lease,
+                    response_meta=router_response.meta_info,
+                    output_tokens=len(router_response.output_ids),
+                    committed_tokens=list(router_response.all_token_ids),
+                )
+            except Exception:
+                logger.warning(
+                    "engine rebalancing observation failed; generation result is unaffected",
+                    exc_info=True,
+                )
 
             raw_text = router_response.text
             response_token_ids = router_response.output_ids
@@ -2084,7 +2165,58 @@ def create_app(
             if finalized is not session:  # defensive; request_lock owns finalize
                 raise RuntimeError("session changed during atomic finalization")
 
+            await engine_rebalancer.finalize_session(session_id)
+
         return finalization_result
+
+    @app.post("/v1/session/context")
+    async def register_session_context(request: Request):
+        _check_auth(request)
+        body = await request.json()
+        session_id = str(body.get("session_id") or "").strip()
+        if not session_id:
+            raise HTTPException(status_code=400, detail="session_id is required")
+        group_size = body.get("group_size", 1)
+        try:
+            group_size = int(group_size)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=400, detail="group_size must be an integer"
+            ) from exc
+        if group_size <= 0:
+            raise HTTPException(status_code=400, detail="group_size must be positive")
+        default_step_max_tokens = body.get("default_step_max_tokens")
+        if default_step_max_tokens is not None:
+            try:
+                default_step_max_tokens = int(default_step_max_tokens)
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail="default_step_max_tokens must be an integer",
+                ) from exc
+            if default_step_max_tokens <= 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail="default_step_max_tokens must be positive",
+                )
+        await engine_rebalancer.register_session_context(
+            session_id=session_id,
+            group_id=body.get("group_id"),
+            group_size=group_size,
+            task_key=(None if body.get("task_key") is None else str(body["task_key"])),
+            default_step_max_tokens=default_step_max_tokens,
+        )
+        return {"success": True, "session_id": session_id}
+
+    @app.get("/v1/engines/load")
+    async def engine_rebalancing_loads(request: Request):
+        _check_auth(request)
+        return await engine_rebalancer.snapshot()
+
+    @app.get("/v1/engines/calibration")
+    async def engine_rebalancing_calibration(request: Request):
+        _check_auth(request)
+        return engine_rebalancer.calibration_snapshot()
 
     @app.post("/trajectory/read")
     async def trajectory_read(request: Request):
@@ -2245,6 +2377,7 @@ def create_app(
                 "use_rollout_routing_replay": use_rollout_routing_replay,
                 "partial_rollout": partial_rollout,
                 "max_partial_rollout_preempts": max_partial_rollout_preempts,
+                "engine_rebalancing": rebalancing_config.snapshot(),
             },
         }
 
@@ -2352,6 +2485,15 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Maximum model weight version switches allowed for one partial-rollout session.",
     )
+    parser.add_argument(
+        "--enable-engine-rebalancing",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable Proxy-side SGLang engine placement and turn-boundary "
+            "rebalancing. Disabled by default."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -2384,6 +2526,13 @@ def main() -> None:
         use_rollout_routing_replay=args.use_rollout_routing_replay,
         partial_rollout=args.dressage_partial_rollout,
         max_partial_rollout_preempts=args.max_partial_rollout_preempts,
+        enable_engine_rebalancing=args.enable_engine_rebalancing,
+        engine_rebalancing_snapshot_root=(
+            log_dir() / "proxy" / "rebalancing"
+            if args.enable_engine_rebalancing
+            else None
+        ),
+        engine_rebalancing_snapshot_run_name=default_run_name(),
     )
     uvicorn.run(app, host=args.host, port=args.port)
 

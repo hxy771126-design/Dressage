@@ -1,0 +1,2515 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import httpx
+from fastapi.testclient import TestClient
+
+from dressage.proxy.rebalancing import EngineRebalancer, EngineRebalancingConfig
+from dressage.proxy.rebalancing.cache_hit_estimator import (
+    CacheHitEstimator,
+    CacheSource,
+    ContextRecoveryEstimate,
+    context_bucket,
+    longest_common_prefix_length,
+)
+from dressage.proxy.rebalancing.context_recovery_model import (
+    ContextRecoveryModel,
+    PerformanceHistory,
+)
+from dressage.proxy.rebalancing.model_cache_profile import ModelCacheProfile
+from dressage.proxy.rebalancing.scheduler import (
+    EngineDeploymentInfo,
+    GroupLengthEstimator,
+    RoutingDecision,
+    RoutingLease,
+    SessionRoutingState,
+    StepLengthEstimator,
+    sglang_rebalancing_supported,
+)
+from dressage.proxy.rebalancing.scheduler_state import (
+    CompatibilityPoolStateMachine,
+    PoolReadiness,
+    SchedulerState,
+)
+from dressage.proxy.rebalancing.snapshot_store import CalibrationSnapshotStore
+from dressage.proxy.server import create_app, parse_args
+from dressage.proxy.sglang_client import SGLangResponse, SGLangRouterClient
+from dressage.proxy.rebalancing.ray_calibration import MachineCalibrationConfig
+from dressage.proxy.rebalancing.transfer_calibrator import (
+    CalibrationPlan,
+    CalibrationSample,
+    CalibrationState,
+    CalibrationTask,
+    TransferCalibrator,
+)
+from tests.test_proxy import FakeTokenizer
+
+
+def run(coro):
+    return asyncio.run(coro)
+
+
+def simple_model_config():
+    return {
+        "hidden_size": 128,
+        "num_attention_heads": 8,
+        "num_key_value_heads": 2,
+        "num_hidden_layers": 4,
+        "torch_dtype": "bfloat16",
+    }
+
+
+class ControlPlaneClient:
+    def __init__(self, *, shared_l3: bool = False):
+        self.urls = ["http://node-a:30000", "http://node-b:30000"]
+        self.shared_l3 = shared_l3
+
+    async def list_workers(self):
+        return [
+            {"url": url, "is_healthy": True, "connection_mode": "http"}
+            for url in self.urls
+        ]
+
+    async def get_worker_loads(self, url):
+        del url
+        return {
+            "loads": [
+                {
+                    "num_running_reqs": 0,
+                    "num_waiting_reqs": 0,
+                    "num_total_tokens": 0,
+                    "max_total_num_tokens": 100_000,
+                    "max_running_requests": 100,
+                    "token_usage": 0.0,
+                }
+            ]
+        }
+
+    async def get_server_info(self, url):
+        del url
+        return {
+            "version": "0.5.15.post1",
+            "server_args": {
+                "tp_size": 1,
+                "pp_size": 1,
+                "dp_size": 1,
+                "dtype": "bfloat16",
+                "kv_cache_dtype": "bfloat16",
+                "page_size": 1,
+                "enable_hierarchical_cache": self.shared_l3,
+                "hicache_storage_backend": "mooncake" if self.shared_l3 else None,
+            },
+        }
+
+    async def get_worker_weight_version(self, url):
+        del url
+        return "7"
+
+
+class DirectGenerationClient(ControlPlaneClient):
+    def __init__(self):
+        super().__init__()
+        self.calls = []
+
+    async def generate(
+        self,
+        input_ids,
+        sampling_params,
+        *,
+        routing_key=None,
+        request_id=None,
+        logprob_start_len=0,
+        worker_url=None,
+    ):
+        self.calls.append(
+            {
+                "input_ids": list(input_ids),
+                "sampling_params": dict(sampling_params),
+                "routing_key": routing_key,
+                "request_id": request_id,
+                "worker_url": worker_url,
+            }
+        )
+        output = [ord("x")]
+        return SGLangResponse(
+            input_token_ids=list(input_ids),
+            input_token_logprobs_raw=[0.0] * len(input_ids),
+            input_token_texts=[""] * len(input_ids),
+            output_ids=output,
+            output_token_logprobs=[-0.1],
+            output_token_texts=["x"],
+            output_versions=["7"],
+            all_token_ids=list(input_ids) + output,
+            all_logprobs=[0.0] * len(input_ids) + [-0.1],
+            text="x",
+            meta_info={
+                "weight_version": "7",
+                "cached_tokens": 0,
+                "queue_time": 0.0,
+                "e2e_latency": 1.0,
+                "decode_throughput": 10.0,
+            },
+            finish_reason="stop",
+        )
+
+    async def abort_request(self, request_id, **kwargs):
+        return {"success": True, "rid": request_id, **kwargs}
+
+    async def list_models(self):
+        return {"object": "list", "data": [{"id": "model"}]}
+
+    async def close(self):
+        return None
+
+
+def test_config_derives_metrics_staleness():
+    config = EngineRebalancingConfig(load_poll_interval_ms=750)
+    assert config.metrics_stale_ms == 3_000
+
+
+def test_config_defaults_propagate_to_online_models():
+    config = EngineRebalancingConfig(enabled=True)
+    assert config.snapshot()["load_poll_interval_ms"] == 250
+    assert config.snapshot()["history_size"] == 128
+    assert config.snapshot()["min_samples"] == 16
+    assert config.snapshot()["min_hold_turns"] == 1
+    assert config.snapshot()["min_risk_ms"] == 10
+    assert config.snapshot()["cold_start_hit_probability"] == 1.0
+
+    rebalancer = EngineRebalancer(
+        ControlPlaneClient(),
+        config=config,
+        model_id="model",
+        model_config=simple_model_config(),
+    )
+    assert rebalancer.performance.min_samples == 16
+    assert rebalancer.cache_hits.min_samples == 16
+    assert rebalancer.cache_hits.cold_start_probability == 1.0
+    assert rebalancer.step_lengths.min_samples == 16
+
+
+def test_state_machine_distinguishes_bootstrap_and_degraded():
+    config = EngineRebalancingConfig(enabled=True)
+    state = CompatibilityPoolStateMachine("fp", config, now=1.0)
+    not_ready = PoolReadiness(2, True, True, False, False, 0)
+    ready = PoolReadiness(2, True, True, True, True, 1)
+
+    assert state.update(not_ready, now=2.0) is SchedulerState.BOOTSTRAP
+    assert state.update(ready, now=3.0) is SchedulerState.ACTIVE
+    assert state.update(not_ready, now=4.0) is SchedulerState.DEGRADED
+    assert state.update(ready, now=5.0) is SchedulerState.ACTIVE
+
+
+def test_model_cache_profile_uses_context_and_dtype():
+    profile = ModelCacheProfile.from_model_config(
+        simple_model_config(),
+        deployment={"kv_dtype": "bfloat16", "page_size": 16},
+    )
+    # 32 tokens * K/V * 4 layers * 2 KV heads * 16 head dim * 2 bytes.
+    assert profile.estimate_bytes(32) == 32 * 2 * 4 * 2 * 16 * 2
+    assert profile.estimate_bytes(64) == 2 * profile.estimate_bytes(32)
+
+
+def test_model_cache_profile_limits_swa_to_page_rounded_resident_window():
+    profile = ModelCacheProfile.from_model_config(
+        {
+            "hidden_size": 128,
+            "num_attention_heads": 8,
+            "num_key_value_heads": 2,
+            "num_hidden_layers": 4,
+            "layer_types": [
+                "full_attention",
+                "sliding_attention",
+                "full_attention",
+                "sliding_attention",
+            ],
+            "sliding_window": 50,
+            "torch_dtype": "bfloat16",
+        },
+        deployment={"kv_dtype": "bfloat16", "page_size": 16},
+    )
+    full = 100 * 2 * 2 * 2 * 16 * 2
+    swa = 64 * 2 * 2 * 2 * 16 * 2
+    assert profile.full_layers == 2
+    assert profile.swa_layers == 2
+    assert profile.estimate_bytes(100) == full + swa
+
+
+def test_model_cache_profile_unwraps_qwen35_text_config_and_counts_gdn_state():
+    profile = ModelCacheProfile.from_model_config(
+        {
+            "model_type": "qwen3_5",
+            "text_config": {
+                "hidden_size": 2560,
+                "num_attention_heads": 16,
+                "num_key_value_heads": 4,
+                "num_hidden_layers": 4,
+                "head_dim": 256,
+                "layer_types": [
+                    "linear_attention",
+                    "linear_attention",
+                    "linear_attention",
+                    "full_attention",
+                ],
+                "linear_conv_kernel_dim": 4,
+                "linear_key_head_dim": 128,
+                "linear_num_key_heads": 16,
+                "linear_num_value_heads": 32,
+                "linear_value_head_dim": 128,
+                "dtype": "bfloat16",
+                "mamba_ssm_dtype": "float32",
+            },
+        },
+        deployment={"kv_dtype": "bfloat16", "mamba_track_interval": 256},
+    )
+    temporal = 32 * 128 * 128 * 4
+    conv = (2 * 16 * 128 + 32 * 128) * 3 * 2
+    assert profile.full_layers == 1
+    assert profile.state_bytes_per_checkpoint == 3 * (temporal + conv)
+    assert profile.confidence == "config"
+    assert profile.estimate_bytes(1) - (2 * 1 * 4 * 256 * 2) == (
+        profile.state_bytes_per_checkpoint
+    )
+    assert profile.estimate_bytes(1024) - (1024 * 2 * 1 * 4 * 256 * 2) == (
+        profile.state_bytes_per_checkpoint
+    )
+
+
+def test_qwen35_cache_profile_regression_uses_one_tail_state_slot():
+    profile = ModelCacheProfile(
+        fingerprint="qwen35-4b",
+        full_layers=8,
+        full_kv_heads=4,
+        full_head_dim=256,
+        full_dtype_bytes=2,
+        state_bytes_per_checkpoint=51_511_296,
+        state_checkpoint_interval=256,
+    )
+    assert profile.estimate_bytes(8 * 1024) == 319_946_752
+    assert profile.estimate_bytes(56 * 1024) == 1_930_559_488
+
+
+def test_cache_hit_estimator_uses_lcp_and_cold_start():
+    estimator = CacheHitEstimator(min_samples=2, cold_start_probability=0.1)
+    assert longest_common_prefix_length([1, 2, 3], [1, 2, 9]) == 2
+    assert (
+        estimator.estimate_probability(
+            fingerprint="fp",
+            engine_url="worker",
+            cache_source=CacheSource.MOONCAKE,
+            context_tokens=100,
+        )
+        == 0.1
+    )
+    assert (
+        estimator.estimate_probability(
+            fingerprint="fp",
+            engine_url="worker",
+            cache_source=CacheSource.NONE,
+            context_tokens=100,
+        )
+        == 0.0
+    )
+    assert (
+        estimator.estimate_probability(
+            fingerprint="fp",
+            engine_url="worker",
+            cache_source=CacheSource.LOCAL,
+            context_tokens=100,
+        )
+        == 1.0
+    )
+
+
+def test_default_mooncake_prior_switches_to_observed_p25_at_16_samples():
+    config = EngineRebalancingConfig()
+    estimator = CacheHitEstimator(
+        history_size=config.history_size,
+        min_samples=config.min_samples,
+        cold_start_probability=config.cold_start_hit_probability,
+    )
+
+    def probability(source: CacheSource) -> float:
+        return estimator.estimate_probability(
+            fingerprint="fp",
+            engine_url="worker",
+            cache_source=source,
+            context_tokens=100,
+        )
+
+    assert probability(CacheSource.NONE) == 0.0
+    assert probability(CacheSource.LOCAL) == 1.0
+    assert probability(CacheSource.MOONCAKE) == 1.0
+
+    for _ in range(15):
+        estimator.observe(
+            fingerprint="fp",
+            engine_url="worker",
+            cache_source=CacheSource.MOONCAKE,
+            estimated_base_tokens=100,
+            actual_cached_tokens=50,
+            context_tokens=100,
+        )
+    assert probability(CacheSource.MOONCAKE) == 1.0
+
+    estimator.observe(
+        fingerprint="fp",
+        engine_url="worker",
+        cache_source=CacheSource.MOONCAKE,
+        estimated_base_tokens=100,
+        actual_cached_tokens=50,
+        context_tokens=100,
+    )
+    assert probability(CacheSource.MOONCAKE) == 0.5
+
+
+def test_group_remaining_length_uses_group_then_task_history():
+    estimator = GroupLengthEstimator(history_size=256, min_task_samples=3)
+    for length in (10, 20, 30):
+        estimator.observe(group_id=None, task_key="task", final_length=length)
+
+    # group_size=1 naturally uses task history; no algorithm name is involved.
+    assert (
+        estimator.remaining(
+            group_id="single",
+            task_key="task",
+            generated_tokens=5,
+        )
+        == 25
+    )
+    assert (
+        estimator.remaining(
+            group_id="new",
+            task_key="unknown",
+            generated_tokens=5,
+        )
+        is None
+    )
+
+    estimator.observe(group_id="g", task_key="task", final_length=40)
+    estimator.observe(group_id="g", task_key="task", final_length=60)
+    assert (
+        estimator.remaining(
+            group_id="g",
+            task_key="task",
+            generated_tokens=10,
+        )
+        == 50
+    )
+
+
+def test_step_length_estimator_uses_task_p75_then_pool_fallback():
+    estimator = StepLengthEstimator(history_size=8, min_samples=2)
+    estimator.observe(
+        fingerprint="fp",
+        task_key="math",
+        max_tokens=8192,
+        output_tokens=1000,
+    )
+    estimator.observe(
+        fingerprint="fp",
+        task_key="math",
+        max_tokens=8192,
+        output_tokens=2000,
+    )
+    assert estimator.p75(fingerprint="fp", task_key="math", max_tokens=8192) == 2000
+    assert estimator.p75(fingerprint="fp", task_key="other", max_tokens=8192) == 2000
+
+
+def test_old_sglang_versions_are_not_rebalancing_compatible():
+    assert not sglang_rebalancing_supported("0.5.12")
+    assert not sglang_rebalancing_supported("v0.5.15")
+    assert sglang_rebalancing_supported("0.5.15.post1")
+    assert sglang_rebalancing_supported("0.5.16")
+
+
+def test_context_model_none_is_full_prefill():
+    performance = PerformanceHistory(min_samples=1)
+    performance.observe(
+        fingerprint="fp",
+        engine_url="worker",
+        running=1,
+        context_tokens=100,
+        queue_seconds=0,
+        context_seconds=2,
+        cached_tokens=0,
+        output_tokens=1,
+        decode_throughput=10,
+    )
+    estimate = ContextRecoveryModel(performance).estimate(
+        fingerprint="fp",
+        engine_url="worker",
+        cache_source=CacheSource.NONE,
+        context_tokens=100,
+        base_tokens=80,
+        hit_probability=0.9,
+        restore_seconds=None,
+    )
+    assert estimate is not None
+    assert estimate.cache_source is CacheSource.NONE
+    assert estimate.expected_cached_tokens == 0
+    assert estimate.expected_prefill_tokens == 100
+    assert estimate.estimated_seconds == 2.0
+
+
+def test_context_model_mooncake_is_expected_restore_plus_prefill():
+    performance = PerformanceHistory(min_samples=1)
+    performance.observe(
+        fingerprint="fp",
+        engine_url="worker",
+        running=1,
+        context_tokens=100,
+        queue_seconds=0,
+        context_seconds=2,
+        cached_tokens=0,
+        output_tokens=1,
+        decode_throughput=10,
+        cache_source=CacheSource.NONE,
+    )
+    estimate = ContextRecoveryModel(performance).estimate(
+        fingerprint="fp",
+        engine_url="worker",
+        cache_source=CacheSource.MOONCAKE,
+        context_tokens=100,
+        base_tokens=80,
+        hit_probability=0.5,
+        restore_seconds=1.0,
+    )
+    assert estimate is not None
+    assert estimate.cache_source is CacheSource.MOONCAKE
+    assert estimate.expected_cached_tokens == 40
+    assert estimate.expected_prefill_tokens == 60
+    # hit: 1.0 restore + 20 / 50 prefill; miss: 100 / 50 prefill.
+    assert estimate.estimated_seconds == 1.7
+
+
+def test_missing_sglang_queue_timing_does_not_make_models_ready():
+    performance = PerformanceHistory(min_samples=1)
+    performance.observe(
+        fingerprint="fp",
+        engine_url="worker",
+        running=1,
+        context_tokens=100,
+        queue_seconds=None,
+        context_seconds=None,
+        cached_tokens=0,
+        output_tokens=1,
+        decode_throughput=10,
+        cache_source=CacheSource.NONE,
+    )
+    assert not performance.queue_ready("fp")
+    assert not performance.prefill_ready("fp")
+
+
+def test_default_queue_and_prefill_models_become_ready_at_16_samples():
+    config = EngineRebalancingConfig()
+    performance = PerformanceHistory(
+        history_size=config.history_size,
+        min_samples=config.min_samples,
+    )
+
+    def observe() -> None:
+        performance.observe(
+            fingerprint="fp",
+            engine_url="worker",
+            running=1,
+            context_tokens=100,
+            queue_seconds=0.5,
+            context_seconds=1.0,
+            cached_tokens=0,
+            output_tokens=1,
+            decode_throughput=10.0,
+            cache_source=CacheSource.NONE,
+        )
+
+    for _ in range(15):
+        observe()
+    assert not performance.queue_ready("fp")
+    assert not performance.prefill_ready("fp")
+    assert (
+        performance.queue_seconds(
+            fingerprint="fp",
+            engine_url="worker",
+            projected_running=1,
+        )
+        is None
+    )
+    assert (
+        performance.prefill_throughput(
+            fingerprint="fp",
+            engine_url="worker",
+            context_tokens=100,
+        )
+        is None
+    )
+
+    observe()
+    assert performance.queue_ready("fp")
+    assert performance.prefill_ready("fp")
+    assert (
+        performance.queue_seconds(
+            fingerprint="fp",
+            engine_url="worker",
+            projected_running=1,
+        )
+        == 0.5
+    )
+    assert (
+        performance.prefill_throughput(
+            fingerprint="fp",
+            engine_url="worker",
+            context_tokens=100,
+        )
+        == 100.0
+    )
+
+
+def test_queue_prediction_error_uses_p90_and_homogeneous_pool_fallback():
+    history = PerformanceHistory(history_size=8, min_samples=2)
+    for actual, predicted in ((1.0, 0.0), (5.0, 1.0)):
+        history.observe(
+            fingerprint="fp",
+            engine_url="engine-a",
+            running=3,
+            projected_load_score=0.6,
+            context_tokens=100,
+            queue_seconds=actual,
+            predicted_queue_seconds=predicted,
+            context_seconds=1.0,
+            cached_tokens=0,
+            output_tokens=1,
+            decode_throughput=10,
+        )
+
+    # P90 of the two absolute errors (1s and 4s) is 4s. Engine B has no
+    # samples of its own, so it uses the compatible-pool history.
+    assert (
+        history.queue_risk_seconds(
+            fingerprint="fp",
+            engine_url="engine-a",
+            projected_running=3,
+            projected_load_score=0.6,
+        )
+        == 4.0
+    )
+    assert (
+        history.queue_risk_seconds(
+            fingerprint="fp",
+            engine_url="engine-b",
+            projected_running=3,
+            projected_load_score=0.6,
+        )
+        == 4.0
+    )
+
+    samples_before = history.snapshot()["queue_error_samples"]
+    history.observe(
+        fingerprint="fp",
+        engine_url="engine-a",
+        running=3,
+        projected_load_score=0.6,
+        context_tokens=100,
+        queue_seconds=2.0,
+        predicted_queue_seconds=None,
+        context_seconds=1.0,
+        cached_tokens=0,
+        output_tokens=1,
+        decode_throughput=10,
+    )
+    assert history.snapshot()["queue_error_samples"] == samples_before
+
+
+def test_context_prediction_risk_waits_for_minimum_samples():
+    history = PerformanceHistory(history_size=8, min_samples=2)
+    history.observe(
+        fingerprint="fp",
+        engine_url="engine-a",
+        running=1,
+        context_tokens=100,
+        queue_seconds=0.0,
+        context_seconds=1.0,
+        cached_tokens=0,
+        output_tokens=1,
+        decode_throughput=10,
+        estimated_context_seconds=3.0,
+        cache_source=CacheSource.NONE,
+    )
+    assert (
+        history.risk_seconds(
+            fingerprint="fp",
+            source=CacheSource.NONE,
+            context_tokens=100,
+            minimum_seconds=0.0,
+        )
+        == 0.0
+    )
+
+    history.observe(
+        fingerprint="fp",
+        engine_url="engine-a",
+        running=1,
+        context_tokens=100,
+        queue_seconds=0.0,
+        context_seconds=1.0,
+        cached_tokens=0,
+        output_tokens=1,
+        decode_throughput=10,
+        estimated_context_seconds=4.0,
+        cache_source=CacheSource.NONE,
+    )
+    assert (
+        history.risk_seconds(
+            fingerprint="fp",
+            source=CacheSource.NONE,
+            context_tokens=100,
+            minimum_seconds=0.0,
+        )
+        == 3.0
+    )
+
+
+def test_tpot_history_is_partitioned_by_engine_load_bucket():
+    history = PerformanceHistory(history_size=8, min_samples=1)
+    for engine, running, throughput in (("a", 1, 10.0), ("b", 8, 5.0)):
+        history.observe(
+            fingerprint="fp",
+            engine_url=engine,
+            running=running,
+            context_tokens=100,
+            queue_seconds=0.0,
+            context_seconds=1.0,
+            cached_tokens=0,
+            output_tokens=10,
+            decode_throughput=throughput,
+        )
+    assert (
+        history.tpot_seconds(
+            fingerprint="fp",
+            engine_url="a",
+            projected_running=1,
+        )
+        == 0.1
+    )
+    assert (
+        history.tpot_seconds(
+            fingerprint="fp",
+            engine_url="b",
+            projected_running=8,
+        )
+        == 0.2
+    )
+
+
+def test_calibration_plan_skips_mooncake_without_l3():
+    client = ControlPlaneClient(shared_l3=False)
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(enabled=True, min_samples=1),
+        model_id="model",
+        model_config=simple_model_config(),
+    )
+    run(rebalancer.refresh())
+    fingerprint = next(iter(rebalancer.profiles))
+    plan = rebalancer.plans[fingerprint]
+    assert plan.tasks == ()
+    assert plan.skipped_links["mooncake"] == "L3 disabled"
+
+
+def test_calibration_plan_matches_host_tcp_rdma_and_gpudirect_paths():
+    class Slot:
+        def __init__(self, node_id, protocol):
+            self.node_id = node_id
+            self.mooncake_protocol = protocol
+
+    profile = ModelCacheProfile(
+        fingerprint="profile",
+        full_layers=1,
+        full_kv_heads=1,
+        full_head_dim=1,
+        full_dtype_bytes=2,
+    )
+    single = CalibrationPlan.build(
+        fingerprint="single",
+        engine_deployments=[Slot("a", "tcp")],
+        shared_l3=True,
+        host_staging=True,
+        gpudirect=False,
+        model_cache_profile=profile,
+    )
+    assert single.tasks == ()
+    assert single.skipped_links["migration"] == "single-engine deployment"
+
+    tcp_slots = [Slot("a", "tcp"), Slot("b", "tcp")]
+    host_plan = CalibrationPlan.build(
+        fingerprint="host",
+        engine_deployments=tcp_slots,
+        shared_l3=True,
+        host_staging=True,
+        gpudirect=False,
+        model_cache_profile=profile,
+    )
+    host_links = {task.link_type for task in host_plan.tasks}
+    assert host_links == {"mooncake_local", "mooncake_tcp", "d2h", "h2d"}
+
+    rdma_plan = CalibrationPlan.build(
+        fingerprint="rdma",
+        engine_deployments=[Slot("a", "rdma"), Slot("b", "rdma")],
+        shared_l3=True,
+        host_staging=True,
+        gpudirect=False,
+        model_cache_profile=profile,
+    )
+    assert "mooncake_rdma" in {task.link_type for task in rdma_plan.tasks}
+
+    gpudirect_plan = CalibrationPlan.build(
+        fingerprint="gpudirect",
+        engine_deployments=[Slot("a", "rdma"), Slot("a", "rdma")],
+        shared_l3=True,
+        host_staging=False,
+        gpudirect=True,
+        model_cache_profile=profile,
+    )
+    assert {task.link_type for task in gpudirect_plan.tasks} == {"mooncake_gpudirect"}
+    assert gpudirect_plan.skipped_links["h2d"] == "GPUDirect restore path"
+
+
+def test_transfer_estimate_uses_complete_p75_without_bandwidth_double_count():
+    calibrator = TransferCalibrator()
+    for payload, elapsed in ((100, 1.0), (200, 3.0)):
+        calibrator.observe(
+            source_node="a",
+            target_node="b",
+            link_type="mooncake_tcp",
+            payload_bytes=payload,
+            elapsed_seconds_p75=elapsed,
+            bandwidth_bytes_per_second_p25=1.0,
+        )
+    # 150 bytes uses the 200-byte upper bucket. A nearest lower bucket plus
+    # bytes/BW would produce a much larger and incorrect value.
+    assert (
+        calibrator.estimate(
+            source_node="a",
+            target_node="b",
+            required_links=("mooncake_tcp",),
+            payload_bytes=150,
+        )
+        == 3.0
+    )
+    assert (
+        calibrator.estimate(
+            source_node="a",
+            target_node="b",
+            required_links=("mooncake_tcp",),
+            payload_bytes=400,
+        )
+        == 6.0
+    )
+
+
+def test_calibration_releases_task_buffers_after_sample_failures():
+    class FailingBenchmark:
+        def __init__(self):
+            self.finished = []
+
+        async def __call__(self, task, payload):
+            del task, payload
+            raise TimeoutError("sample timed out")
+
+        async def finish_task(self, task):
+            self.finished.append(task)
+
+    task = CalibrationTask("a", "b", "mooncake_tcp", (100,))
+    plan = CalibrationPlan("plan", (task,), {})
+    benchmark = FailingBenchmark()
+    calibrator = TransferCalibrator()
+    run(calibrator.execute(plan, benchmark))
+    assert benchmark.finished == [task]
+    assert calibrator.plan_complete(plan) is False
+
+
+def test_machine_calibration_config_rejects_unknown_protocol():
+    try:
+        MachineCalibrationConfig.from_mapping(
+            {
+                "schema_version": 1,
+                "ray_address": "auto",
+                "hicache": {
+                    "enabled": True,
+                    "storage_backend": "mooncake",
+                    "write_policy": "write_through",
+                },
+                "mooncake": {
+                    "protocol": "mystery",
+                    "metadata_server": "metadata",
+                },
+            }
+        )
+    except ValueError as exc:
+        assert "protocol" in str(exc)
+    else:  # pragma: no cover - assertion guard
+        raise AssertionError("unknown Mooncake protocol was accepted")
+
+
+def test_machine_path_fingerprint_tracks_topology_but_not_model_version():
+    base = {
+        "schema_version": 1,
+        "ray_address": "auto",
+        "nodes": [
+            {
+                "node_id": "node-a",
+                "gpu_count": 2,
+                "gpu_ids": [0, 1],
+                "numa_node": "0",
+                "nic": "eth0",
+            }
+        ],
+        "hicache": {
+            "enabled": True,
+            "storage_backend": "mooncake",
+            "write_policy": "write_through",
+        },
+        "mooncake": {
+            "protocol": "tcp",
+            "metadata_server": "metadata",
+        },
+    }
+    first = MachineCalibrationConfig.from_mapping(
+        {**base, "model_deployment": {"weight_version": "one"}}
+    )
+    second = MachineCalibrationConfig.from_mapping(
+        {**base, "model_deployment": {"weight_version": "two"}}
+    )
+    discovered = [
+        {
+            "node_id": "ray-a",
+            "address": "node-a",
+            "gpu_count": 2,
+            "hardware": [
+                {
+                    "gpu_uuid": "gpu-0",
+                    "numa_node": "0",
+                    "cuda_version": "13.0",
+                    "driver_version": "999",
+                    "mooncake_version": "1.0",
+                }
+            ],
+        }
+    ]
+    assert first.nodes[0].gpu_ids == (0, 1)
+    assert first.buffer_registration_mode == "host_pinned"
+    assert first.fingerprint(discovered) == second.fingerprint(discovered)
+
+
+def test_single_node_loopback_engine_maps_to_routable_calibration_node():
+    rebalancer = EngineRebalancer(
+        ControlPlaneClient(),
+        config=EngineRebalancingConfig(enabled=True),
+        model_id="model",
+        model_config=simple_model_config(),
+    )
+    deployment = EngineDeploymentInfo.from_worker(
+        worker_url="http://127.0.0.1:30000",
+        server_info={"version": "0.5.15.post1", "server_args": {}},
+        weight_version="1",
+        model_id="model",
+    )
+    rebalancer._preflight_node_addresses = {"10.0.0.7"}
+    rebalancer._preflight_node_ids = {"ray-node", "10.0.0.7"}
+    rebalancer._preflight_node_aliases = {
+        "ray-node": "10.0.0.7",
+        "10.0.0.7": "10.0.0.7",
+    }
+    assert rebalancer._calibration_node_for(deployment) == "10.0.0.7"
+
+
+def test_remote_context_risk_switches_from_transport_margin_to_path_error_p90():
+    rebalancer = EngineRebalancer(
+        ControlPlaneClient(),
+        config=EngineRebalancingConfig(enabled=True, min_samples=2),
+        model_id="model",
+        model_config=simple_model_config(),
+    )
+    estimate = ContextRecoveryEstimate(
+        cache_source=CacheSource.MOONCAKE,
+        expected_cached_tokens=100,
+        expected_prefill_tokens=0,
+        estimated_seconds=4.0,
+        hit_probability=1.0,
+        restore_seconds=4.0,
+        restore_sample_source="offline",
+    )
+    assert (
+        rebalancer._context_prediction_risk(
+            fingerprint="fp",
+            source_engine="a",
+            target_engine="b",
+            estimate=estimate,
+            context_tokens=100,
+        )
+        == 0.2
+    )
+    rebalancer._runtime_restore_errors[("fp", "a", "b", context_bucket(100))].extend(
+        [0.2, 0.3]
+    )
+    assert (
+        rebalancer._context_prediction_risk(
+            fingerprint="fp",
+            source_engine="a",
+            target_engine="b",
+            estimate=estimate,
+            context_tokens=100,
+        )
+        == 0.3
+    )
+
+
+def test_default_runtime_restore_model_becomes_ready_at_16_samples():
+    rebalancer = EngineRebalancer(
+        ControlPlaneClient(),
+        config=EngineRebalancingConfig(enabled=True),
+        model_id="model",
+        model_config=simple_model_config(),
+    )
+    key = ("fp", "source", "target", context_bucket(100))
+    rebalancer._runtime_restore_seconds[key].extend([0.5] * 15)
+    result = rebalancer._runtime_calibration_snapshot()["results"][0]
+    assert result["restore_sample_count"] == 15
+    assert result["model_ready"] is False
+    assert result["effective_source"] == "offline"
+
+    rebalancer._runtime_restore_seconds[key].append(0.5)
+    result = rebalancer._runtime_calibration_snapshot()["results"][0]
+    assert result["restore_sample_count"] == 16
+    assert result["model_ready"] is True
+    assert result["effective_source"] == "runtime"
+
+
+def test_shared_l3_calibration_plan_executes_required_restore_links():
+    client = ControlPlaneClient(shared_l3=True)
+
+    async def benchmark(task, payload):
+        del task
+        return CalibrationSample(
+            latency_seconds=0.01,
+            bandwidth_bytes_per_second=max(1, payload * 10),
+        )
+
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(enabled=True, min_samples=1),
+        model_id="model",
+        model_config=simple_model_config(),
+        calibration_benchmark=benchmark,
+    )
+    run(rebalancer.refresh())
+    fingerprint = next(iter(rebalancer.profiles))
+    plan = rebalancer.plans[fingerprint]
+    assert {task.link_type for task in plan.tasks} == {
+        "mooncake_local",
+        "mooncake_remote",
+        "d2h",
+        "h2d",
+    }
+    assert rebalancer.calibrator.plan_complete(plan)
+    readiness = rebalancer._path_readiness(client.urls[0], client.urls[1])
+    assert "h2d" in readiness.required_links
+    assert "d2h" not in readiness.required_links
+
+
+def test_missing_l3_calibration_falls_back_to_full_prefill_without_blocking_pool():
+    client = ControlPlaneClient(shared_l3=True)
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(enabled=True, min_samples=1),
+        model_id="model",
+        model_config=simple_model_config(),
+    )
+
+    async def scenario():
+        await rebalancer.refresh()
+        source, target = client.urls
+        fingerprint = rebalancer.deployments[source].cache_fingerprint
+        for url in client.urls:
+            rebalancer.performance.observe(
+                fingerprint=fingerprint,
+                engine_url=url,
+                running=1,
+                context_tokens=8 * 1024,
+                queue_seconds=0.0,
+                context_seconds=1.0,
+                cached_tokens=0,
+                output_tokens=1,
+                decode_throughput=10.0,
+                cache_source=CacheSource.NONE,
+            )
+        readiness = rebalancer._path_readiness(source, target)
+        assert readiness.ready is True
+        assert readiness.cache_source is CacheSource.NONE
+        assert "full prefill" in readiness.skipped_links["fallback"]
+        pool = rebalancer._pool_readiness(fingerprint, now=time.monotonic())
+        assert pool.ready is True
+
+    run(scenario())
+
+
+def test_machine_calibration_finishes_before_router_discovery(monkeypatch):
+    class CountingRouterClient:
+        def __init__(self):
+            self.list_workers_calls = 0
+
+        async def list_workers(self):
+            self.list_workers_calls += 1
+            return []
+
+    client = CountingRouterClient()
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(enabled=True),
+        model_id="model",
+        model_config=simple_model_config(),
+    )
+    calibration_gate = asyncio.Event()
+
+    async def blocked_calibration():
+        await calibration_gate.wait()
+        rebalancer.calibrator.transition(
+            CalibrationState.DEGRADED,
+            "test calibration complete",
+        )
+
+    monkeypatch.setattr(
+        rebalancer,
+        "_run_machine_preflight_impl",
+        blocked_calibration,
+    )
+
+    async def scenario():
+        await rebalancer.start()
+        await asyncio.sleep(0)
+        assert rebalancer._poll_task is None
+        await rebalancer.refresh()
+        assert client.list_workers_calls == 0
+
+        calibration_gate.set()
+        assert rebalancer._calibration_task is not None
+        await rebalancer._calibration_task
+        assert rebalancer._poll_task is not None
+        assert client.list_workers_calls == 0
+        await rebalancer.close()
+
+    run(scenario())
+
+
+def test_initial_snapshot_finishes_before_router_poll_starts(monkeypatch, tmp_path):
+    rebalancer = EngineRebalancer(
+        ControlPlaneClient(),
+        config=EngineRebalancingConfig(enabled=True),
+        model_id="model",
+        model_config=simple_model_config(),
+        calibration_snapshot_root=tmp_path,
+        calibration_snapshot_run_name="startup-order",
+    )
+    rebalancer.machine_calibration_config = None
+    write_started = asyncio.Event()
+    allow_write = asyncio.Event()
+    original_write = rebalancer._snapshot_store.write
+
+    async def delayed_write(**kwargs):
+        if kwargs["kind"] == "initial":
+            write_started.set()
+            await allow_write.wait()
+        return await original_write(**kwargs)
+
+    monkeypatch.setattr(rebalancer._snapshot_store, "write", delayed_write)
+
+    async def scenario():
+        await rebalancer.start()
+        await write_started.wait()
+        assert rebalancer._poll_task is None
+
+        allow_write.set()
+        assert rebalancer._calibration_task is not None
+        await rebalancer._calibration_task
+        assert (rebalancer._snapshot_store.directory / "initial.json").is_file()
+        assert rebalancer._poll_task is not None
+        await rebalancer.close()
+
+    run(scenario())
+
+
+def test_router_waiting_backoff_and_runtime_outage_logging(caplog, monkeypatch):
+    class FlakyRouterClient:
+        def __init__(self):
+            self.responses = [
+                "startup_failure",
+                "startup_failure",
+                "startup_failure",
+                "startup_failure",
+                "success",
+                "outage_failure",
+                "outage_failure",
+                "success",
+                "final_outage",
+            ]
+            self.rebalancer = None
+
+        async def list_workers(self):
+            response = self.responses.pop(0)
+            if response == "success":
+                return []
+            if response == "final_outage":
+                self.rebalancer._stopping = True
+            raise httpx.ConnectError(response)
+
+    client = FlakyRouterClient()
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(enabled=True),
+        model_id="model",
+        model_config=simple_model_config(),
+    )
+    client.rebalancer = rebalancer
+    delays = []
+    real_sleep = asyncio.sleep
+
+    async def capture_sleep(delay):
+        delays.append(delay)
+        await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", capture_sleep)
+
+    with caplog.at_level(
+        logging.DEBUG,
+        logger="dressage.proxy.rebalancing.scheduler",
+    ):
+        run(rebalancer._poll_loop())
+
+    waiting_records = [
+        record
+        for record in caplog.records
+        if "waiting_for_router" in record.getMessage()
+    ]
+    assert delays[:5] == [0.25, 1.0, 2.0, 5.0, 5.0]
+    assert all(delay == 0.25 for delay in delays[5:])
+    assert sum(record.levelno == logging.INFO for record in waiting_records) == 1
+    assert not any(record.levelno >= logging.WARNING for record in waiting_records)
+    assert all(record.exc_info is None for record in waiting_records)
+
+    outage_warnings = [
+        record
+        for record in caplog.records
+        if record.levelno == logging.WARNING
+        and "Router became unavailable" in record.getMessage()
+    ]
+    assert len(outage_warnings) == 2
+    assert all(record.exc_info is None for record in outage_warnings)
+    assert (
+        sum(
+            "Router connection recovered" in record.getMessage()
+            for record in caplog.records
+        )
+        == 1
+    )
+
+
+def test_runtime_calibration_reports_percentiles_and_source_threshold():
+    rebalancer = EngineRebalancer(
+        ControlPlaneClient(),
+        config=EngineRebalancingConfig(enabled=True, min_samples=3),
+        model_id="model",
+        model_config=simple_model_config(),
+    )
+    ready_key = ("fp", "source", "target", "8K-16K")
+    rebalancer._runtime_restore_seconds[ready_key].extend([1.0, 2.0, 3.0])
+    rebalancer._runtime_restore_throughputs[ready_key].extend([100.0, 200.0, 300.0])
+    rebalancer._runtime_restore_errors[ready_key].extend([0.1, 0.2, 0.3])
+    cold_key = ("fp", "source", "cold-target", "8K-16K")
+    rebalancer._runtime_restore_seconds[cold_key].extend([4.0, 5.0])
+
+    results = {
+        (item["source_engine"], item["target_engine"]): item
+        for item in rebalancer._runtime_calibration_snapshot()["results"]
+    }
+    ready = results[("source", "target")]
+    assert ready["restore_sample_count"] == 3
+    assert ready["restore_seconds_p75"] == 3.0
+    assert ready["restore_throughput_bytes_per_second_p25"] == 100.0
+    assert ready["prediction_error_seconds_p90"] == 0.3
+    assert ready["model_ready"] is True
+    assert ready["effective_source"] == "runtime"
+    assert results[("source", "cold-target")]["effective_source"] == "offline"
+
+
+def test_calibration_snapshots_are_atomic_periodic_and_final(tmp_path):
+    rebalancer = EngineRebalancer(
+        ControlPlaneClient(),
+        config=EngineRebalancingConfig(enabled=True, min_samples=3),
+        model_id="model",
+        model_config=simple_model_config(),
+        calibration_snapshot_root=tmp_path,
+        calibration_snapshot_run_name="snapshot-test",
+    )
+    rebalancer.machine_calibration_config = None
+
+    async def scenario():
+        await rebalancer.start()
+        assert rebalancer._calibration_task is not None
+        await rebalancer._calibration_task
+        await rebalancer._drain_snapshot_tasks()
+        directory = rebalancer._snapshot_store.directory
+        assert (directory / "initial.json").is_file()
+        runtime_key = ("fp", "source", "target", "8K-16K")
+        rebalancer._runtime_restore_seconds[runtime_key].extend([1.0, 2.0, 3.0])
+        rebalancer._runtime_restore_throughputs[runtime_key].extend(
+            [100.0, 200.0, 300.0]
+        )
+        rebalancer._runtime_restore_errors[runtime_key].extend([0.1, 0.2, 0.3])
+
+        for _ in range(127):
+            rebalancer._record_successful_online_request()
+        await rebalancer._drain_snapshot_tasks()
+        assert not (directory / "request-000000127.json").exists()
+        assert not (directory / "request-000000128.json").exists()
+
+        failed = RoutingLease(
+            decision=RoutingDecision(
+                session_id="failed",
+                source_worker_url=None,
+                target_worker_url="worker",
+                cache_fingerprint=None,
+                state=SchedulerState.BOOTSTRAP,
+                reason="test",
+            ),
+            worker_url="worker",
+            reserved_tokens=1,
+            base_tokens=0,
+            started_monotonic=time.monotonic(),
+        )
+        await rebalancer.fail(failed)
+        assert rebalancer._online_request_count == 127
+
+        rebalancer._record_successful_online_request()
+        await rebalancer._drain_snapshot_tasks()
+        periodic = directory / "request-000000128.json"
+        assert periodic.is_file()
+        runtime_result = json.loads(periodic.read_text(encoding="utf-8"))[
+            "runtime_calibration"
+        ]["results"][0]
+        assert runtime_result["restore_seconds_p75"] == 3.0
+        assert runtime_result["restore_throughput_bytes_per_second_p25"] == 100.0
+        assert runtime_result["prediction_error_seconds_p90"] == 0.3
+        assert runtime_result["effective_source"] == "runtime"
+        for _ in range(128):
+            rebalancer._record_successful_online_request()
+        await rebalancer._drain_snapshot_tasks()
+        second_periodic = directory / "request-000000256.json"
+        assert second_periodic.is_file()
+        assert periodic.is_file()
+
+        await rebalancer.close()
+        final = directory / "final.json"
+        assert final.is_file()
+        for path, expected_kind in (
+            (directory / "initial.json", "initial"),
+            (periodic, "periodic"),
+            (second_periodic, "periodic"),
+            (final, "final"),
+        ):
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            assert set(payload) == {
+                "snapshot_type",
+                "snapshot_time",
+                "online_request_count",
+                "offline_calibration",
+                "runtime_calibration",
+            }
+            assert payload["snapshot_type"] == expected_kind
+            assert "results" in payload["offline_calibration"]
+            assert "results" in payload["runtime_calibration"]
+        assert json.loads(final.read_text())["online_request_count"] == 256
+        assert not list(directory.glob(".*.tmp"))
+
+    run(scenario())
+
+    first = CalibrationSnapshotStore(
+        root=tmp_path,
+        run_name="snapshot-test",
+        started_at=1.0,
+        pid=1,
+    )
+    second = CalibrationSnapshotStore(
+        root=tmp_path,
+        run_name="snapshot-test",
+        started_at=2.0,
+        pid=1,
+    )
+    assert first.directory != second.directory
+
+
+def test_ray_preflight_state_is_independent_and_releases_backend(monkeypatch, tmp_path):
+    config_path = tmp_path / "deployment.json"
+    config_path.write_text(
+        __import__("json").dumps(
+            {
+                "schema_version": 1,
+                "ray_address": "auto",
+                "nodes": [{"node_id": "node-a", "gpu_count": 2}],
+                "hicache": {
+                    "enabled": True,
+                    "storage_backend": "mooncake",
+                    "write_policy": "write_through",
+                },
+                "mooncake": {
+                    "protocol": "tcp",
+                    "metadata_server": "metadata",
+                },
+                "model_deployment": {"kv_dtype": "bfloat16"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(
+        "DRESSAGE_ENGINE_REBALANCING_DEPLOYMENT_CONFIG", str(config_path)
+    )
+
+    class Slot:
+        node_id = "node-a"
+        mooncake_protocol = "tcp"
+
+    holder = {}
+
+    class FakeRayBenchmark:
+        instances = []
+        resources_recovered = True
+
+        def __init__(self, config):
+            self.config = config
+            self.closed = False
+            self.state_seen_on_close = None
+            self.instances.append(self)
+
+        async def connect(self):
+            return [
+                {
+                    "node_id": "ray-node-a",
+                    "address": "node-a",
+                    "gpu_count": 2,
+                    "resources": {"GPU": 2},
+                    "hardware": {"gpu_name": "fake"},
+                }
+            ]
+
+        def planned_engine_slots(self):
+            return [Slot(), Slot()]
+
+        async def __call__(self, task, payload):
+            del task
+            return CalibrationSample(
+                elapsed_seconds_p75=0.01,
+                bandwidth_bytes_per_second_p25=payload / 0.01,
+                payload_bytes=payload,
+            )
+
+        async def close(self):
+            self.state_seen_on_close = holder["rebalancer"].calibrator.state
+            self.closed = True
+            return self.resources_recovered
+
+    monkeypatch.setattr(
+        "dressage.proxy.rebalancing.scheduler.RayTransferBenchmark",
+        FakeRayBenchmark,
+    )
+    rebalancer = EngineRebalancer(
+        ControlPlaneClient(shared_l3=True),
+        config=EngineRebalancingConfig(enabled=True, min_samples=1),
+        model_id="model",
+        model_config=simple_model_config(),
+    )
+    holder["rebalancer"] = rebalancer
+
+    async def scenario():
+        await rebalancer.start()
+        assert rebalancer._calibration_task is not None
+        await rebalancer._calibration_task
+        assert rebalancer.calibrator.state is CalibrationState.READY
+        plan_snapshot = rebalancer.calibration_snapshot()["plan"]
+        assert plan_snapshot["complete"] is True
+        assert plan_snapshot["pending_links"] == []
+        assert plan_snapshot["completed_links"]
+        assert all(task["path_fingerprint"] for task in plan_snapshot["tasks"])
+        assert FakeRayBenchmark.instances[0].closed is True
+        assert (
+            FakeRayBenchmark.instances[0].state_seen_on_close
+            is CalibrationState.RUNNING
+        )
+        await rebalancer.close()
+
+    run(scenario())
+
+    FakeRayBenchmark.resources_recovered = False
+    degraded = EngineRebalancer(
+        ControlPlaneClient(shared_l3=True),
+        config=EngineRebalancingConfig(enabled=True, min_samples=1),
+        model_id="model",
+        model_config=simple_model_config(),
+    )
+    holder["rebalancer"] = degraded
+
+    async def degraded_scenario():
+        await degraded.start()
+        assert degraded._calibration_task is not None
+        await degraded._calibration_task
+        assert degraded.calibrator.state is CalibrationState.DEGRADED
+        assert "GPU resources" in degraded.calibrator.state_reason
+        await degraded.close()
+
+    run(degraded_scenario())
+
+
+def test_reservations_spread_simultaneous_new_sessions():
+    client = ControlPlaneClient()
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(enabled=True, min_samples=1),
+        model_id="model",
+        model_config=simple_model_config(),
+    )
+
+    async def scenario():
+        await rebalancer.refresh()
+        first = await rebalancer.acquire(session_id="a", input_ids=[1] * 100)
+        second = await rebalancer.acquire(session_id="b", input_ids=[1] * 100)
+        try:
+            assert first.worker_url != second.worker_url
+            assert first.decision.reason == "new_session_projected_load_fallback"
+            assert second.decision.reason == "new_session_projected_load_fallback"
+        finally:
+            await rebalancer.fail(first)
+            await rebalancer.fail(second)
+
+    run(scenario())
+
+
+def test_new_session_scores_every_engine_with_full_prefill_and_no_restore():
+    client = ControlPlaneClient()
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(enabled=True, min_samples=1),
+        model_id="model",
+        model_config=simple_model_config(),
+    )
+
+    async def scenario():
+        await rebalancer.refresh()
+        slower_queue, faster_queue = client.urls
+        fingerprint = rebalancer.deployments[slower_queue].cache_fingerprint
+        for url, queue_seconds in ((slower_queue, 3.0), (faster_queue, 0.0)):
+            rebalancer.performance.observe(
+                fingerprint=fingerprint,
+                engine_url=url,
+                running=1,
+                context_tokens=100,
+                queue_seconds=queue_seconds,
+                context_seconds=2.0,
+                cached_tokens=0,
+                output_tokens=10,
+                decode_throughput=10.0,
+                cache_source=CacheSource.NONE,
+            )
+
+        lease = await rebalancer.acquire(
+            session_id="new-full-prefill",
+            input_ids=[1] * 100,
+            step_max_new_tokens=10,
+        )
+        try:
+            assert lease.worker_url == faster_queue
+            assert lease.base_tokens == 0
+            assert lease.decision.reason == "new_session_estimated_completion"
+            assert lease.decision.source_worker_url is None
+            assert lease.decision.moved is False
+            assert lease.decision.target_context is not None
+            assert lease.decision.target_context.cache_source is CacheSource.NONE
+            assert lease.decision.target_context.expected_cached_tokens == 0
+            assert lease.decision.target_context.expected_prefill_tokens == 100
+            assert lease.decision.target_context.restore_seconds == 0.0
+            assert lease.decision.target_context.hit_probability == 0.0
+        finally:
+            await rebalancer.fail(lease)
+
+    run(scenario())
+
+
+def test_new_session_uses_engine_specific_full_prefill_time():
+    client = ControlPlaneClient()
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(enabled=True, min_samples=1),
+        model_id="model",
+        model_config=simple_model_config(),
+    )
+
+    async def scenario():
+        await rebalancer.refresh()
+        slow_prefill, fast_prefill = client.urls
+        fingerprint = rebalancer.deployments[slow_prefill].cache_fingerprint
+        for url, queue_seconds, context_seconds in (
+            (slow_prefill, 0.0, 4.0),
+            (fast_prefill, 0.4, 1.0),
+        ):
+            rebalancer.performance.observe(
+                fingerprint=fingerprint,
+                engine_url=url,
+                running=1,
+                context_tokens=100,
+                queue_seconds=queue_seconds,
+                context_seconds=context_seconds,
+                cached_tokens=0,
+                output_tokens=10,
+                decode_throughput=10.0,
+                cache_source=CacheSource.NONE,
+            )
+        # Make the faster-prefill Engine lose the projected-load fallback. The
+        # unified seconds model must still choose it: 0.4s queue + 1s prefill is
+        # less than 0s queue + 4s prefill.
+        rebalancer.loads[fast_prefill].queued = 1
+
+        lease = await rebalancer.acquire(
+            session_id="new-prefill-throughput",
+            input_ids=[1] * 100,
+            step_max_new_tokens=10,
+        )
+        try:
+            assert lease.worker_url == fast_prefill
+            assert lease.decision.reason == "new_session_estimated_completion"
+            assert lease.decision.target_context is not None
+            assert lease.decision.target_context.estimated_seconds == 1.0
+            assert lease.decision.target_context.expected_prefill_tokens == 100
+        finally:
+            await rebalancer.fail(lease)
+
+    run(scenario())
+
+
+def test_step_budget_prefers_request_and_rollout_caps_before_context():
+    client = ControlPlaneClient()
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(enabled=True, min_samples=32),
+        model_id="model",
+        model_config=simple_model_config(),
+    )
+
+    async def scenario():
+        await rebalancer.refresh()
+        await rebalancer.register_session_context(
+            session_id="rollout-cap",
+            group_id=None,
+            group_size=1,
+            task_key="task",
+            default_step_max_tokens=8192,
+        )
+        rollout_limited = await rebalancer.acquire(
+            session_id="rollout-cap",
+            input_ids=[1] * 100,
+            context_remaining_tokens=56 * 1024,
+        )
+        try:
+            assert rollout_limited.decision.effective_step_max_tokens == 8192
+            assert rollout_limited.decision.estimated_step_output_tokens == 8192
+            assert rollout_limited.expected_output_tokens == 8192
+            assert rollout_limited.reserved_tokens == 8292
+            assert "rollout" in rollout_limited.decision.step_max_tokens_source
+        finally:
+            await rebalancer.fail(rollout_limited)
+
+        await rebalancer.register_session_context(
+            session_id="request-cap",
+            group_id=None,
+            group_size=1,
+            task_key="task",
+            default_step_max_tokens=8192,
+        )
+        request_limited = await rebalancer.acquire(
+            session_id="request-cap",
+            input_ids=[1] * 100,
+            step_max_new_tokens=2048,
+            context_remaining_tokens=56 * 1024,
+        )
+        try:
+            assert request_limited.decision.effective_step_max_tokens == 2048
+            assert request_limited.expected_output_tokens == 2048
+        finally:
+            await rebalancer.fail(request_limited)
+
+        context_only = await rebalancer.acquire(
+            session_id="context-only",
+            input_ids=[1] * 100,
+            context_remaining_tokens=4096,
+        )
+        try:
+            assert context_only.decision.effective_step_max_tokens == 4096
+            assert context_only.decision.step_max_tokens_source == "min(context)"
+        finally:
+            await rebalancer.fail(context_only)
+
+        rebalancer.group_lengths.observe(
+            group_id="g", task_key="task", final_length=5000
+        )
+        rebalancer.group_lengths.observe(
+            group_id="g", task_key="task", final_length=5000
+        )
+        await rebalancer.register_session_context(
+            session_id="group-cap",
+            group_id="g",
+            group_size=2,
+            task_key="task",
+            default_step_max_tokens=8192,
+        )
+        rebalancer.sessions["group-cap"].generated_tokens = 4000
+        group_limited = await rebalancer.acquire(
+            session_id="group-cap",
+            input_ids=[1] * 100,
+            context_remaining_tokens=56 * 1024,
+        )
+        try:
+            assert group_limited.decision.group_remaining_tokens == 1000
+            assert group_limited.decision.estimated_step_output_tokens == 1000
+        finally:
+            await rebalancer.fail(group_limited)
+
+    run(scenario())
+
+
+def test_bootstrap_sticky_turn_keeps_committed_prefix_for_hit_learning():
+    client = ControlPlaneClient()
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(enabled=True),
+        model_id="model",
+        model_config=simple_model_config(),
+    )
+
+    async def scenario():
+        await rebalancer.refresh()
+        owner = client.urls[0]
+        fingerprint = rebalancer.deployments[owner].cache_fingerprint
+        rebalancer.sessions["session"] = SessionRoutingState(
+            owner_worker_url=owner,
+            fingerprint=fingerprint,
+            previous_committed_tokens=[1, 2, 3, 4],
+            seen_engines={owner},
+        )
+        lease = await rebalancer.acquire(
+            session_id="session",
+            input_ids=[1, 2, 3, 9, 10],
+        )
+        try:
+            assert lease.decision.state is SchedulerState.BOOTSTRAP
+            assert lease.base_tokens == 3
+        finally:
+            await rebalancer.fail(lease)
+
+    run(scenario())
+
+
+def test_load_snapshot_accepts_public_and_internal_queue_field_names():
+    client = ControlPlaneClient()
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(enabled=True),
+        model_id="model",
+    )
+    rebalancer._update_load(
+        "worker",
+        {
+            "loads": [
+                {"num_waiting_reqs": 2},
+                {"num_queue_reqs": 3},
+            ]
+        },
+        now=1.0,
+    )
+    assert rebalancer.loads["worker"].queued == 5
+
+
+def test_active_scheduler_compares_source_and_target_context():
+    client = ControlPlaneClient()
+    config = EngineRebalancingConfig(
+        enabled=True,
+        min_samples=1,
+        min_hold_turns=0,
+        min_risk_ms=100,
+    )
+    rebalancer = EngineRebalancer(
+        client,
+        config=config,
+        model_id="model",
+        model_config=simple_model_config(),
+    )
+
+    async def scenario():
+        await rebalancer.refresh()
+        source, target = client.urls
+        fingerprint = rebalancer.deployments[source].cache_fingerprint
+        for url, queue in ((source, 5.0), (target, 0.0)):
+            rebalancer.performance.observe(
+                fingerprint=fingerprint,
+                engine_url=url,
+                running=1,
+                context_tokens=100,
+                queue_seconds=queue,
+                context_seconds=1.0,
+                cached_tokens=0,
+                output_tokens=1,
+                decode_throughput=10,
+            )
+        rebalancer.loads[source].queued = 1
+        rebalancer.pools[fingerprint].update(
+            rebalancer._pool_readiness(fingerprint, now=__import__("time").monotonic())
+        )
+        rebalancer.sessions["session"] = SessionRoutingState(
+            owner_worker_url=source,
+            fingerprint=fingerprint,
+            previous_committed_tokens=[1] * 80,
+            seen_engines={source},
+            owner_turns=2,
+        )
+        lease = await rebalancer.acquire(
+            session_id="session",
+            input_ids=[1] * 100,
+        )
+        try:
+            assert lease.decision.state is SchedulerState.ACTIVE
+            assert lease.decision.moved is True
+            assert lease.worker_url == target
+            assert lease.decision.source_context is not None
+            assert lease.decision.target_context is not None
+            assert lease.decision.target_context.cache_source is CacheSource.NONE
+            assert lease.decision.queue_risk_seconds == 0.0
+            assert lease.decision.context_risk_seconds == 0.0
+            assert lease.decision.decision_risk_seconds == 0.1
+        finally:
+            await rebalancer.fail(lease)
+
+    run(scenario())
+
+
+def test_default_mooncake_prior_can_make_move_beneficial_without_relaxing_guards():
+    async def benchmark(task, payload):
+        del task
+        return CalibrationSample(
+            latency_seconds=0.01,
+            bandwidth_bytes_per_second=max(1, payload * 10),
+        )
+
+    async def prepare(cold_start_probability: float) -> EngineRebalancer:
+        client = ControlPlaneClient(shared_l3=True)
+        rebalancer = EngineRebalancer(
+            client,
+            config=EngineRebalancingConfig(
+                enabled=True,
+                cold_start_hit_probability=cold_start_probability,
+            ),
+            model_id="model",
+            model_config=simple_model_config(),
+            calibration_benchmark=benchmark,
+        )
+        await rebalancer.refresh()
+        source, target = client.urls
+        fingerprint = rebalancer.deployments[source].cache_fingerprint
+        for _ in range(rebalancer.config.min_samples):
+            for engine_url, queue_seconds in ((source, 0.5), (target, 0.0)):
+                rebalancer.performance.observe(
+                    fingerprint=fingerprint,
+                    engine_url=engine_url,
+                    running=1,
+                    context_tokens=100,
+                    queue_seconds=queue_seconds,
+                    context_seconds=1.0,
+                    cached_tokens=0,
+                    output_tokens=1,
+                    decode_throughput=10.0,
+                    cache_source=CacheSource.NONE,
+                )
+        rebalancer.loads[source].queued = 1
+        rebalancer.pools[fingerprint].update(
+            rebalancer._pool_readiness(fingerprint, now=time.monotonic())
+        )
+        return rebalancer
+
+    async def decide(
+        rebalancer: EngineRebalancer,
+        *,
+        session_id: str,
+        owner_turns: int,
+    ) -> RoutingDecision:
+        source = rebalancer.client.urls[0]
+        fingerprint = rebalancer.deployments[source].cache_fingerprint
+        rebalancer.sessions[session_id] = SessionRoutingState(
+            owner_worker_url=source,
+            fingerprint=fingerprint,
+            previous_committed_tokens=[1] * 80,
+            seen_engines={source},
+            owner_turns=owner_turns,
+        )
+        lease = await rebalancer.acquire(
+            session_id=session_id,
+            input_ids=[1] * 100,
+        )
+        try:
+            return lease.decision
+        finally:
+            await rebalancer.fail(lease)
+
+    async def scenario():
+        conservative = await prepare(0.1)
+        default = await prepare(EngineRebalancingConfig().cold_start_hit_probability)
+
+        conservative_decision = await decide(
+            conservative,
+            session_id="conservative",
+            owner_turns=2,
+        )
+        held_decision = await decide(
+            default,
+            session_id="held",
+            owner_turns=1,
+        )
+        default_decision = await decide(
+            default,
+            session_id="default",
+            owner_turns=2,
+        )
+
+        assert conservative_decision.moved is False
+        assert conservative_decision.move_seconds > conservative_decision.stay_seconds
+        assert held_decision.move_seconds < held_decision.stay_seconds
+        assert held_decision.moved is True
+        assert default_decision.move_seconds < default_decision.stay_seconds
+        assert default_decision.moved is True
+        assert default_decision.reason == "context_benefit"
+        assert default_decision.decision_risk_seconds == 0.01
+        assert default.config.min_hold_turns == 1
+        assert default.config.min_risk_ms == 10
+
+    run(scenario())
+
+
+def test_existing_session_can_move_for_lower_total_step_time():
+    client = ControlPlaneClient()
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(
+            enabled=True,
+            min_samples=1,
+            min_hold_turns=0,
+            min_risk_ms=100,
+        ),
+        model_id="model",
+        model_config=simple_model_config(),
+    )
+
+    async def scenario():
+        await rebalancer.refresh()
+        source, target = client.urls
+        fingerprint = rebalancer.deployments[source].cache_fingerprint
+        for url, queue_seconds, context_seconds in (
+            (source, 0.0, 4.0),
+            (target, 0.5, 1.0),
+        ):
+            rebalancer.performance.observe(
+                fingerprint=fingerprint,
+                engine_url=url,
+                running=1,
+                context_tokens=100,
+                queue_seconds=queue_seconds,
+                context_seconds=context_seconds,
+                cached_tokens=0,
+                output_tokens=10,
+                decode_throughput=10.0,
+                cache_source=CacheSource.NONE,
+            )
+        rebalancer.loads[source].queued = 1
+        rebalancer.pools[fingerprint].update(
+            rebalancer._pool_readiness(fingerprint, now=time.monotonic())
+        )
+        rebalancer.sessions["total-step"] = SessionRoutingState(
+            owner_worker_url=source,
+            fingerprint=fingerprint,
+            previous_committed_tokens=[],
+            seen_engines={source},
+            owner_turns=2,
+        )
+
+        lease = await rebalancer.acquire(
+            session_id="total-step",
+            input_ids=[1] * 100,
+            step_max_new_tokens=10,
+        )
+        try:
+            # The target has a longer queue but saves three seconds of full
+            # prefill, so the unified total-step comparison must migrate.
+            assert lease.worker_url == target
+            assert lease.decision.moved is True
+            assert lease.decision.stay_seconds == 5.0
+            assert lease.decision.move_seconds == 2.6
+        finally:
+            await rebalancer.fail(lease)
+
+    run(scenario())
+
+
+def test_owner_failure_uses_unified_candidate_estimate_without_threshold():
+    client = ControlPlaneClient()
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(enabled=True, min_samples=1),
+        model_id="model",
+        model_config=simple_model_config(),
+    )
+
+    async def scenario():
+        await rebalancer.refresh()
+        source, target = client.urls
+        fingerprint = rebalancer.deployments[source].cache_fingerprint
+        rebalancer.performance.observe(
+            fingerprint=fingerprint,
+            engine_url=target,
+            running=1,
+            context_tokens=100,
+            queue_seconds=0.5,
+            context_seconds=1.0,
+            cached_tokens=0,
+            output_tokens=10,
+            decode_throughput=10.0,
+            cache_source=CacheSource.NONE,
+        )
+        rebalancer.loads[source].healthy = False
+        rebalancer.sessions["failed-owner"] = SessionRoutingState(
+            owner_worker_url=source,
+            fingerprint=fingerprint,
+            previous_committed_tokens=[1] * 80,
+            seen_engines={source},
+            owner_turns=2,
+        )
+
+        lease = await rebalancer.acquire(
+            session_id="failed-owner",
+            input_ids=[1] * 100,
+            step_max_new_tokens=10,
+        )
+        try:
+            assert lease.worker_url == target
+            assert lease.decision.reason == "owner_unhealthy_failover"
+            assert lease.decision.moved is True
+            assert lease.decision.decision_risk_seconds == 0.0
+            assert lease.decision.target_context is not None
+            assert lease.decision.target_context.cache_source is CacheSource.NONE
+            assert lease.decision.target_context.expected_prefill_tokens == 100
+        finally:
+            await rebalancer.fail(lease)
+
+    run(scenario())
+
+
+def test_heterogeneous_scheduler_uses_single_step_budget_for_decode_cost():
+    client = ControlPlaneClient()
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(
+            enabled=True,
+            min_samples=1,
+            min_hold_turns=0,
+            min_risk_ms=100,
+        ),
+        model_id="model",
+        model_config=simple_model_config(),
+    )
+
+    async def scenario():
+        await rebalancer.refresh()
+        source, target = client.urls
+        fingerprint = rebalancer.deployments[source].cache_fingerprint
+        for url, decode_throughput in ((source, 10.0), (target, 20.0)):
+            rebalancer.performance.observe(
+                fingerprint=fingerprint,
+                engine_url=url,
+                running=1,
+                context_tokens=100,
+                queue_seconds=1.0,
+                context_seconds=1.0,
+                cached_tokens=0,
+                output_tokens=10,
+                decode_throughput=decode_throughput,
+                cache_source=CacheSource.NONE,
+            )
+        rebalancer.loads[source].queued = 1
+        rebalancer.pools[fingerprint].update(
+            rebalancer._pool_readiness(fingerprint, now=time.monotonic())
+        )
+        rebalancer.sessions["heterogeneous"] = SessionRoutingState(
+            owner_worker_url=source,
+            fingerprint=fingerprint,
+            previous_committed_tokens=[1] * 80,
+            seen_engines={source},
+            owner_turns=2,
+        )
+        lease = await rebalancer.acquire(
+            session_id="heterogeneous",
+            input_ids=[1] * 100,
+            step_max_new_tokens=8192,
+            context_remaining_tokens=56 * 1024,
+        )
+        try:
+            assert lease.decision.moved is True
+            assert lease.decision.estimated_step_output_tokens == 8192
+            assert lease.decision.source_decode_seconds == 819.2
+            assert lease.decision.target_decode_seconds == 409.6
+        finally:
+            await rebalancer.fail(lease)
+
+    run(scenario())
+
+
+def test_queue_and_context_risks_are_summed_and_can_reject_migration():
+    client = ControlPlaneClient()
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(
+            enabled=True,
+            min_samples=1,
+            min_hold_turns=0,
+            min_risk_ms=100,
+        ),
+        model_id="model",
+        model_config=simple_model_config(),
+    )
+
+    async def scenario():
+        await rebalancer.refresh()
+        source, target = client.urls
+        fingerprint = rebalancer.deployments[source].cache_fingerprint
+        # Queue errors are 1s on the source and 2s on the target. Context
+        # errors are also 1s and 2s, respectively.
+        rebalancer.performance.observe(
+            fingerprint=fingerprint,
+            engine_url=source,
+            running=1,
+            context_tokens=100,
+            queue_seconds=5.0,
+            predicted_queue_seconds=4.0,
+            context_seconds=1.0,
+            cached_tokens=80,
+            output_tokens=1,
+            decode_throughput=10,
+            estimated_context_seconds=2.0,
+            cache_source=CacheSource.LOCAL,
+        )
+        rebalancer.performance.observe(
+            fingerprint=fingerprint,
+            engine_url=target,
+            running=1,
+            context_tokens=100,
+            queue_seconds=0.0,
+            predicted_queue_seconds=2.0,
+            context_seconds=1.0,
+            cached_tokens=0,
+            output_tokens=1,
+            decode_throughput=10,
+            estimated_context_seconds=3.0,
+            cache_source=CacheSource.NONE,
+        )
+        rebalancer.loads[source].queued = 1
+        rebalancer.pools[fingerprint].update(
+            rebalancer._pool_readiness(fingerprint, now=time.monotonic())
+        )
+        rebalancer.sessions["risk-blocked"] = SessionRoutingState(
+            owner_worker_url=source,
+            fingerprint=fingerprint,
+            previous_committed_tokens=[1] * 80,
+            seen_engines={source},
+            owner_turns=2,
+        )
+
+        lease = await rebalancer.acquire(
+            session_id="risk-blocked",
+            input_ids=[1] * 100,
+        )
+        try:
+            assert lease.decision.state is SchedulerState.ACTIVE
+            assert lease.decision.moved is False
+            assert lease.worker_url == source
+            assert lease.decision.reason == "benefit_below_threshold"
+            assert lease.decision.queue_risk_seconds == 3.0
+            assert lease.decision.context_risk_seconds == 3.0
+            assert lease.decision.decision_risk_seconds == 6.0
+        finally:
+            await rebalancer.fail(lease)
+
+    run(scenario())
+
+
+def test_completion_pairs_actual_queue_with_the_selected_path_prediction():
+    client = ControlPlaneClient()
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(enabled=True, min_samples=1),
+        model_id="model",
+        model_config=simple_model_config(),
+    )
+
+    async def scenario():
+        await rebalancer.refresh()
+        source, target = client.urls
+        fingerprint = rebalancer.deployments[source].cache_fingerprint
+
+        for session_id, selected, actual, expected, moved in (
+            ("stay", source, 2.0, 3.0, False),
+            ("move", target, 4.0, 1.0, True),
+        ):
+            rebalancer.sessions[session_id] = SessionRoutingState(
+                owner_worker_url=source,
+                fingerprint=fingerprint,
+                seen_engines={source},
+            )
+            decision = RoutingDecision(
+                session_id=session_id,
+                source_worker_url=source,
+                target_worker_url=target if moved else source,
+                cache_fingerprint=fingerprint,
+                state=SchedulerState.ACTIVE,
+                reason="test",
+                source_queue_seconds=3.0,
+                target_queue_seconds=1.0,
+                moved=moved,
+            )
+            lease = RoutingLease(
+                decision=decision,
+                worker_url=selected,
+                reserved_tokens=100,
+                base_tokens=0,
+                started_monotonic=time.monotonic(),
+            )
+            await rebalancer.complete(
+                lease,
+                response_meta={
+                    "queue_time": actual,
+                    "e2e_latency": actual + 1.0,
+                    "cached_tokens": 0,
+                    "decode_throughput": 10.0,
+                },
+                output_tokens=1,
+                committed_tokens=[1] * 100,
+            )
+            observation = rebalancer._observations[-1]
+            assert observation["predicted_queue_seconds"] == expected
+            assert observation["actual_queue_seconds"] == actual
+            assert observation["queue_prediction_error_seconds"] == abs(
+                expected - actual
+            )
+
+    run(scenario())
+
+
+def test_actual_mooncake_hit_overrides_full_prefill_prediction_classification():
+    client = ControlPlaneClient(shared_l3=True)
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(enabled=True, min_samples=1),
+        model_id="model",
+        model_config=simple_model_config(),
+    )
+
+    async def scenario():
+        await rebalancer.refresh()
+        source, target = client.urls
+        fingerprint = rebalancer.deployments[source].cache_fingerprint
+        rebalancer.sessions["s"] = SessionRoutingState(
+            owner_worker_url=source,
+            fingerprint=fingerprint,
+            seen_engines={source},
+        )
+        predicted_full_prefill = ContextRecoveryEstimate(
+            cache_source=CacheSource.NONE,
+            expected_cached_tokens=0,
+            expected_prefill_tokens=100,
+            estimated_seconds=1.0,
+            hit_probability=0.0,
+        )
+        lease = RoutingLease(
+            decision=RoutingDecision(
+                session_id="s",
+                source_worker_url=source,
+                target_worker_url=target,
+                cache_fingerprint=fingerprint,
+                state=SchedulerState.ACTIVE,
+                reason="test",
+                target_context=predicted_full_prefill,
+                moved=True,
+            ),
+            worker_url=target,
+            reserved_tokens=100,
+            base_tokens=80,
+            started_monotonic=time.monotonic(),
+            context_tokens=100,
+        )
+        await rebalancer.complete(
+            lease,
+            response_meta={
+                "queue_time": 0.0,
+                "e2e_latency": 1.0,
+                "cached_tokens": 80,
+                "decode_throughput": 10.0,
+            },
+            output_tokens=1,
+            committed_tokens=[1] * 101,
+        )
+        assert rebalancer._observations[-1]["cache_source"] == "mooncake"
+        assert rebalancer.performance.snapshot()["prefill_samples"] == 0
+
+    run(scenario())
+
+
+def test_sglang_client_can_target_worker_directly():
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        return httpx.Response(
+            200,
+            json={
+                "text": "x",
+                "output_ids": [120],
+                "meta_info": {
+                    "output_token_logprobs": [[-0.1, 120, "x"]],
+                    "finish_reason": {"type": "stop"},
+                },
+            },
+        )
+
+    async def scenario():
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as http_client:
+            client = SGLangRouterClient("http://router", client=http_client)
+            response = await client.generate(
+                [1, 2],
+                {"max_new_tokens": 1},
+                worker_url="http://worker-a:30000",
+            )
+            assert response.output_ids == [120]
+
+    run(scenario())
+    assert seen == ["http://worker-a:30000/generate"]
+
+
+def test_sglang_client_weight_version_uses_model_info_with_legacy_fallback():
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        if request.url.path == "/model_info":
+            return httpx.Response(404)
+        return httpx.Response(200, json={"weight_version": "9"})
+
+    async def scenario():
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as http_client:
+            client = SGLangRouterClient("http://router", client=http_client)
+            assert (
+                await client.get_worker_weight_version("http://worker-a:30000") == "9"
+            )
+
+    run(scenario())
+    assert seen == ["/model_info", "/get_weight_version"]
+
+
+def test_cli_exposes_single_rebalancing_switch(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["dressage-proxy", "--tokenizer-path", "model", "--enable-engine-rebalancing"],
+    )
+    args = parse_args()
+    assert args.enable_engine_rebalancing is True
+
+
+def test_enabled_proxy_places_first_request_directly_and_reports_state():
+    client = DirectGenerationClient()
+    app = create_app(
+        tokenizer=FakeTokenizer(),
+        tokenizer_path="model",
+        token_build_mode="snapshot",
+        sglang_client=client,
+        enable_engine_rebalancing=True,
+        engine_rebalancing_config=EngineRebalancingConfig(enabled=True),
+        engine_rebalancing_model_config=simple_model_config(),
+        tool_call_parse_backend="local",
+        reasoning_parse_backend="local",
+    )
+    with TestClient(app) as http_client:
+        context_response = http_client.post(
+            "/v1/session/context",
+            json={
+                "session_id": "s1",
+                "group_id": 3,
+                "group_size": 4,
+                "task_key": "math",
+                "default_step_max_tokens": 8192,
+            },
+        )
+        assert context_response.status_code == 200
+        response = http_client.post(
+            "/v1/chat/completions",
+            headers={"X-Session-ID": "s1"},
+            json={"messages": [{"role": "user", "content": "hello"}]},
+        )
+        assert response.status_code == 200
+        assert client.calls[0]["worker_url"] in client.urls
+        assert client.calls[0]["input_ids"]
+
+        loads = http_client.get("/v1/engines/load").json()
+        assert loads["enabled"] is True
+        assert loads["effective_config"]["metrics_stale_ms"] == 2_000
+        assert loads["effective_config"]["load_poll_interval_ms"] == 250
+        assert loads["effective_config"]["history_size"] == 128
+        assert loads["effective_config"]["min_samples"] == 16
+        assert loads["effective_config"]["min_hold_turns"] == 1
+        assert loads["effective_config"]["min_risk_ms"] == 10
+        assert loads["effective_config"]["cold_start_hit_probability"] == 1.0
+        assert loads["compatibility_pools"][0]["state"] in {
+            "BOOTSTRAP",
+            "ACTIVE",
+        }
+        observation = loads["recent_context_observations"][0]
+        assert observation["cache_source"] == "none"
+        assert observation["actual_cached_tokens"] == 0
+        assert observation["actual_prefill_tokens"] > 0
+        assert "predicted_queue_seconds" in observation
+        assert "actual_queue_seconds" in observation
+        assert "queue_prediction_error_seconds" in observation
+        assert "queue_risk_seconds" in observation
+        assert "context_risk_seconds" in observation
+        assert "decision_risk" in observation
+        assert "queue_error_samples" in loads["performance_models"]
+        assert loads["recent_decisions"][0]["effective_step_max_tokens"] == 8192
+        assert loads["recent_decisions"][0]["estimated_step_output_tokens"] == 8192
+
+        calibration = http_client.get("/v1/engines/calibration").json()
+        assert calibration["state"] == "DEGRADED"
+        assert "full-prefill fallback" in calibration["state_reason"]
+        assert "online_request_count" not in calibration
+        assert "runtime_calibration" not in calibration
+        assert "snapshot_persistence" not in calibration
+        assert "effective_model_sources" not in calibration
+        assert "router_discovery" not in loads
+
+
+def test_disabled_proxy_reports_off_without_discovery():
+    client = DirectGenerationClient()
+    app = create_app(
+        tokenizer=FakeTokenizer(),
+        token_build_mode="snapshot",
+        sglang_client=client,
+        tool_call_parse_backend="local",
+        reasoning_parse_backend="local",
+    )
+    with TestClient(app) as http_client:
+        payload = http_client.get("/v1/engines/load").json()
+        assert payload["enabled"] is False
+        assert payload["state"] == "OFF"
+
+
+def test_single_node_l3_hicache_script_owns_mooncake_lifecycle():
+    path = Path("examples/scripts/run_blackbox_qwen3.5_4b_sync_local_l3_hicache.sh")
+    source = path.read_text()
+
+    assert '"qwen3.5-4B-sync-local-l3-hicache"' in source
+    assert "--debug-rollout-only" in source
+    assert "--enable-engine-rebalancing" in source
+    assert "MOONCAKE_MASTER_PORT=50051" in source
+    assert "MOONCAKE_METADATA_PORT=8080" in source
+    assert (
+        'MOONCAKE_MASTER_ADDRESS="${MOONCAKE_MASTER_HOST}:${MOONCAKE_MASTER_PORT}"'
+        in source
+    )
+    assert (
+        'MOONCAKE_GLOBAL_SEGMENT_SIZE="${MOONCAKE_GLOBAL_SEGMENT_SIZE:-4gb}"' in source
+    )
+    assert '"protocol": "tcp"' in source
+    assert '"metadata_server": metadata_server' in source
+    assert "mooncake_master \\\n" in source
+    assert "--enable_http_metadata_server=true" in source
+    assert "mooncake_store_service" not in source
+    cleanup = source[source.index("cleanup() {") : source.index("trap cleanup EXIT")]
+    assert cleanup.index("_stop_proxy_on_exit") < cleanup.index(
+        "_stop_ray_cluster_on_exit"
+    )
+    assert cleanup.index("_stop_proxy_on_exit") < cleanup.index(
+        "_stop_mooncake_master_on_exit"
+    )
+    assert '[[ "${wait_count}" -lt 100 ]]' in source
+    for argument in (
+        "--sglang-enable-hierarchical-cache",
+        "--sglang-hicache-ratio 2.0",
+        "--sglang-hicache-write-policy write_through",
+        "--sglang-hicache-mem-layout page_first",
+        "--sglang-hicache-storage-backend mooncake",
+        "--sglang-hicache-storage-backend-extra-config",
+    ):
+        assert argument in source
+    assert cleanup.index("_stop_ray_cluster_on_exit") < cleanup.index(
+        "_stop_mooncake_master_on_exit"
+    )
+    assert 'rm -f "${MOONCAKE_MASTER_PID_FILE}"' in source
+
+
+def test_engine_rebalancing_benchmark_defaults_to_one_off_on_pair(tmp_path):
+    path = Path(
+        "examples/scripts/benchmark_engine_rebalancing_qwen3.5_4b_sync_local_l3_hicache.sh"
+    )
+    source = path.read_text()
+    result = subprocess.run(
+        ["bash", str(path)],
+        cwd=Path.cwd(),
+        env={
+            **os.environ,
+            "BENCHMARK_DRY_RUN": "1",
+            "BENCHMARK_ROOT": str(tmp_path / "benchmark"),
+            "BENCHMARK_SEED": "20260806",
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "seed20260806-off-r1" in result.stdout
+    assert "seed20260806-on-r1" in result.stdout
+    assert "warm-up" not in result.stdout
+    assert "off-r2" not in result.stdout
+    assert "on-r2" not in result.stdout
+    assert "Valid measured pairs: `{len(valid_rows)}/1`" in source
+    assert "Median rollout speedup" not in source
+    assert "Warm-up" not in source
+    assert not (tmp_path / "benchmark").exists()
+
+
+def test_sync_local_script_gracefully_stops_proxy_before_ray():
+    path = Path("examples/scripts/run_blackbox_qwen3.5_4b_sync_local.sh")
+    source = path.read_text()
+    cleanup = source[source.index("cleanup() {") : source.index("trap cleanup EXIT")]
+
+    assert cleanup.index("_stop_proxy_on_exit") < cleanup.index(
+        "_stop_ray_cluster_on_exit"
+    )
+    assert '[[ "${wait_count}" -lt 100 ]]' in source
+    assert "Dressage proxy did not stop gracefully; sending SIGKILL" in source

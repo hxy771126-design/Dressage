@@ -50,6 +50,38 @@ def get_proxy_client() -> ProxyClientType:
     return _PROXY_CLIENT
 
 
+def rollout_task_key(sample: Any) -> str:
+    metadata = getattr(sample, "metadata", None)
+    if isinstance(metadata, dict) and metadata.get("task_key") is not None:
+        return str(metadata["task_key"])
+    if isinstance(metadata, dict):
+        for key in ("task_type", "env_type", "generate_function"):
+            if metadata.get(key) is not None:
+                return f"{key}:{metadata[key]}"
+    return f"sample:{type(sample).__module__}.{type(sample).__qualname__}"
+
+
+async def register_rollout_group_context(
+    proxy_client: Any,
+    *,
+    args: Any,
+    sample: Any,
+    session_id: str,
+) -> None:
+    register = getattr(proxy_client, "register_session_context", None)
+    if not callable(register):
+        return
+    await maybe_await(
+        register(
+            session_id,
+            group_id=getattr(sample, "group_index", None),
+            group_size=int(getattr(args, "n_samples_per_prompt", 1) or 1),
+            task_key=rollout_task_key(sample),
+            default_step_max_tokens=getattr(args, "rollout_max_response_len", None),
+        )
+    )
+
+
 def get_paddock_from_env(
     *, allow_whitebox_mode: bool, mode: str | None = None
 ) -> Any:

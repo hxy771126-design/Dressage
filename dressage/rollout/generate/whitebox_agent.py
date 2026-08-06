@@ -44,6 +44,7 @@ from dressage.rollout.generate.runtime import (
     get_proxy_client,
     maybe_await,
     paddock_env_args_from_metadata,
+    register_rollout_group_context,
 )
 
 if TYPE_CHECKING:
@@ -345,6 +346,12 @@ def make_generate(agent_cls: type[WhiteboxAgent]):
         _stamp_runtime_metadata(sample, agent.session_id, agent.instance_id)
 
         try:
+            await register_rollout_group_context(
+                agent.proxy,
+                args=args,
+                sample=sample,
+                session_id=agent.session_id,
+            )
             await agent.setup(sample)
             try:
                 agent_response = await agent.rollout(sample, sampling_params)

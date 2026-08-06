@@ -37,6 +37,7 @@ The proxy runs as a standalone FastAPI service (CLI: `dressage-proxy`) and is de
 - **Routing Replay (R3)** — For Mixture-of-Experts (MoE) models, the proxy captures routed expert IDs per generated token via `--use-rollout-routing-replay`. This data is stored as base64-encoded chunks and forwarded to training for faithful MoE routing replay.
 - **Configurable Parsers** — Pluggable tool call and reasoning extraction backends (`local`, `sglang_api`, `hybrid`). Both parser backends default to `sglang_api`; `local` parses model output directly, and `hybrid` tries SGLang first with local fallback. Reasoning parsers extract `<think>` blocks for models like Qwen3.
 - **Version and Context Safety** — Non-partial trajectories are rejected if the model weight version or rollout epoch changes mid-trajectory (`trajectory_version_changed`). Proxy-side context checks return stable `context_overflow` payloads and clamp generation to the exact remaining context budget. `--max-output-tokens` is an optional additional per-request hard cap.
+- **Engine Rebalancing** — Optional turn-boundary routing compares source and target queue, context-preparation, and remaining-generation time. The Proxy always sends complete `input_ids`; native SGLang HiCache decides the real cache hit and safely falls back to prefill.
 
 ## 🧱 Core Modules
 
@@ -51,6 +52,12 @@ The proxy codebase is organized into focused, single-responsibility modules:
  | `sglang_client.py` | Low-level SGLang router client with weight-version tracking. Sends generation requests, receives responses with token IDs and logprobs, records which weight version was active. | 
  | `tool_call_parser.py` | Model-specific tool call extraction from assistant responses. Supports multiple backend modes (`local` for direct parsing, `sglang_api` for SGLang-native, `hybrid` for fallback chain). Currently optimized for Qwen3.5 tool call format. |
  | `reasoning_parser.py` | Reasoning-content parsing for models that produce structured thinking blocks (e.g., Qwen3's `<think>...</think>` format). Separates reasoning tokens from action tokens for selective loss masking. |
+ | `rebalancing/scheduler_state.py` | Per-cache-fingerprint `OFF → BOOTSTRAP → ACTIVE ↔ DEGRADED` lifecycle and internal defaults. |
+ | `rebalancing/scheduler.py` | Engine discovery, output-aware reservations, sticky ownership, anti-flapping, and context-benefit routing decisions. |
+ | `rebalancing/model_cache_profile.py` / `cache_hit_estimator.py` | Deployment-derived cache-size estimates and online `cached_tokens`-based hit prediction. These are performance models, not cache-correctness logic. |
+ | `rebalancing/transfer_calibrator.py` / `ray_calibration.py` | Machine-level Ray preflight plans, CUDA/Mooncake measurement, and an independent calibration lifecycle. |
+ | `rebalancing/context_recovery_model.py` | Online queue, prefill, TPOT, context-preparation, and prediction-error models. |
+ | `rebalancing/snapshot_store.py` | Atomic, run-scoped persistence for initial, periodic online, and final calibration snapshots. |
  | `proxy_client.py` | Async HTTP client used by rollout code to interact with the proxy. Provides typed methods for `chat_completions`, `finalize_session`, and `read_trajectory`. |
  | `tool_call_ids.py` | Deterministic tool call ID generation. Ensures that tool call IDs are reproducible across re-runs, which is important for trajectory consistency. |
  | `last_step/prompt_assistant_mask.py` | Snapshot alignment helper. Builds masks for complete step snapshots. |
@@ -201,6 +208,9 @@ The proxy exposes these endpoints for agent interaction and rollout management:
  | `/v1/rollout/pause` | `POST` | Pause generation | Signals `GenerationController` to abort at next token boundary. |
  | `/v1/rollout/resume` | `POST` | Resume generation | Re-enables generation after weight update completes. |
  | `/v1/rollout/pause_state` | `GET` | Pause state | Reports `GenerationController` pause/resume state. |
+ | `/v1/session/context` | `POST` | Register rollout context | Registers `group_id`, `group_size`, stable `task_key`, and optional per-step rollout output cap before an agent starts. |
+ | `/v1/engines/load` | `GET` | Rebalancing diagnostics | Reports effective defaults, compatible-pool states, loads, path readiness, calibration, and recent decisions. |
+ | `/v1/engines/calibration` | `GET` | Calibration diagnostics | Reports the independent preflight state, machine/path fingerprints, completed and pending samples, skipped links, and fallback reason. |
  | `/health` | `GET` | Health check | Returns active session, trajectory store, rollout pause, and proxy config state. |
 
 ### Preemptible Generation Flow
@@ -250,11 +260,78 @@ Output limits are resolved independently for each request:
   single token, and combines it with any request or Proxy cap using `min(...)`.
 - If neither request nor CLI supplies a limit, the remaining context is used.
   If `--context-window` is also absent, the Proxy omits `max_new_tokens` and the
-  backend chooses its default ([SGLang 0.5.12 SamplingParams](https://github.com/sgl-project/sglang/blob/v0.5.12.post1/python/sglang/srt/sampling/sampling_params.py)
+  backend chooses its default ([SGLang 0.5.15.post1 SamplingParams](https://github.com/sgl-project/sglang/blob/v0.5.15.post1/python/sglang/srt/sampling/sampling_params.py)
   defaults to 128).
 
 `--no-dynamic-max-tokens` disables only the context-derived clamp. It does not
 change the request or optional CLI cap.
+
+### Engine Rebalancing
+
+Rebalancing is independent of the batch size; batch 1024 is a stress-test case,
+not a scheduler assumption. It is off by default and exposes one normal CLI
+switch:
+
+```bash
+dressage-proxy \
+  --tokenizer-path /path/to/Qwen3.5-4B \
+  --sglang-router-url http://<sglang-router-host>:<port> \
+  --enable-engine-rebalancing
+```
+
+Each compatible Engine pool starts in `BOOTSTRAP`, enters `ACTIVE` after load,
+queue, prefill, and at least one conservative candidate path are ready, and moves to
+`DEGRADED` if those prerequisites are later lost. New sessions use projected
+least-load placement in every enabled state. Existing sessions migrate only in
+`ACTIVE`; `BOOTSTRAP` and `DEGRADED` retain a healthy owner, with full-input
+failover if that owner fails. SGLang versions older than `v0.5.15.post1` are
+listed under `excluded_engines` and cannot join a rebalancing pool.
+
+For every new turn the scheduler estimates:
+
+```text
+T_stay = Q_source + Context_source + Remaining_source
+T_move = Q_target + Context_target + Remaining_target + Risk
+```
+
+It changes the owner only when `T_move < T_stay`, after the two-turn hold and
+reverse-migration hysteresis checks. With no shared L3, an unseen target's
+context cost is a full prefill. With shared Mooncake L3, the target cost is the
+expected native restore plus prefill cost, weighted by online `cached_tokens`
+history. Missing or failed transport calibration does not block the pool: that
+directed path is estimated as a full prefill until a usable baseline exists.
+The Proxy never supplies a cache prefix length or manipulates FULL/SWA/MAMBA
+pools; it sends complete `input_ids` and lets SGLang restore or prefill.
+
+The decode term represents one model call, not the complete multi-turn
+trajectory. The scheduler combines request, Proxy, rollout and context limits;
+successful step-length P75 and group remaining length can tighten that bound.
+Reservations include both the input and expected output tokens.
+
+An advanced deployment JSON can be supplied through
+`DRESSAGE_ENGINE_REBALANCING_DEPLOYMENT_CONFIG`; it is not a CLI switch. The
+Proxy then reports the independent
+`WAITING_FOR_RAY → RUNNING → READY/DEGRADED` lifecycle at
+`GET /v1/engines/calibration`. Short-lived GPU actors measure complete P75 CUDA
+and Mooncake transfer time before rollout Engines start. `READY` is published
+only after those actors exit and Ray reports the reserved GPU resources as
+available again. Calibration failure is performance-only and activates the
+full-prefill fallback. Router discovery does not run during machine
+calibration; load polling starts only after the terminal calibration snapshot
+has been written.
+
+The calibration HTTP response remains offline-only. Runtime corrections are
+recorded exclusively in atomic files under
+`${LOG_DIR}/proxy/rebalancing/${DRESSAGE_RUN_NAME}/${UTC_START}-${PID}/` as
+`initial.json`, every 128 successful online requests, and `final.json` during
+graceful Proxy shutdown. Each file contains the offline baseline and the
+per-path runtime restore P75, throughput P25, prediction-error P90, readiness,
+and effective model source.
+
+The bundled `run_blackbox_qwen3.5_4b_sync_local_l3_hicache.sh` recipe generates
+that deployment JSON, starts Ray, waits for calibration to reach `READY` or
+`DEGRADED`, and only then submits the rollout job. Inspect both diagnostics
+endpoints before interpreting performance results.
 
 ### Using the Proxy Client
 

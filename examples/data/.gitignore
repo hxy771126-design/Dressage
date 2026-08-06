@@ -5,6 +5,8 @@
 !.gitignore
 !dressage_dapo_prompts.jsonl
 !dressage_dapo_prompts_e2b.jsonl
+!dressage_dapo_prompts_dynamic.jsonl
+!dressage_dapo_prompts_dynamic_multi.jsonl
 
 !swegym/
 !swegym/prepare_swegym_data.py

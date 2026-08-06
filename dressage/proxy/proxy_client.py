@@ -81,6 +81,41 @@ class ProxyClient:
         response.raise_for_status()
         return response.json()
 
+    async def register_session_context(
+        self,
+        session_id: str,
+        *,
+        group_id: int | str | None = None,
+        group_size: int = 1,
+        task_key: str | None = None,
+        default_step_max_tokens: int | None = None,
+    ) -> dict:
+        payload: dict[str, Any] = {
+            "session_id": session_id,
+            "group_size": group_size,
+        }
+        if group_id is not None:
+            payload["group_id"] = group_id
+        if task_key is not None:
+            payload["task_key"] = task_key
+        if default_step_max_tokens is not None:
+            payload["default_step_max_tokens"] = default_step_max_tokens
+        response = await self._client.post(
+            f"{self._proxy_url}/v1/session/context",
+            json=payload,
+            headers=self._headers(),
+        )
+        response.raise_for_status()
+        return response.json()
+
+    async def engine_loads(self) -> dict:
+        response = await self._client.get(
+            f"{self._proxy_url}/v1/engines/load",
+            headers=self._headers(),
+        )
+        response.raise_for_status()
+        return response.json()
+
     async def read_trajectory(
         self,
         *,

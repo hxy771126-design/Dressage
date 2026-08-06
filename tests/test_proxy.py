@@ -2202,7 +2202,7 @@ def test_sglang_router_client_get_weight_versions_probes_stable_topology():
                     ]
                 },
             )
-        if request.url.path == "/get_weight_version":
+        if request.url.path == "/model_info":
             worker_calls.append(str(request.url))
             return httpx.Response(200, json={"weight_version": "v7"})
         raise AssertionError(f"Unexpected request: {request.method} {request.url}")

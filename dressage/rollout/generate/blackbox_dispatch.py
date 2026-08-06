@@ -45,6 +45,7 @@ from dressage.rollout.generate.runtime import (
     get_proxy_client,
     maybe_await,
     paddock_env_args_from_metadata,
+    register_rollout_group_context,
 )
 
 logger = logging.getLogger(__name__)
@@ -116,6 +117,12 @@ async def generate(
             blackbox_type=blackbox_type,
         )
         proxy_client = get_proxy_client()
+        await register_rollout_group_context(
+            proxy_client,
+            args=args,
+            sample=sample,
+            session_id=session_id,
+        )
         prewarm_requested = bool(metadata.get("prewarm_requested"))
         prewarm_t0 = time.monotonic()
         handle = await claim_prewarm(session_id)
