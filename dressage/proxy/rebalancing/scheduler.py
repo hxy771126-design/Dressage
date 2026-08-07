@@ -233,8 +233,16 @@ class EngineLoad:
     token_capacity: int = 0
     request_capacity: int = 0
     token_usage: float = 0.0
+    waiting_uncached_tokens: int = 0
+    gen_throughput: float = 0.0
+    queue_waiting: int = 0
+    queue_paused: int = 0
+    queue_retracted: int = 0
+    queue_grammar: int = 0
+    live_queue_metrics_available: bool = False
     reserved_requests: int = 0
     reserved_tokens: int = 0
+    reserved_prefill_tokens: int = 0
 
     def fresh(self, *, now: float, stale_seconds: float) -> bool:
         return (
@@ -287,6 +295,8 @@ class EngineStepEstimate:
     engine_url: str
     context: ContextRecoveryEstimate
     queue_seconds: float
+    queue_history_seconds: float
+    queue_live_seconds: float | None
     projected_running: int
     projected_load_score: float
     tpot_seconds: float | None
@@ -310,6 +320,10 @@ class RoutingDecision:
     target_context: ContextRecoveryEstimate | None = None
     source_queue_seconds: float | None = None
     target_queue_seconds: float | None = None
+    source_queue_history_seconds: float | None = None
+    source_queue_live_seconds: float | None = None
+    target_queue_history_seconds: float | None = None
+    target_queue_live_seconds: float | None = None
     stay_seconds: float | None = None
     move_seconds: float | None = None
     queue_risk_seconds: float = 0.0
@@ -348,6 +362,8 @@ class RoutingLease:
     projected_load_score: float | None = None
     context_tokens: int = 0
     expected_output_tokens: int = 0
+    reserved_prefill_tokens: int = 0
+    prefill_reservation_generation: int | None = None
 
 
 class GroupLengthEstimator:
@@ -490,6 +506,8 @@ class EngineRebalancer:
         )
         self.deployments: dict[str, EngineDeploymentInfo] = {}
         self.loads: dict[str, EngineLoad] = {}
+        self._load_generations: dict[str, int] = defaultdict(int)
+        self._prefill_reservations: dict[str, dict[int, int]] = defaultdict(dict)
         self.profiles: dict[str, ModelCacheProfile] = {}
         self.pools: dict[str, CompatibilityPoolStateMachine] = {}
         self.plans: dict[str, CalibrationPlan] = {}
@@ -1103,6 +1121,68 @@ class EngineRebalancer:
             int(row.get("max_running_requests") or 0) for row in valid
         )
         load.token_usage = max(float(row.get("token_usage") or 0.0) for row in valid)
+        load.waiting_uncached_tokens = sum(
+            int(row.get("num_waiting_uncached_tokens") or 0) for row in valid
+        )
+        load.gen_throughput = sum(
+            float(row.get("gen_throughput") or 0.0) for row in valid
+        )
+        queues = [
+            row.get("queues") if isinstance(row.get("queues"), Mapping) else {}
+            for row in valid
+        ]
+        load.queue_waiting = sum(int(queue.get("waiting") or 0) for queue in queues)
+        load.queue_paused = sum(int(queue.get("paused") or 0) for queue in queues)
+        load.queue_retracted = sum(int(queue.get("retracted") or 0) for queue in queues)
+        load.queue_grammar = sum(int(queue.get("grammar") or 0) for queue in queues)
+        load.live_queue_metrics_available = all(
+            row.get("num_waiting_uncached_tokens") is not None for row in valid
+        )
+        if load.live_queue_metrics_available:
+            self._advance_prefill_reservation_generation(url)
+
+    def _advance_prefill_reservation_generation(self, url: str) -> None:
+        """Retire reservations after one complete observable load generation."""
+
+        generation = self._load_generations[url] + 1
+        self._load_generations[url] = generation
+        buckets = self._prefill_reservations.get(url)
+        if buckets:
+            for reserved_generation in list(buckets):
+                if reserved_generation < generation:
+                    del buckets[reserved_generation]
+            if not buckets:
+                self._prefill_reservations.pop(url, None)
+        load = self.loads.get(url)
+        if load is not None:
+            load.reserved_prefill_tokens = sum(
+                self._prefill_reservations.get(url, {}).values()
+            )
+
+    def _release_prefill_reservation(
+        self,
+        url: str,
+        *,
+        generation: int | None,
+        tokens: int,
+    ) -> None:
+        if generation is None or tokens <= 0:
+            return
+        buckets = self._prefill_reservations.get(url)
+        if not buckets or generation not in buckets:
+            return
+        remaining = max(0, buckets[generation] - int(tokens))
+        if remaining:
+            buckets[generation] = remaining
+        else:
+            del buckets[generation]
+        if not buckets:
+            self._prefill_reservations.pop(url, None)
+        load = self.loads.get(url)
+        if load is not None:
+            load.reserved_prefill_tokens = sum(
+                self._prefill_reservations.get(url, {}).values()
+            )
 
     def _pool_readiness(self, fingerprint: str, *, now: float) -> PoolReadiness:
         urls = [
@@ -1642,6 +1722,8 @@ class EngineRebalancer:
                     reason="new_session_estimated_completion",
                     target_context=selected.context,
                     target_queue_seconds=selected.queue_seconds,
+                    target_queue_history_seconds=selected.queue_history_seconds,
+                    target_queue_live_seconds=selected.queue_live_seconds,
                     move_seconds=selected_total,
                     target_decode_seconds=selected.decode_seconds,
                     **budget.snapshot(),
@@ -1733,6 +1815,8 @@ class EngineRebalancer:
                     reason="owner_unhealthy_failover",
                     target_context=selected.context,
                     target_queue_seconds=selected.queue_seconds,
+                    target_queue_history_seconds=selected.queue_history_seconds,
+                    target_queue_live_seconds=selected.queue_live_seconds,
                     move_seconds=selected_total,
                     target_decode_seconds=selected.decode_seconds,
                     **budget.snapshot(),
@@ -1882,6 +1966,10 @@ class EngineRebalancer:
                 target_context=target_estimate.context,
                 source_queue_seconds=source_estimate.queue_seconds,
                 target_queue_seconds=target_estimate.queue_seconds,
+                source_queue_history_seconds=source_estimate.queue_history_seconds,
+                source_queue_live_seconds=source_estimate.queue_live_seconds,
+                target_queue_history_seconds=target_estimate.queue_history_seconds,
+                target_queue_live_seconds=target_estimate.queue_live_seconds,
                 stay_seconds=stay,
                 move_seconds=move,
                 queue_risk_seconds=queue_risk,
@@ -1920,11 +2008,42 @@ class EngineRebalancer:
                 "no_beneficial_target",
                 source_context=source_estimate.context,
                 source_queue_seconds=source_estimate.queue_seconds,
+                source_queue_history_seconds=source_estimate.queue_history_seconds,
+                source_queue_live_seconds=source_estimate.queue_live_seconds,
                 **budget.snapshot(),
             ),
             base_tokens,
             budget,
         )
+
+    def _live_queue_seconds(
+        self,
+        *,
+        fingerprint: str,
+        engine_url: str,
+        context_tokens: int,
+        now: float | None = None,
+    ) -> float | None:
+        load = self.loads.get(engine_url)
+        if load is None or not load.live_queue_metrics_available:
+            return None
+        observed_at = time.monotonic() if now is None else now
+        if not load.fresh(
+            now=observed_at,
+            stale_seconds=self.config.metrics_stale_ms / 1000.0,
+        ):
+            return None
+        prefill_throughput = self.performance.prefill_throughput(
+            fingerprint=fingerprint,
+            engine_url=engine_url,
+            context_tokens=context_tokens,
+        )
+        if prefill_throughput is None or prefill_throughput <= 0:
+            return None
+        backlog_tokens = max(0, load.waiting_uncached_tokens) + max(
+            0, load.reserved_prefill_tokens
+        )
+        return backlog_tokens / prefill_throughput
 
     def _estimate_step_candidate(
         self,
@@ -1956,14 +2075,20 @@ class EngineRebalancer:
             prompt_tokens=len(input_ids),
             expected_output_tokens=budget.estimated_step_output_tokens or 0,
         )
-        queue = self.performance.queue_seconds(
+        history_queue = self.performance.queue_seconds(
             fingerprint=fingerprint,
             engine_url=target_engine,
             projected_running=projected_running,
             projected_load_score=projected_score,
         )
-        if context is None or queue is None:
+        if context is None or history_queue is None:
             return None
+        live_queue = self._live_queue_seconds(
+            fingerprint=fingerprint,
+            engine_url=target_engine,
+            context_tokens=len(input_ids),
+        )
+        queue = max(history_queue, live_queue or 0.0)
         tpot = self.performance.tpot_seconds(
             fingerprint=fingerprint,
             engine_url=target_engine,
@@ -1984,6 +2109,8 @@ class EngineRebalancer:
             engine_url=target_engine,
             context=context,
             queue_seconds=queue,
+            queue_history_seconds=history_queue,
+            queue_live_seconds=live_queue,
             projected_running=projected_running,
             projected_load_score=projected_score,
             tpot_seconds=tpot,
@@ -2273,8 +2400,32 @@ class EngineRebalancer:
         target = decision.target_worker_url
         expected_output_tokens = budget.estimated_step_output_tokens or 0
         reserved_tokens = len(input_ids) + expected_output_tokens
+        reserved_prefill_tokens = 0
+        prefill_reservation_generation = None
         projected_load_score = None
         if target is not None:
+            selected_context = None
+            if (
+                target == decision.source_worker_url
+                and decision.source_context is not None
+            ):
+                selected_context = decision.source_context
+            elif (
+                target == decision.target_worker_url
+                and decision.target_context is not None
+            ):
+                selected_context = decision.target_context
+            if selected_context is not None:
+                reserved_prefill_tokens = max(
+                    0, int(selected_context.expected_prefill_tokens)
+                )
+            elif (
+                decision.source_worker_url is not None
+                and target == decision.source_worker_url
+            ):
+                reserved_prefill_tokens = max(0, len(input_ids) - base_tokens)
+            else:
+                reserved_prefill_tokens = len(input_ids)
             projected_load_score = self._projected_load_score(
                 target,
                 prompt_tokens=len(input_ids),
@@ -2283,6 +2434,14 @@ class EngineRebalancer:
             load = self.loads[target]
             load.reserved_requests += 1
             load.reserved_tokens += reserved_tokens
+            if reserved_prefill_tokens > 0:
+                prefill_reservation_generation = self._load_generations[target] + 1
+                buckets = self._prefill_reservations[target]
+                buckets[prefill_reservation_generation] = (
+                    buckets.get(prefill_reservation_generation, 0)
+                    + reserved_prefill_tokens
+                )
+                load.reserved_prefill_tokens = sum(buckets.values())
         self._decisions.append(decision.snapshot())
         return RoutingLease(
             decision=decision,
@@ -2293,6 +2452,8 @@ class EngineRebalancer:
             projected_load_score=projected_load_score,
             context_tokens=len(input_ids),
             expected_output_tokens=expected_output_tokens,
+            reserved_prefill_tokens=reserved_prefill_tokens,
+            prefill_reservation_generation=prefill_reservation_generation,
         )
 
     async def complete(
@@ -2307,6 +2468,11 @@ class EngineRebalancer:
         if not self.config.enabled or lease.worker_url is None:
             return
         async with self._lock:
+            self._release_prefill_reservation(
+                lease.worker_url,
+                generation=lease.prefill_reservation_generation,
+                tokens=lease.reserved_prefill_tokens,
+            )
             context_tokens = (
                 lease.context_tokens
                 if lease.context_tokens > 0

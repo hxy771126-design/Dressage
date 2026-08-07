@@ -27,10 +27,12 @@ from dressage.proxy.rebalancing.context_recovery_model import (
 from dressage.proxy.rebalancing.model_cache_profile import ModelCacheProfile
 from dressage.proxy.rebalancing.scheduler import (
     EngineDeploymentInfo,
+    EngineLoad,
     GroupLengthEstimator,
     RoutingDecision,
     RoutingLease,
     SessionRoutingState,
+    StepGenerationBudget,
     StepLengthEstimator,
     sglang_rebalancing_supported,
 )
@@ -1739,6 +1741,259 @@ def test_load_snapshot_accepts_public_and_internal_queue_field_names():
         now=1.0,
     )
     assert rebalancer.loads["worker"].queued == 5
+    assert rebalancer.loads["worker"].waiting_uncached_tokens == 0
+    assert rebalancer.loads["worker"].gen_throughput == 0.0
+    assert rebalancer.loads["worker"].live_queue_metrics_available is False
+
+
+def test_load_snapshot_aggregates_live_queue_fields_across_dp_ranks():
+    rebalancer = EngineRebalancer(
+        ControlPlaneClient(),
+        config=EngineRebalancingConfig(enabled=True),
+        model_id="model",
+    )
+    rebalancer._update_load(
+        "worker",
+        {
+            "loads": [
+                {
+                    "num_waiting_reqs": 2,
+                    "num_waiting_uncached_tokens": 3_000,
+                    "gen_throughput": 120.5,
+                    "queues": {
+                        "waiting": 2,
+                        "paused": 1,
+                        "retracted": 3,
+                        "grammar": 4,
+                    },
+                },
+                {
+                    "num_waiting_reqs": 5,
+                    "num_waiting_uncached_tokens": 5_000,
+                    "gen_throughput": 79.5,
+                    "queues": {
+                        "waiting": 5,
+                        "paused": 2,
+                        "retracted": 4,
+                        "grammar": 1,
+                    },
+                },
+            ]
+        },
+        now=1.0,
+    )
+
+    load = rebalancer.loads["worker"]
+    assert load.queued == 7
+    assert load.waiting_uncached_tokens == 8_000
+    assert load.gen_throughput == 200.0
+    assert load.queue_waiting == 7
+    assert load.queue_paused == 3
+    assert load.queue_retracted == 7
+    assert load.queue_grammar == 5
+    assert load.live_queue_metrics_available is True
+
+
+def test_live_queue_seconds_uses_prefill_p25_and_falls_back_when_unavailable():
+    rebalancer = EngineRebalancer(
+        ControlPlaneClient(),
+        config=EngineRebalancingConfig(enabled=True, min_samples=1),
+        model_id="model",
+    )
+    fingerprint = "fp"
+    engine = "worker"
+    rebalancer.performance.observe(
+        fingerprint=fingerprint,
+        engine_url=engine,
+        running=1,
+        context_tokens=8_000,
+        queue_seconds=0.1,
+        context_seconds=2.0,
+        cached_tokens=0,
+        output_tokens=1,
+        decode_throughput=10.0,
+        cache_source=CacheSource.NONE,
+    )
+    rebalancer.loads[engine] = EngineLoad(
+        worker_url=engine,
+        metrics_timestamp=10.0,
+        waiting_uncached_tokens=8_000,
+        live_queue_metrics_available=True,
+    )
+
+    assert (
+        rebalancer._live_queue_seconds(
+            fingerprint=fingerprint,
+            engine_url=engine,
+            context_tokens=8_000,
+            now=10.0,
+        )
+        == 2.0
+    )
+    rebalancer.loads[engine].reserved_prefill_tokens = 2_000
+    assert (
+        rebalancer._live_queue_seconds(
+            fingerprint=fingerprint,
+            engine_url=engine,
+            context_tokens=8_000,
+            now=10.0,
+        )
+        == 2.5
+    )
+
+    rebalancer.loads[engine].metrics_timestamp = 1.0
+    assert (
+        rebalancer._live_queue_seconds(
+            fingerprint=fingerprint,
+            engine_url=engine,
+            context_tokens=8_000,
+            now=10.0,
+        )
+        is None
+    )
+    rebalancer.loads[engine].metrics_timestamp = 10.0
+    rebalancer.loads[engine].live_queue_metrics_available = False
+    assert (
+        rebalancer._live_queue_seconds(
+            fingerprint=fingerprint,
+            engine_url=engine,
+            context_tokens=8_000,
+            now=10.0,
+        )
+        is None
+    )
+
+    empty_history = EngineRebalancer(
+        ControlPlaneClient(),
+        config=EngineRebalancingConfig(enabled=True, min_samples=1),
+        model_id="model",
+    )
+    empty_history.loads[engine] = EngineLoad(
+        worker_url=engine,
+        metrics_timestamp=10.0,
+        waiting_uncached_tokens=8_000,
+        live_queue_metrics_available=True,
+    )
+    assert (
+        empty_history._live_queue_seconds(
+            fingerprint=fingerprint,
+            engine_url=engine,
+            context_tokens=8_000,
+            now=10.0,
+        )
+        is None
+    )
+
+
+def test_prefill_reservations_expire_by_load_generation_and_release_on_failure():
+    client = ControlPlaneClient()
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(enabled=True),
+        model_id="model",
+    )
+
+    async def scenario():
+        await rebalancer.refresh()
+        target = client.urls[0]
+        live_payload = {
+            "loads": [
+                {
+                    "num_waiting_uncached_tokens": 0,
+                    "num_waiting_reqs": 0,
+                }
+            ]
+        }
+        rebalancer._update_load(target, live_payload, now=time.monotonic())
+        fingerprint = rebalancer.deployments[target].cache_fingerprint
+        estimate = ContextRecoveryEstimate(
+            cache_source=CacheSource.MOONCAKE,
+            expected_cached_tokens=20,
+            expected_prefill_tokens=80,
+            estimated_seconds=1.0,
+            hit_probability=0.2,
+        )
+        decision = RoutingDecision(
+            session_id="generation-reservation",
+            source_worker_url=None,
+            target_worker_url=target,
+            cache_fingerprint=fingerprint,
+            state=SchedulerState.ACTIVE,
+            reason="test",
+            target_context=estimate,
+        )
+        budget = StepGenerationBudget("unavailable", None, None, None, None)
+        lease = rebalancer._reserve(
+            decision,
+            input_ids=[1] * 100,
+            base_tokens=0,
+            budget=budget,
+        )
+        assert lease.reserved_prefill_tokens == 80
+        assert rebalancer.loads[target].reserved_prefill_tokens == 80
+
+        generation = rebalancer._load_generations[target]
+        rebalancer._update_load(
+            target,
+            {"loads": [{"num_waiting_reqs": 0}]},
+            now=time.monotonic(),
+        )
+        assert rebalancer._load_generations[target] == generation
+        assert rebalancer.loads[target].reserved_prefill_tokens == 80
+
+        rebalancer._update_load(target, live_payload, now=time.monotonic())
+        assert rebalancer.loads[target].reserved_prefill_tokens == 80
+        rebalancer._update_load(target, live_payload, now=time.monotonic())
+        assert rebalancer.loads[target].reserved_prefill_tokens == 0
+        await rebalancer.fail(lease)
+        assert rebalancer.loads[target].reserved_prefill_tokens == 0
+
+        second = rebalancer._reserve(
+            decision,
+            input_ids=[1] * 100,
+            base_tokens=0,
+            budget=budget,
+        )
+        assert rebalancer.loads[target].reserved_prefill_tokens == 80
+        await rebalancer.fail(second)
+        assert rebalancer.loads[target].reserved_prefill_tokens == 0
+
+        sticky_decision = RoutingDecision(
+            session_id="sticky-reservation",
+            source_worker_url=target,
+            target_worker_url=target,
+            cache_fingerprint=fingerprint,
+            state=SchedulerState.BOOTSTRAP,
+            reason="test",
+        )
+        sticky = rebalancer._reserve(
+            sticky_decision,
+            input_ids=[1] * 100,
+            base_tokens=80,
+            budget=budget,
+        )
+        assert sticky.reserved_prefill_tokens == 20
+        await rebalancer.fail(sticky)
+
+        full_prefill_decision = RoutingDecision(
+            session_id="new-session-reservation",
+            source_worker_url=None,
+            target_worker_url=target,
+            cache_fingerprint=fingerprint,
+            state=SchedulerState.BOOTSTRAP,
+            reason="test",
+        )
+        full_prefill = rebalancer._reserve(
+            full_prefill_decision,
+            input_ids=[1] * 100,
+            base_tokens=0,
+            budget=budget,
+        )
+        assert full_prefill.reserved_prefill_tokens == 100
+        await rebalancer.fail(full_prefill)
+        assert rebalancer.loads[target].reserved_prefill_tokens == 0
+
+    run(scenario())
 
 
 def test_active_scheduler_compares_source_and_target_context():
@@ -1772,6 +2027,11 @@ def test_active_scheduler_compares_source_and_target_context():
                 output_tokens=1,
                 decode_throughput=10,
             )
+        metrics_timestamp = time.monotonic()
+        for url in (source, target):
+            rebalancer.loads[url].metrics_timestamp = metrics_timestamp
+            rebalancer.loads[url].waiting_uncached_tokens = 0
+            rebalancer.loads[url].live_queue_metrics_available = True
         rebalancer.loads[source].queued = 1
         rebalancer.pools[fingerprint].update(
             rebalancer._pool_readiness(fingerprint, now=__import__("time").monotonic())
@@ -1797,6 +2057,81 @@ def test_active_scheduler_compares_source_and_target_context():
             assert lease.decision.queue_risk_seconds == 0.0
             assert lease.decision.context_risk_seconds == 0.0
             assert lease.decision.decision_risk_seconds == 0.1
+            assert lease.decision.source_queue_history_seconds == 5.0
+            assert lease.decision.source_queue_live_seconds == 0.0
+            assert lease.decision.target_queue_history_seconds == 0.0
+            assert lease.decision.target_queue_live_seconds == 0.0
+            snapshot = lease.decision.snapshot()
+            assert snapshot["source_queue_seconds"] == 5.0
+            assert snapshot["target_queue_seconds"] == 0.0
+        finally:
+            await rebalancer.fail(lease)
+
+    run(scenario())
+
+
+def test_live_prefill_backlog_prevents_false_benefit_migration():
+    client = ControlPlaneClient()
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(
+            enabled=True,
+            min_samples=1,
+            min_hold_turns=0,
+            min_risk_ms=100,
+        ),
+        model_id="model",
+        model_config=simple_model_config(),
+    )
+
+    async def scenario():
+        await rebalancer.refresh()
+        source, target = client.urls
+        fingerprint = rebalancer.deployments[source].cache_fingerprint
+        for url, queue in ((source, 2.0), (target, 0.1)):
+            rebalancer.performance.observe(
+                fingerprint=fingerprint,
+                engine_url=url,
+                running=1,
+                context_tokens=100,
+                queue_seconds=queue,
+                context_seconds=1.0,
+                cached_tokens=0,
+                output_tokens=1,
+                decode_throughput=10.0,
+                cache_source=CacheSource.NONE,
+            )
+        metrics_timestamp = time.monotonic()
+        for url in (source, target):
+            rebalancer.loads[url].metrics_timestamp = metrics_timestamp
+            rebalancer.loads[url].live_queue_metrics_available = True
+        rebalancer.loads[source].waiting_uncached_tokens = 0
+        rebalancer.loads[source].queued = 1
+        rebalancer.loads[target].waiting_uncached_tokens = 1_000
+        rebalancer.pools[fingerprint].update(
+            rebalancer._pool_readiness(fingerprint, now=time.monotonic())
+        )
+        rebalancer.sessions["live-backlog"] = SessionRoutingState(
+            owner_worker_url=source,
+            fingerprint=fingerprint,
+            previous_committed_tokens=[1] * 80,
+            seen_engines={source},
+            owner_turns=2,
+        )
+
+        lease = await rebalancer.acquire(
+            session_id="live-backlog",
+            input_ids=[1] * 100,
+        )
+        try:
+            assert lease.decision.state is SchedulerState.ACTIVE
+            assert lease.decision.moved is False
+            assert lease.worker_url == source
+            assert lease.decision.reason == "benefit_below_threshold"
+            assert lease.decision.target_queue_history_seconds == 0.1
+            assert lease.decision.target_queue_live_seconds == 10.0
+            assert lease.decision.target_queue_seconds == 10.0
+            assert lease.reserved_prefill_tokens == 20
         finally:
             await rebalancer.fail(lease)
 
@@ -2389,6 +2724,15 @@ def test_enabled_proxy_places_first_request_directly_and_reports_state():
             "BOOTSTRAP",
             "ACTIVE",
         }
+        engine_load = loads["engines"][0]
+        assert "waiting_uncached_tokens" in engine_load
+        assert "gen_throughput" in engine_load
+        assert "queue_waiting" in engine_load
+        assert "queue_paused" in engine_load
+        assert "queue_retracted" in engine_load
+        assert "queue_grammar" in engine_load
+        assert "reserved_prefill_tokens" in engine_load
+        assert "live_queue_metrics_available" in engine_load
         observation = loads["recent_context_observations"][0]
         assert observation["cache_source"] == "none"
         assert observation["actual_cached_tokens"] == 0
@@ -2402,6 +2746,8 @@ def test_enabled_proxy_places_first_request_directly_and_reports_state():
         assert "queue_error_samples" in loads["performance_models"]
         assert loads["recent_decisions"][0]["effective_step_max_tokens"] == 8192
         assert loads["recent_decisions"][0]["estimated_step_output_tokens"] == 8192
+        assert "target_queue_history_seconds" in loads["recent_decisions"][0]
+        assert "target_queue_live_seconds" in loads["recent_decisions"][0]
 
         calibration = http_client.get("/v1/engines/calibration").json()
         assert calibration["state"] == "DEGRADED"
