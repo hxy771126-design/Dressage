@@ -291,6 +291,15 @@ class StepGenerationBudget:
 
 
 @dataclass(frozen=True)
+class LoadScore:
+    request_pressure: float
+    token_pressure: float
+    queue_pressure: float
+    prefill_pressure: float
+    total: float
+
+
+@dataclass(frozen=True)
 class EngineStepEstimate:
     engine_url: str
     context: ContextRecoveryEstimate
@@ -331,6 +340,12 @@ class RoutingDecision:
     decision_risk_seconds: float = 0.0
     source_decode_seconds: float | None = None
     target_decode_seconds: float | None = None
+    source_base_load: LoadScore | None = None
+    target_base_load: LoadScore | None = None
+    source_projected_load: LoadScore | None = None
+    target_projected_load: LoadScore | None = None
+    load_improvement_ratio: float | None = None
+    required_load_improvement_ratio: float | None = None
     step_max_tokens_source: str = "unavailable"
     effective_step_max_tokens: int | None = None
     historical_step_tokens_p75: int | None = None
@@ -1204,7 +1219,10 @@ class EngineRebalancer:
             for target in healthy_urls:
                 if source == target:
                     continue
-                if self._path_readiness(source, target).ready:
+                if (
+                    self._path_readiness(source, target).cache_source
+                    is CacheSource.MOONCAKE
+                ):
                     eligible_paths += 1
         return PoolReadiness(
             healthy_engines=len(healthy_urls),
@@ -1311,7 +1329,7 @@ class EngineRebalancer:
         target: str,
     ) -> ContextPathReadiness:
         """Return readiness for the path this session would actually use."""
-        if target == session.owner_worker_url or target in session.seen_engines:
+        if target == session.owner_worker_url:
             deployment = self.deployments[target]
             prefill_ready = self.performance.prefill_throughput(
                 fingerprint=deployment.cache_fingerprint,
@@ -1326,7 +1344,7 @@ class EngineRebalancer:
                 CacheSource.LOCAL,
                 prefill_ready,
                 prefill_ready,
-                skipped_links={"transfer": "target has Engine-local session history"},
+                skipped_links={"transfer": "target is the current session owner"},
             )
         return self._path_readiness(source, target)
 
@@ -1553,7 +1571,7 @@ class EngineRebalancer:
                     pool_state=pool_state,
                 )
             except Exception:
-                # A prediction/modeling failure must never change generation
+                # A load-decision failure must never change generation
                 # semantics. Keep a healthy sticky owner; otherwise place the
                 # complete input on the least-loaded eligible Engine.
                 logger.warning(
@@ -1587,7 +1605,7 @@ class EngineRebalancer:
                         source,
                         fingerprint,
                         pool_state or self.pools[fingerprint].state,
-                        "prediction_error_keep_owner",
+                        "decision_error_keep_owner",
                         **budget.snapshot(),
                     )
                 else:
@@ -1607,7 +1625,7 @@ class EngineRebalancer:
                         fingerprint,
                         pool_state or self.pools[fingerprint].state,
                         (
-                            "new_session_projected_load_fallback"
+                            "new_session_min_load_fallback"
                             if source is None
                             else "owner_unhealthy_failover"
                         ),
@@ -1663,170 +1681,67 @@ class EngineRebalancer:
         }
 
         if source is None:
-            estimates: list[EngineStepEstimate] = []
-            for target in candidates:
-                estimate = self._estimate_step_candidate(
-                    session=session,
-                    source_engine=None,
-                    target_engine=target,
-                    input_ids=input_ids,
-                    base_tokens=0,
-                    budget=budgets[target],
-                    cache_source=CacheSource.NONE,
-                )
-                if estimate is None:
-                    return self._projected_load_selection(
-                        session_id=session_id,
-                        session=session,
-                        source=None,
-                        candidates=candidates,
-                        input_ids=input_ids,
-                        step_max_new_tokens=step_max_new_tokens,
-                        context_remaining_tokens=context_remaining_tokens,
-                        reason="new_session_projected_load_fallback",
-                    )
-                estimates.append(estimate)
-            homogeneous = self._step_estimates_homogeneous(estimates)
-            if not homogeneous and any(
-                estimate.decode_seconds is None for estimate in estimates
-            ):
-                return self._projected_load_selection(
-                    session_id=session_id,
-                    session=session,
-                    source=None,
-                    candidates=candidates,
-                    input_ids=input_ids,
-                    step_max_new_tokens=step_max_new_tokens,
-                    context_remaining_tokens=context_remaining_tokens,
-                    reason="new_session_projected_load_fallback",
-                )
-
-            def new_session_key(
-                estimate: EngineStepEstimate,
-            ) -> tuple[float, float, str]:
-                total = self._step_total_seconds(
-                    estimate,
-                    include_decode=not homogeneous,
-                )
-                tie = hashlib.sha256(
-                    f"{session_id}\0{estimate.engine_url}".encode()
-                ).hexdigest()
-                return total, estimate.projected_load_score, tie
-
-            selected = min(estimates, key=new_session_key)
-            selected_total = self._step_total_seconds(
-                selected,
-                include_decode=not homogeneous,
+            scores = self._load_scores(
+                candidates,
+                prompt_tokens=len(input_ids),
+                budgets=budgets,
+                include_pending_request=True,
             )
-            budget = budgets[selected.engine_url]
-            fingerprint = self.deployments[selected.engine_url].cache_fingerprint
+            target = min(
+                candidates,
+                key=lambda url: (
+                    scores[url].total,
+                    hashlib.sha256(f"{session_id}\0{url}".encode()).hexdigest(),
+                ),
+            )
+            budget = budgets[target]
+            fingerprint = self.deployments[target].cache_fingerprint
             return (
                 RoutingDecision(
                     session_id=session_id,
                     source_worker_url=None,
-                    target_worker_url=selected.engine_url,
+                    target_worker_url=target,
                     cache_fingerprint=fingerprint,
                     state=self.pools[fingerprint].state,
-                    reason="new_session_estimated_completion",
-                    target_context=selected.context,
-                    target_queue_seconds=selected.queue_seconds,
-                    target_queue_history_seconds=selected.queue_history_seconds,
-                    target_queue_live_seconds=selected.queue_live_seconds,
-                    move_seconds=selected_total,
-                    target_decode_seconds=selected.decode_seconds,
+                    reason="new_session_min_load",
+                    target_projected_load=scores[target],
                     **budget.snapshot(),
                 ),
                 0,
                 budget,
             )
 
-        fingerprint = self.deployments[source].cache_fingerprint
+        fingerprint = session.fingerprint
+        if fingerprint is None:
+            deployment = self.deployments.get(source)
+            if deployment is None:
+                raise RuntimeError("session owner is missing deployment compatibility data")
+            fingerprint = deployment.cache_fingerprint
         source_healthy = source in candidates
         if not source_healthy:
-            estimates = []
-            for target in candidates:
-                readiness = self._candidate_path_readiness(session, source, target)
-                if not readiness.ready:
-                    return self._projected_load_selection(
-                        session_id=session_id,
-                        session=session,
-                        source=source,
-                        candidates=candidates,
-                        input_ids=input_ids,
-                        step_max_new_tokens=step_max_new_tokens,
-                        context_remaining_tokens=context_remaining_tokens,
-                        reason="owner_unhealthy_failover",
-                        base_tokens=base_tokens,
-                    )
-                estimate = self._estimate_step_candidate(
-                    session=session,
-                    source_engine=source,
-                    target_engine=target,
-                    input_ids=input_ids,
-                    base_tokens=base_tokens,
-                    budget=budgets[target],
-                    cache_source=readiness.cache_source,
-                )
-                if estimate is None:
-                    return self._projected_load_selection(
-                        session_id=session_id,
-                        session=session,
-                        source=source,
-                        candidates=candidates,
-                        input_ids=input_ids,
-                        step_max_new_tokens=step_max_new_tokens,
-                        context_remaining_tokens=context_remaining_tokens,
-                        reason="owner_unhealthy_failover",
-                        base_tokens=base_tokens,
-                    )
-                estimates.append(estimate)
-            homogeneous = self._step_estimates_homogeneous(estimates)
-            if not homogeneous and any(
-                estimate.decode_seconds is None for estimate in estimates
-            ):
-                return self._projected_load_selection(
-                    session_id=session_id,
-                    session=session,
-                    source=source,
-                    candidates=candidates,
-                    input_ids=input_ids,
-                    step_max_new_tokens=step_max_new_tokens,
-                    context_remaining_tokens=context_remaining_tokens,
-                    reason="owner_unhealthy_failover",
-                    base_tokens=base_tokens,
-                )
-            selected = min(
-                estimates,
-                key=lambda estimate: (
-                    self._step_total_seconds(
-                        estimate,
-                        include_decode=not homogeneous,
-                    ),
-                    estimate.projected_load_score,
-                    hashlib.sha256(
-                        f"{session_id}\0{estimate.engine_url}".encode()
-                    ).hexdigest(),
+            projected_scores = self._load_scores(
+                candidates,
+                prompt_tokens=len(input_ids),
+                budgets=budgets,
+                include_pending_request=True,
+            )
+            target = min(
+                candidates,
+                key=lambda url: (
+                    projected_scores[url].total,
+                    hashlib.sha256(f"{session_id}\0{url}".encode()).hexdigest(),
                 ),
             )
-            selected_total = self._step_total_seconds(
-                selected,
-                include_decode=not homogeneous,
-            )
-            budget = budgets[selected.engine_url]
+            budget = budgets[target]
             return (
                 RoutingDecision(
                     session_id=session_id,
                     source_worker_url=source,
-                    target_worker_url=selected.engine_url,
+                    target_worker_url=target,
                     cache_fingerprint=fingerprint,
                     state=pool_state or self.pools[fingerprint].state,
                     reason="owner_unhealthy_failover",
-                    target_context=selected.context,
-                    target_queue_seconds=selected.queue_seconds,
-                    target_queue_history_seconds=selected.queue_history_seconds,
-                    target_queue_live_seconds=selected.queue_live_seconds,
-                    move_seconds=selected_total,
-                    target_decode_seconds=selected.decode_seconds,
+                    target_projected_load=projected_scores[target],
                     **budget.snapshot(),
                     moved=True,
                 ),
@@ -1834,194 +1749,103 @@ class EngineRebalancer:
                 budget,
             )
 
-        budget = budgets[source]
-        if pool_state is not SchedulerState.ACTIVE:
-            return (
-                RoutingDecision(
-                    session_id,
-                    source,
-                    source,
-                    fingerprint,
-                    pool_state or self.pools[fingerprint].state,
-                    f"pool_state_{(pool_state or self.pools[fingerprint].state).value.lower()}",
-                    **budget.snapshot(),
-                ),
-                base_tokens,
-                budget,
-            )
-
-        source_estimate = self._estimate_step_candidate(
-            session=session,
-            source_engine=source,
-            target_engine=source,
-            input_ids=input_ids,
-            base_tokens=base_tokens,
-            budget=budget,
-            cache_source=CacheSource.LOCAL,
+        base_scores = self._load_scores(
+            candidates,
+            prompt_tokens=len(input_ids),
+            budgets=budgets,
+            include_pending_request=False,
         )
-        if source_estimate is None:
+        projected_scores = self._load_scores(
+            candidates,
+            prompt_tokens=len(input_ids),
+            budgets=budgets,
+            include_pending_request=True,
+        )
+        budget = budgets[source]
+        eligible_targets = [
+            target
+            for target in candidates
+            if target != source
+            and self._candidate_path_readiness(
+                session, source, target
+            ).cache_source
+            is CacheSource.MOONCAKE
+        ]
+        if not eligible_targets:
             return (
                 RoutingDecision(
-                    session_id,
-                    source,
-                    source,
-                    fingerprint,
-                    SchedulerState.ACTIVE,
-                    "source_model_not_ready",
+                    session_id=session_id,
+                    source_worker_url=source,
+                    target_worker_url=source,
+                    cache_fingerprint=fingerprint,
+                    state=pool_state or self.pools[fingerprint].state,
+                    reason="no_eligible_migration_target",
+                    source_base_load=base_scores[source],
+                    source_projected_load=projected_scores[source],
                     **budget.snapshot(),
                 ),
                 base_tokens,
                 budget,
             )
+        target = min(
+            eligible_targets,
+            key=lambda url: (
+                base_scores[url].total,
+                hashlib.sha256(f"{session_id}\0{url}".encode()).hexdigest(),
+            ),
+        )
+        source_base = base_scores[source]
+        target_base = base_scores[target]
+        improvement = (
+            max(0.0, (source_base.total - target_base.total) / source_base.total)
+            if source_base.total > 0.0
+            else 0.0
+        )
+        required_ratio = self.config.min_load_improvement_ratio
+        returning_to_previous_owner = (
+            target == session.previous_owner_worker_url and session.owner_turns == 1
+        )
+        if returning_to_previous_owner:
+            required_ratio = min(1.0, 2.0 * required_ratio)
 
-        best: RoutingDecision | None = None
-        best_rejected: RoutingDecision | None = None
-        for target in candidates:
-            if target == source:
-                continue
-            readiness = self._candidate_path_readiness(session, source, target)
-            if not readiness.ready:
-                continue
-            target_estimate = self._estimate_step_candidate(
-                session=session,
-                source_engine=source,
-                target_engine=target,
-                input_ids=input_ids,
-                base_tokens=base_tokens,
-                budget=budgets[target],
-                cache_source=readiness.cache_source,
+        moved = False
+        if target_base.total >= source_base.total:
+            reason = "owner_min_load"
+        elif session.owner_turns < self.config.min_hold_turns:
+            reason = "min_hold_turns_not_met"
+        elif improvement < required_ratio:
+            reason = (
+                "return_hysteresis_below_threshold"
+                if returning_to_previous_owner
+                else "load_improvement_below_threshold"
             )
-            if target_estimate is None:
-                continue
-            context_risk = self._context_prediction_risk(
-                fingerprint=fingerprint,
-                source_engine=source,
-                target_engine=source,
-                estimate=source_estimate.context,
-                context_tokens=len(input_ids),
-            ) + self._context_prediction_risk(
-                fingerprint=fingerprint,
-                source_engine=source,
-                target_engine=target,
-                estimate=target_estimate.context,
-                context_tokens=len(input_ids),
-            )
-            queue_risk = self.performance.queue_risk_seconds(
-                fingerprint=fingerprint,
-                engine_url=source,
-                projected_running=source_estimate.projected_running,
-                projected_load_score=source_estimate.projected_load_score,
-            ) + self.performance.queue_risk_seconds(
-                fingerprint=fingerprint,
-                engine_url=target,
-                projected_running=target_estimate.projected_running,
-                projected_load_score=target_estimate.projected_load_score,
-            )
-            risk = max(
-                self.config.min_risk_ms / 1000.0,
-                context_risk + queue_risk,
-            )
-            homogeneous = self._within_ten_percent(
-                source_estimate.tpot_seconds,
-                target_estimate.tpot_seconds,
-            ) and self._within_ten_percent(
-                source_estimate.prefill_throughput,
-                target_estimate.prefill_throughput,
-            )
-            if homogeneous:
-                stay = source_estimate.context_queue_seconds
-                move = target_estimate.context_queue_seconds + risk
-            else:
-                if (
-                    source_estimate.decode_seconds is None
-                    or target_estimate.decode_seconds is None
-                ):
-                    continue
-                stay = self._step_total_seconds(
-                    source_estimate,
-                    include_decode=True,
-                )
-                move = (
-                    self._step_total_seconds(
-                        target_estimate,
-                        include_decode=True,
-                    )
-                    + risk
-                )
-            beneficial = move < stay
+        elif projected_scores[target].total > projected_scores[source].total:
+            reason = "projected_load_safety_check_failed"
+        else:
+            reason = "load_improvement_threshold_met"
+            moved = True
 
-            other_source_work = (
-                self.loads[source].running
-                + self.loads[source].queued
-                + self.loads[source].reserved_requests
-                > 0
-            )
-            if (
-                not other_source_work
-                or session.owner_turns < self.config.min_hold_turns
-            ):
-                beneficial = False
-            if target == session.previous_owner_worker_url and beneficial:
-                beneficial = stay - move > 2.0 * risk
-            candidate = RoutingDecision(
-                session_id=session_id,
-                source_worker_url=source,
-                target_worker_url=target if beneficial else source,
-                cache_fingerprint=fingerprint,
-                state=SchedulerState.ACTIVE,
-                reason="context_benefit" if beneficial else "benefit_below_threshold",
-                source_context=source_estimate.context,
-                target_context=target_estimate.context,
-                source_queue_seconds=source_estimate.queue_seconds,
-                target_queue_seconds=target_estimate.queue_seconds,
-                source_queue_history_seconds=source_estimate.queue_history_seconds,
-                source_queue_live_seconds=source_estimate.queue_live_seconds,
-                target_queue_history_seconds=target_estimate.queue_history_seconds,
-                target_queue_live_seconds=target_estimate.queue_live_seconds,
-                stay_seconds=stay,
-                move_seconds=move,
-                queue_risk_seconds=queue_risk,
-                context_risk_seconds=context_risk,
-                decision_risk_seconds=risk,
-                source_decode_seconds=source_estimate.decode_seconds,
-                target_decode_seconds=target_estimate.decode_seconds,
-                **budgets[target].snapshot(),
-                moved=beneficial,
-            )
-            if beneficial and (
-                best is None
-                or (candidate.move_seconds or math.inf)
-                < (best.move_seconds or math.inf)
-            ):
-                best = candidate
-            elif not beneficial and (
-                best_rejected is None
-                or (candidate.move_seconds or math.inf)
-                < (best_rejected.move_seconds or math.inf)
-            ):
-                # Keep the most competitive rejected path so diagnostics show
-                # which queue/context risk terms prevented the migration.
-                best_rejected = candidate
-        if best is not None:
-            return best, base_tokens, budgets[best.target_worker_url or source]
-        if best_rejected is not None:
-            return best_rejected, base_tokens, budget
+        selected = target if moved else source
+        selected_budget = budgets[selected]
         return (
             RoutingDecision(
-                session_id,
-                source,
-                source,
-                fingerprint,
-                SchedulerState.ACTIVE,
-                "no_beneficial_target",
-                source_context=source_estimate.context,
-                source_queue_seconds=source_estimate.queue_seconds,
-                source_queue_history_seconds=source_estimate.queue_history_seconds,
-                source_queue_live_seconds=source_estimate.queue_live_seconds,
-                **budget.snapshot(),
+                session_id=session_id,
+                source_worker_url=source,
+                target_worker_url=selected,
+                cache_fingerprint=fingerprint,
+                state=pool_state or self.pools[fingerprint].state,
+                reason=reason,
+                source_base_load=source_base,
+                target_base_load=target_base,
+                source_projected_load=projected_scores[source],
+                target_projected_load=projected_scores[target],
+                load_improvement_ratio=improvement,
+                required_load_improvement_ratio=required_ratio,
+                moved=moved,
+                **selected_budget.snapshot(),
             ),
             base_tokens,
-            budget,
+            selected_budget,
         )
 
     def _live_queue_seconds(
@@ -2352,6 +2176,31 @@ class EngineRebalancer:
         target = min(urls, key=key)
         return target, budgets[target]
 
+    def _load_scores(
+        self,
+        urls: list[str],
+        *,
+        prompt_tokens: int,
+        budgets: Mapping[str, StepGenerationBudget],
+        include_pending_request: bool,
+    ) -> dict[str, LoadScore]:
+        max_running = max([self.loads[url].request_capacity for url in urls] + [1])
+        max_tokens = max([self.loads[url].token_capacity for url in urls] + [1])
+        max_queue = max([self.loads[url].queued for url in urls] + [1])
+        fallback = (max_running, max_tokens, max_queue)
+        return {
+            url: self._load_score(
+                url,
+                prompt_tokens=prompt_tokens,
+                expected_output_tokens=(
+                    budgets[url].estimated_step_output_tokens or 0
+                ),
+                include_pending_request=include_pending_request,
+                capacity_fallback=fallback,
+            )
+            for url in urls
+        }
+
     def _projected_load_score(
         self,
         url: str,
@@ -2360,6 +2209,23 @@ class EngineRebalancer:
         expected_output_tokens: int = 0,
         capacity_fallback: tuple[int, int, int] | None = None,
     ) -> float:
+        return self._load_score(
+            url,
+            prompt_tokens=prompt_tokens,
+            expected_output_tokens=expected_output_tokens,
+            include_pending_request=True,
+            capacity_fallback=capacity_fallback,
+        ).total
+
+    def _load_score(
+        self,
+        url: str,
+        *,
+        prompt_tokens: int,
+        expected_output_tokens: int = 0,
+        include_pending_request: bool,
+        capacity_fallback: tuple[int, int, int] | None = None,
+    ) -> LoadScore:
         load = self.loads[url]
         if capacity_fallback is None:
             compatible = [
@@ -2381,20 +2247,38 @@ class EngineRebalancer:
         req_capacity = load.request_capacity or max_running
         token_capacity = load.token_capacity or max_tokens
         queue_capacity = max(max_queue, req_capacity)
+        pending_requests = 1 if include_pending_request else 0
+        pending_tokens = (
+            prompt_tokens + max(0, int(expected_output_tokens))
+            if include_pending_request
+            else 0
+        )
+        request_pressure = (
+            max(load.running, load.reserved_requests) + pending_requests
+        ) / max(1, req_capacity)
         token_pressure = max(
             (
-                load.active_tokens
-                + load.reserved_tokens
-                + prompt_tokens
-                + max(0, int(expected_output_tokens))
+                max(load.active_tokens, load.reserved_tokens) + pending_tokens
             )
             / max(1, token_capacity),
             load.token_usage,
         )
-        return (
-            (load.running + load.reserved_requests + 1) / max(1, req_capacity)
-            + token_pressure
-            + load.queued / max(1, queue_capacity)
+        queue_pressure = load.queued / max(1, queue_capacity)
+        prefill_pressure = max(
+            load.waiting_uncached_tokens,
+            load.reserved_prefill_tokens,
+        ) / max(1, token_capacity)
+        return LoadScore(
+            request_pressure=request_pressure,
+            token_pressure=token_pressure,
+            queue_pressure=queue_pressure,
+            prefill_pressure=prefill_pressure,
+            total=(
+                request_pressure
+                + token_pressure
+                + queue_pressure
+                + prefill_pressure
+            ),
         )
 
     def _reserve(

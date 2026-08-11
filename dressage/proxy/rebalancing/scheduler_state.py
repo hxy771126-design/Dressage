@@ -30,6 +30,7 @@ class EngineRebalancingConfig:
     min_hold_turns: int = 1
     min_risk_ms: int = 10
     cold_start_hit_probability: float = 1.0
+    min_load_improvement_ratio: float = 0.30
 
     def __post_init__(self) -> None:
         self.metrics_stale_ms = max(
@@ -48,6 +49,8 @@ class EngineRebalancingConfig:
             raise ValueError("min_risk_ms must be non-negative")
         if not 0.0 <= self.cold_start_hit_probability <= 1.0:
             raise ValueError("cold_start_hit_probability must be between 0 and 1")
+        if not 0.0 <= self.min_load_improvement_ratio <= 1.0:
+            raise ValueError("min_load_improvement_ratio must be between 0 and 1")
 
     def snapshot(self) -> dict[str, Any]:
         return asdict(self)
@@ -67,8 +70,6 @@ class PoolReadiness:
         return (
             self.healthy_engines >= 2
             and self.metrics_fresh
-            and self.queue_model_ready
-            and self.prefill_model_ready
             and self.eligible_paths > 0
         )
 
@@ -79,7 +80,7 @@ class PoolReadiness:
 
 
 class CompatibilityPoolStateMachine:
-    """Four-state scheduler lifecycle for one cache fingerprint."""
+    """Four-state load-routing lifecycle for one cache fingerprint."""
 
     def __init__(
         self,
