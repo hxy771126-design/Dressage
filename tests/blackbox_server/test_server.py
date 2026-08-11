@@ -350,6 +350,64 @@ def test_register_runtime_root_override_creates_runtime_under_override(
         assert runtime_dir.is_dir()
 
 
+@pytest.mark.parametrize(
+    "bound_session_id",
+    [
+        "bbs-det-20260806-0",
+        "bbs-det-20260806-1",
+        "bbs-det-20260806-0-miss",
+        "bbs-det-20260806-0-retry-1",
+    ],
+)
+def test_deterministic_runtime_id_uses_bound_session_id(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    prompt_file: Path,
+    bound_session_id: str,
+):
+    client = make_client(tmp_path, monkeypatch, FakeAdapter())
+    payload = register_payload(prompt_file, bound_session_id=bound_session_id)
+    payload["backend_options"]["proxy"] = {
+        "sampling_mode": "force",
+        "sampling_seed_base": 20260806,
+    }
+
+    with client:
+        response = client.post("/v1/rollout/register", json=payload)
+
+        assert response.status_code == 200
+        binding = response.json()["binding"]
+        assert binding["runtime_id"] == bound_session_id
+        assert Path(binding["runtime_dir"]).name == bound_session_id
+
+
+def test_deterministic_runtime_id_is_stable_across_runtime_roots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, prompt_file: Path
+):
+    bound_session_id = "bbs-det-20260806-0-miss"
+    payload = register_payload(prompt_file, bound_session_id=bound_session_id)
+    payload["backend_options"]["proxy"] = {
+        "sampling_mode": "force",
+        "sampling_seed_base": 20260806,
+    }
+
+    first_client = make_client(tmp_path / "off", monkeypatch, FakeAdapter())
+    with first_client:
+        first_response = first_client.post("/v1/rollout/register", json=payload)
+        assert first_response.status_code == 200
+        first_binding = first_response.json()["binding"]
+
+    second_client = make_client(tmp_path / "on", monkeypatch, FakeAdapter())
+    with second_client:
+        second_response = second_client.post("/v1/rollout/register", json=payload)
+        assert second_response.status_code == 200
+        second_binding = second_response.json()["binding"]
+
+    assert first_binding["runtime_id"] == second_binding["runtime_id"] == bound_session_id
+    assert Path(first_binding["runtime_dir"]).name == bound_session_id
+    assert Path(second_binding["runtime_dir"]).name == bound_session_id
+
+
 def test_server_config_override_runtime_root_applies_and_affects_fingerprint():
     runtime_root = "/workspace_sandbox/blackbox_server_runtime"
     override = ServerConfigOverride(runtime_root=runtime_root)
@@ -569,6 +627,7 @@ def test_register_send_message_and_replay(tmp_path: Path, monkeypatch: pytest.Mo
         assert register_data["status"] == "ready"
         assert register_data["binding"]["blackbox_type"] == "opencode"
         assert register_data["binding"]["runtime_id"].startswith("bbs-")
+        assert register_data["binding"]["runtime_id"] != "sess-001"
         assert "instance_id" not in register_data["binding"]
         assert register_data["binding"]["bound_session_id"] == "sess-001"
         assert register_data["binding"]["bound_instance_id"] == "inst-001"
