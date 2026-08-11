@@ -1,15 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
+import re
+import resource
+import signal
 import subprocess
 import sys
 import time
 from pathlib import Path
 
 import httpx
+import pytest
 from fastapi.testclient import TestClient
 
 from dressage.proxy.rebalancing import EngineRebalancer, EngineRebalancingConfig
@@ -42,7 +47,7 @@ from dressage.proxy.rebalancing.scheduler_state import (
     SchedulerState,
 )
 from dressage.proxy.rebalancing.snapshot_store import CalibrationSnapshotStore
-from dressage.proxy.server import create_app, parse_args
+from dressage.proxy.server import _settle_routing_lease, create_app, parse_args
 from dressage.proxy.sglang_client import SGLangResponse, SGLangRouterClient
 from dressage.proxy.rebalancing.ray_calibration import MachineCalibrationConfig
 from dressage.proxy.rebalancing.transfer_calibrator import (
@@ -2847,6 +2852,955 @@ def test_engine_rebalancing_benchmark_defaults_to_one_off_on_pair(tmp_path):
     assert "Median rollout speedup" not in source
     assert "Warm-up" not in source
     assert not (tmp_path / "benchmark").exists()
+
+
+def test_disabled_rebalancer_does_not_create_session_context_state():
+    rebalancer = EngineRebalancer(
+        ControlPlaneClient(),
+        config=EngineRebalancingConfig(enabled=False),
+        model_id="model",
+    )
+
+    async def scenario():
+        for index in range(256):
+            await rebalancer.register_session_context(
+                session_id=f"disabled-{index}",
+                group_id=index,
+                group_size=4,
+                task_key="task",
+            )
+        assert (await rebalancer.snapshot())["active_sessions"] == 0
+
+    run(scenario())
+
+
+def test_discard_session_context_is_idempotent_without_group_observation():
+    rebalancer = EngineRebalancer(
+        ControlPlaneClient(),
+        config=EngineRebalancingConfig(enabled=True),
+        model_id="model",
+    )
+
+    async def scenario():
+        await rebalancer.register_session_context(
+            session_id="discarded",
+            group_id="group",
+            group_size=2,
+            task_key="task",
+        )
+        rebalancer.sessions["discarded"].generated_tokens = 17
+
+        await rebalancer.discard_session_context("discarded")
+        await rebalancer.discard_session_context("discarded")
+
+        assert "discarded" not in rebalancer.sessions
+        assert not rebalancer.group_lengths._group
+        assert not rebalancer.group_lengths._task
+
+    run(scenario())
+
+
+@pytest.mark.parametrize("settle_method", ["complete", "fail"])
+def test_late_lease_settle_releases_reservation_without_recreating_discarded_session(
+    settle_method,
+):
+    rebalancer = EngineRebalancer(
+        ControlPlaneClient(),
+        config=EngineRebalancingConfig(enabled=True),
+        model_id="model",
+        model_config=simple_model_config(),
+    )
+
+    async def scenario():
+        await rebalancer.refresh()
+        await rebalancer.register_session_context(
+            session_id="discard-before-settle",
+            group_id="group",
+            group_size=1,
+            task_key="task",
+        )
+        lease = await rebalancer.acquire(
+            session_id="discard-before-settle",
+            input_ids=[1] * 100,
+        )
+        load = rebalancer.loads[lease.worker_url]
+        assert load.reserved_requests == 1
+        assert load.reserved_tokens > 0
+        assert load.reserved_prefill_tokens > 0
+
+        await rebalancer.discard_session_context("discard-before-settle")
+        if settle_method == "complete":
+            await rebalancer.complete(
+                lease,
+                response_meta={
+                    "cached_tokens": 0,
+                    "queue_time": 0.0,
+                    "e2e_latency": 1.0,
+                    "decode_throughput": 10.0,
+                },
+                output_tokens=1,
+                committed_tokens=[1] * 101,
+            )
+        else:
+            await rebalancer.fail(lease)
+
+        assert "discard-before-settle" not in rebalancer.sessions
+        assert (await rebalancer.snapshot())["active_sessions"] == 0
+        assert load.reserved_requests == 0
+        assert load.reserved_tokens == 0
+        assert load.reserved_prefill_tokens == 0
+
+    run(scenario())
+
+
+def test_registered_context_acquire_rejects_session_discarded_before_acquire():
+    rebalancer = EngineRebalancer(
+        ControlPlaneClient(),
+        config=EngineRebalancingConfig(enabled=True),
+        model_id="model",
+        model_config=simple_model_config(),
+    )
+
+    async def scenario():
+        await rebalancer.refresh()
+        await rebalancer.register_session_context(
+            session_id="discard-before-acquire",
+            group_id="group",
+            group_size=1,
+            task_key="task",
+        )
+        await rebalancer.discard_session_context("discard-before-acquire")
+
+        with pytest.raises(RuntimeError, match="context.*registered|discarded"):
+            await rebalancer.acquire(
+                session_id="discard-before-acquire",
+                input_ids=[1] * 100,
+                require_registered_context=True,
+            )
+
+        assert "discard-before-acquire" not in rebalancer.sessions
+        assert (await rebalancer.snapshot())["active_sessions"] == 0
+
+    run(scenario())
+
+
+def test_partial_rollout_request_rejects_context_discarded_before_acquire():
+    app = create_app(
+        tokenizer=FakeTokenizer(),
+        tokenizer_path="model",
+        token_build_mode="snapshot",
+        sglang_client=DirectGenerationClient(),
+        enable_engine_rebalancing=True,
+        engine_rebalancing_config=EngineRebalancingConfig(enabled=True),
+        engine_rebalancing_model_config=simple_model_config(),
+        tool_call_parse_backend="local",
+        reasoning_parse_backend="local",
+        stream_heartbeat_interval_seconds=0,
+    )
+
+    with TestClient(app) as http_client:
+        assert http_client.post(
+            "/v1/session/context",
+            json={"session_id": "discarded-request", "group_size": 1},
+        ).status_code == 200
+        assert http_client.delete(
+            "/v1/session/context/discarded-request"
+        ).status_code == 200
+
+        response = http_client.post(
+            "/v1/chat/completions",
+            headers={
+                "X-Session-ID": "discarded-request",
+                "X-Dressage-Partial-Rollout": "1",
+            },
+            json={"messages": [{"role": "user", "content": "hello"}]},
+        )
+
+        assert response.status_code == 503
+        assert "context" in str(response.json()["detail"]["message"])
+        assert http_client.get("/v1/engines/load").json()["active_sessions"] == 0
+
+
+def test_general_request_without_partial_rollout_header_creates_routing_session():
+    app = create_app(
+        tokenizer=FakeTokenizer(),
+        tokenizer_path="model",
+        token_build_mode="snapshot",
+        sglang_client=DirectGenerationClient(),
+        enable_engine_rebalancing=True,
+        engine_rebalancing_config=EngineRebalancingConfig(enabled=True),
+        engine_rebalancing_model_config=simple_model_config(),
+        tool_call_parse_backend="local",
+        reasoning_parse_backend="local",
+        stream_heartbeat_interval_seconds=0,
+    )
+
+    with TestClient(app) as http_client:
+        response = http_client.post(
+            "/v1/chat/completions",
+            headers={"X-Session-ID": "general-request"},
+            json={"messages": [{"role": "user", "content": "hello"}]},
+        )
+
+        assert response.status_code == 200
+        assert http_client.get("/v1/engines/load").json()["active_sessions"] == 1
+
+
+def test_registered_partial_rollout_request_acquires_normally():
+    app = create_app(
+        tokenizer=FakeTokenizer(),
+        tokenizer_path="model",
+        token_build_mode="snapshot",
+        sglang_client=DirectGenerationClient(),
+        enable_engine_rebalancing=True,
+        engine_rebalancing_config=EngineRebalancingConfig(enabled=True),
+        engine_rebalancing_model_config=simple_model_config(),
+        tool_call_parse_backend="local",
+        reasoning_parse_backend="local",
+        stream_heartbeat_interval_seconds=0,
+    )
+
+    with TestClient(app) as http_client:
+        assert http_client.post(
+            "/v1/session/context",
+            json={"session_id": "registered-request", "group_size": 1},
+        ).status_code == 200
+
+        response = http_client.post(
+            "/v1/chat/completions",
+            headers={
+                "X-Session-ID": "registered-request",
+                "X-Dressage-Partial-Rollout": "1",
+            },
+            json={"messages": [{"role": "user", "content": "hello"}]},
+        )
+
+        assert response.status_code == 200
+        assert http_client.get("/v1/engines/load").json()["active_sessions"] == 1
+
+
+def test_session_context_delete_endpoint_requires_auth_and_is_idempotent():
+    app = create_app(
+        tokenizer=FakeTokenizer(),
+        tokenizer_path="model",
+        token_build_mode="snapshot",
+        sglang_client=DirectGenerationClient(),
+        api_key="proxy-secret",
+        enable_engine_rebalancing=True,
+        engine_rebalancing_config=EngineRebalancingConfig(enabled=True),
+        engine_rebalancing_model_config=simple_model_config(),
+        tool_call_parse_backend="local",
+        reasoning_parse_backend="local",
+    )
+    headers = {"Authorization": "Bearer proxy-secret"}
+
+    with TestClient(app) as http_client:
+        registered = http_client.post(
+            "/v1/session/context",
+            headers=headers,
+            json={"session_id": "discard-me", "group_size": 1},
+        )
+        assert registered.status_code == 200
+        assert http_client.get("/v1/engines/load", headers=headers).json()[
+            "active_sessions"
+        ] == 1
+
+        unauthorized = http_client.delete("/v1/session/context/discard-me")
+        assert unauthorized.status_code == 401
+
+        first = http_client.delete(
+            "/v1/session/context/discard-me", headers=headers
+        )
+        second = http_client.delete(
+            "/v1/session/context/discard-me", headers=headers
+        )
+
+        assert first.status_code == second.status_code == 200
+        assert first.json() == second.json() == {
+            "success": True,
+            "session_id": "discard-me",
+        }
+        assert http_client.get("/v1/engines/load", headers=headers).json()[
+            "active_sessions"
+        ] == 0
+
+
+@pytest.mark.parametrize("settle_method", ["complete", "fail"])
+def test_request_cancellation_waits_for_routing_lease_settle(
+    monkeypatch, settle_method
+):
+    class ControlledGenerationClient(DirectGenerationClient):
+        def __init__(self):
+            super().__init__()
+            self.generation_started = asyncio.Event()
+            self.generation_release = asyncio.Event()
+
+        async def generate(self, *args, **kwargs):
+            self.generation_started.set()
+            await self.generation_release.wait()
+            if settle_method == "fail":
+                raise RuntimeError("generation boom")
+            return await super().generate(*args, **kwargs)
+
+    async def scenario():
+        generation_client = ControlledGenerationClient()
+        app = create_app(
+            tokenizer=FakeTokenizer(),
+            tokenizer_path="model",
+            token_build_mode="snapshot",
+            sglang_client=generation_client,
+            enable_engine_rebalancing=True,
+            engine_rebalancing_config=EngineRebalancingConfig(enabled=True),
+            engine_rebalancing_model_config=simple_model_config(),
+            tool_call_parse_backend="local",
+            reasoning_parse_backend="local",
+            stream_heartbeat_interval_seconds=0,
+        )
+        rebalancer = app.state.engine_rebalancer
+        await rebalancer.refresh()
+        original_settle = getattr(rebalancer, settle_method)
+        settle_started = asyncio.Event()
+        settle_tasks: list[asyncio.Task] = []
+        settle_leases: list[RoutingLease] = []
+
+        async def tracked_settle(*args, **kwargs):
+            settle_tasks.append(asyncio.current_task())
+            settle_leases.append(args[0])
+            settle_started.set()
+            return await original_settle(*args, **kwargs)
+
+        monkeypatch.setattr(rebalancer, settle_method, tracked_settle)
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://proxy.test",
+        ) as http_client:
+            request_task = asyncio.create_task(
+                http_client.post(
+                    "/v1/chat/completions",
+                    headers={"X-Session-ID": "cancel-settle"},
+                    json={"messages": [{"role": "user", "content": "hello"}]},
+                )
+            )
+            await generation_client.generation_started.wait()
+            await rebalancer._lock.acquire()
+            try:
+                generation_client.generation_release.set()
+                await settle_started.wait()
+                load = rebalancer.loads[settle_leases[0].worker_url]
+                assert load.reserved_requests == 1
+                assert load.reserved_tokens > 0
+                assert load.reserved_prefill_tokens > 0
+
+                request_task.cancel()
+                await asyncio.sleep(0)
+                request_task.cancel()
+                await asyncio.sleep(0)
+                assert not request_task.done()
+            finally:
+                rebalancer._lock.release()
+
+            with pytest.raises(asyncio.CancelledError):
+                await request_task
+
+        assert len(settle_tasks) == 1
+        assert settle_tasks[0].done()
+        assert load.reserved_requests == 0
+        assert load.reserved_tokens == 0
+        assert load.reserved_prefill_tokens == 0
+        assert rebalancer.sessions["cancel-settle"].pending_owner_worker_url is None
+
+    run(scenario())
+
+
+def test_generation_failure_is_not_masked_when_lease_fail_settle_raises(monkeypatch):
+    class FailingGenerationClient(DirectGenerationClient):
+        async def generate(self, *args, **kwargs):
+            raise RuntimeError("generation boom")
+
+    async def scenario():
+        app = create_app(
+            tokenizer=FakeTokenizer(),
+            tokenizer_path="model",
+            token_build_mode="snapshot",
+            sglang_client=FailingGenerationClient(),
+            enable_engine_rebalancing=True,
+            engine_rebalancing_config=EngineRebalancingConfig(enabled=True),
+            engine_rebalancing_model_config=simple_model_config(),
+            tool_call_parse_backend="local",
+            reasoning_parse_backend="local",
+            stream_heartbeat_interval_seconds=0,
+        )
+
+        async def fail_settle(_lease):
+            raise RuntimeError("settle boom")
+
+        monkeypatch.setattr(app.state.engine_rebalancer, "fail", fail_settle)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://proxy.test",
+        ) as http_client:
+            with pytest.raises(RuntimeError, match="generation boom"):
+                await http_client.post(
+                    "/v1/chat/completions",
+                    headers={"X-Session-ID": "generation-fail"},
+                    json={"messages": [{"role": "user", "content": "hello"}]},
+                )
+
+    run(scenario())
+
+
+def test_cancelled_lease_settle_logs_late_failure_without_masking_cancel(caplog):
+    async def scenario():
+        settle_started = asyncio.Event()
+        settle_release = asyncio.Event()
+
+        async def settle():
+            settle_started.set()
+            await settle_release.wait()
+            raise RuntimeError("late settle boom")
+
+        task = asyncio.create_task(_settle_routing_lease(settle()))
+        await settle_started.wait()
+        task.cancel()
+        await asyncio.sleep(0)
+        settle_release.set()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    with caplog.at_level(logging.WARNING, logger="dressage.proxy.server"):
+        run(scenario())
+
+    assert "routing lease settle failed after caller cancellation" in caplog.text
+    assert "late settle boom" in caplog.text
+
+
+def test_self_cancelled_fail_settle_does_not_mask_generation_failure(
+    monkeypatch, caplog
+):
+    class FailingGenerationClient(DirectGenerationClient):
+        async def generate(self, *args, **kwargs):
+            raise RuntimeError("generation boom")
+
+    async def scenario():
+        app = create_app(
+            tokenizer=FakeTokenizer(),
+            tokenizer_path="model",
+            token_build_mode="snapshot",
+            sglang_client=FailingGenerationClient(),
+            enable_engine_rebalancing=True,
+            engine_rebalancing_config=EngineRebalancingConfig(enabled=True),
+            engine_rebalancing_model_config=simple_model_config(),
+            tool_call_parse_backend="local",
+            reasoning_parse_backend="local",
+            stream_heartbeat_interval_seconds=0,
+        )
+
+        async def self_cancelled_fail(_lease):
+            raise asyncio.CancelledError()
+
+        monkeypatch.setattr(
+            app.state.engine_rebalancer, "fail", self_cancelled_fail
+        )
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://proxy.test",
+        ) as http_client:
+            with pytest.raises(RuntimeError, match="generation boom"):
+                await http_client.post(
+                    "/v1/chat/completions",
+                    headers={"X-Session-ID": "self-cancelled-fail"},
+                    json={"messages": [{"role": "user", "content": "hello"}]},
+                )
+
+    with caplog.at_level(logging.WARNING, logger="dressage.proxy.server"):
+        run(scenario())
+
+    assert "engine rebalancing failure settle failed" in caplog.text
+
+
+def test_self_cancelled_complete_settle_does_not_change_generation_response(
+    monkeypatch, caplog
+):
+    async def scenario():
+        app = create_app(
+            tokenizer=FakeTokenizer(),
+            tokenizer_path="model",
+            token_build_mode="snapshot",
+            sglang_client=DirectGenerationClient(),
+            enable_engine_rebalancing=True,
+            engine_rebalancing_config=EngineRebalancingConfig(enabled=True),
+            engine_rebalancing_model_config=simple_model_config(),
+            tool_call_parse_backend="local",
+            reasoning_parse_backend="local",
+            stream_heartbeat_interval_seconds=0,
+        )
+
+        async def self_cancelled_complete(*args, **kwargs):
+            raise asyncio.CancelledError()
+
+        monkeypatch.setattr(
+            app.state.engine_rebalancer, "complete", self_cancelled_complete
+        )
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://proxy.test",
+        ) as http_client:
+            response = await http_client.post(
+                "/v1/chat/completions",
+                headers={"X-Session-ID": "self-cancelled-complete"},
+                json={"messages": [{"role": "user", "content": "hello"}]},
+            )
+
+        assert response.status_code == 200
+        assert response.json()["choices"][0]["message"]["content"] == "x"
+
+    with caplog.at_level(logging.WARNING, logger="dressage.proxy.server"):
+        run(scenario())
+
+    assert "engine rebalancing observation failed" in caplog.text
+
+
+def test_complete_observation_failure_does_not_change_generation_response(monkeypatch):
+    async def scenario():
+        app = create_app(
+            tokenizer=FakeTokenizer(),
+            tokenizer_path="model",
+            token_build_mode="snapshot",
+            sglang_client=DirectGenerationClient(),
+            enable_engine_rebalancing=True,
+            engine_rebalancing_config=EngineRebalancingConfig(enabled=True),
+            engine_rebalancing_model_config=simple_model_config(),
+            tool_call_parse_backend="local",
+            reasoning_parse_backend="local",
+            stream_heartbeat_interval_seconds=0,
+        )
+
+        async def complete_settle(*args, **kwargs):
+            raise RuntimeError("observation boom")
+
+        monkeypatch.setattr(app.state.engine_rebalancer, "complete", complete_settle)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://proxy.test",
+        ) as http_client:
+            response = await http_client.post(
+                "/v1/chat/completions",
+                headers={"X-Session-ID": "observation-fail"},
+                json={"messages": [{"role": "user", "content": "hello"}]},
+            )
+
+        assert response.status_code == 200
+        assert response.json()["choices"][0]["message"]["content"] == "x"
+
+    run(scenario())
+
+
+def _benchmark_heredoc(function_name: str) -> str:
+    path = Path(
+        "examples/scripts/benchmark_engine_rebalancing_qwen3.5_4b_sync_local_l3_hicache.sh"
+    )
+    source = path.read_text(encoding="utf-8")
+    marker = f"{function_name}() {{"
+    assert marker in source, f"{function_name} is missing"
+    function_start = source.index(marker)
+    heredoc_start = source.index("<<'PY'\n", function_start) + len("<<'PY'\n")
+    heredoc_end = source.index("\nPY\n", heredoc_start)
+    return source[heredoc_start:heredoc_end]
+
+
+def _run_benchmark_heredoc(
+    function_name: str,
+    *args: str,
+    env: dict[str, str] | None = None,
+    file_size_limit: int | None = None,
+) -> subprocess.CompletedProcess[str]:
+    def limit_file_size() -> None:
+        signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+        resource.setrlimit(resource.RLIMIT_FSIZE, (file_size_limit, file_size_limit))
+
+    return subprocess.run(
+        [sys.executable, "-c", _benchmark_heredoc(function_name), *args],
+        cwd=Path.cwd(),
+        env=env,
+        preexec_fn=limit_file_size if file_size_limit is not None else None,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_engine_rebalancing_benchmark_generates_seeded_tool_prompts_once(tmp_path):
+    source = Path("examples/data/dressage_dapo_prompts_dynamic_multi.jsonl")
+    source_bytes = source.read_bytes()
+    source_mtime_ns = source.stat().st_mtime_ns
+    output = tmp_path / "prompts.deterministic.jsonl"
+
+    result = _run_benchmark_heredoc(
+        "prepare_deterministic_prompts", str(source), str(output), "20260806"
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert source.read_bytes() == source_bytes
+    assert source.stat().st_mtime_ns == source_mtime_ns
+
+    source_rows = [json.loads(line) for line in source.read_text(encoding="utf-8").splitlines()]
+    output_bytes = output.read_bytes()
+    output_rows = [json.loads(line) for line in output_bytes.decode("utf-8").splitlines()]
+    assert len(source_rows) == len(output_rows) == 255
+    assert [row["metadata"]["instance_id"] for row in output_rows] == [
+        row["metadata"]["instance_id"] for row in source_rows
+    ]
+
+    source_contents = [row["prompt"][0]["content"] for row in source_rows]
+    output_contents = [row["prompt"][0]["content"] for row in output_rows]
+    assert sum(content.count("mktemp /tmp/dressage-step.XXXXXX") for content in source_contents) == 255
+    assert sum(content.count("date +%s%N > <PATH>") for content in source_contents) == 195
+    assert "mktemp /tmp/dressage-step.XXXXXX" not in "\n".join(output_contents)
+    assert "date +%s%N > <PATH>" not in "\n".join(output_contents)
+    assert "filename returned by the first call" not in "\n".join(output_contents)
+
+    expected_paths = []
+    expected_timestamps = []
+    for row in source_rows:
+        instance_id = row["metadata"]["instance_id"]
+        digest = hashlib.sha256(f"20260806:{instance_id}".encode()).hexdigest()
+        expected_paths.append(f"/tmp/dressage-step-{digest[:16]}")
+        expected_timestamps.append(1_700_000_000_000_000_000 + int(digest[16:28], 16) % 1_000_000_000_000)
+
+    for source_content, output_content, path, timestamp in zip(
+        source_contents, output_contents, expected_paths, expected_timestamps, strict=True
+    ):
+        assert f"LC_ALL=C install -v -m 600 /dev/null {path}" in output_content
+        if "date +%s%N > <PATH>" in source_content:
+            assert f"printf '%s\\n' '{timestamp}' > {path}" in output_content
+        assert re.search(
+            r"This session requires exactly [1-5] sequential bash tool call\(s\)",
+            output_content,
+        )
+
+    same_seed = tmp_path / "prompts.same-seed.jsonl"
+    different_seed = tmp_path / "prompts.different-seed.jsonl"
+    assert _run_benchmark_heredoc(
+        "prepare_deterministic_prompts", str(source), str(same_seed), "20260806"
+    ).returncode == 0
+    assert _run_benchmark_heredoc(
+        "prepare_deterministic_prompts", str(source), str(different_seed), "20260807"
+    ).returncode == 0
+    assert same_seed.read_bytes() == output_bytes
+    assert different_seed.read_bytes() != output_bytes
+
+
+@pytest.mark.parametrize("alias_kind", ["same", "symlink", "hardlink"])
+def test_engine_rebalancing_benchmark_rejects_prompt_output_aliases(
+    tmp_path, alias_kind
+):
+    source = tmp_path / "source.jsonl"
+    source.write_bytes(
+        Path("examples/data/dressage_dapo_prompts_dynamic_multi.jsonl").read_bytes()
+    )
+    if alias_kind == "same":
+        effective = source
+    else:
+        effective = tmp_path / "effective.jsonl"
+        if alias_kind == "symlink":
+            effective.symlink_to(source)
+        else:
+            effective.hardlink_to(source)
+    source_bytes = source.read_bytes()
+    source_mtime_ns = source.stat().st_mtime_ns
+
+    result = _run_benchmark_heredoc(
+        "prepare_deterministic_prompts", str(source), str(effective), "20260806"
+    )
+
+    assert result.returncode != 0
+    assert "same file" in result.stderr
+    assert source.read_bytes() == source_bytes
+    assert source.stat().st_mtime_ns == source_mtime_ns
+
+
+def test_engine_rebalancing_benchmark_generation_failure_preserves_effective_file(
+    tmp_path,
+):
+    source = Path("examples/data/dressage_dapo_prompts_dynamic_multi.jsonl")
+    effective = tmp_path / "prompts.deterministic.jsonl"
+    original_effective = b"existing effective prompt data\n"
+    effective.write_bytes(original_effective)
+
+    result = _run_benchmark_heredoc(
+        "prepare_deterministic_prompts",
+        str(source),
+        str(effective),
+        "20260806",
+        file_size_limit=1024,
+    )
+
+    assert result.returncode != 0
+    assert effective.read_bytes() == original_effective
+
+
+def test_engine_rebalancing_benchmark_prepares_once_before_both_runs():
+    source = Path(
+        "examples/scripts/benchmark_engine_rebalancing_qwen3.5_4b_sync_local_l3_hicache.sh"
+    ).read_text(encoding="utf-8")
+    prepare_call = (
+        'prepare_deterministic_prompts "${PROMPT_SOURCE}" '
+        '"${PROMPT_EFFECTIVE}" "${BENCHMARK_SEED}"'
+    )
+    run_loop = 'for index in "${!RUN_NAMES[@]}"; do\n  run_one'
+    run_one = source[source.index("run_one() {") : source.index("write_summary() {")]
+
+    assert source.count(prepare_call) == 1
+    assert source.index(prepare_call) < source.index(run_loop)
+    assert run_one.count('export PROMPT_DATA="${PROMPT_EFFECTIVE}"') == 1
+    assert "prepare_deterministic_prompts" not in run_one
+
+
+def test_engine_rebalancing_benchmark_environment_records_prompt_fingerprints(
+    tmp_path,
+):
+    repo = Path.cwd()
+    benchmark_script = repo / (
+        "examples/scripts/"
+        "benchmark_engine_rebalancing_qwen3.5_4b_sync_local_l3_hicache.sh"
+    )
+    source_recipe = repo / (
+        "examples/scripts/run_blackbox_qwen3.5_4b_sync_local_l3_hicache.sh"
+    )
+    prompt_source = repo / "examples/data/dressage_dapo_prompts_dynamic_multi.jsonl"
+    prompt_effective = tmp_path / "prompts.deterministic.jsonl"
+    prompt_effective.write_text("effective\n", encoding="utf-8")
+    output = tmp_path / "environment.txt"
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    nvidia_smi = bin_dir / "nvidia-smi"
+    nvidia_smi.write_text(
+        "#!/usr/bin/env bash\nprintf '%s\\n' '0, Test GPU, uuid, driver'\n",
+        encoding="utf-8",
+    )
+    nvidia_smi.chmod(0o755)
+
+    result = _run_benchmark_heredoc(
+        "record_environment",
+        str(repo),
+        str(source_recipe),
+        str(benchmark_script),
+        str(prompt_source),
+        str(prompt_effective),
+        str(output),
+        "seed20260806-off-r1",
+        "off",
+        "20260806",
+        env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"},
+    )
+
+    assert result.returncode == 0, result.stderr
+    environment = dict(
+        line.split("=", 1)
+        for line in output.read_text(encoding="utf-8").splitlines()
+    )
+    assert environment["prompt_source"] == str(prompt_source)
+    assert environment["prompt_source_sha256"] == hashlib.sha256(
+        prompt_source.read_bytes()
+    ).hexdigest()
+    assert environment["prompt_effective"] == str(prompt_effective)
+    assert environment["prompt_effective_sha256"] == hashlib.sha256(
+        prompt_effective.read_bytes()
+    ).hexdigest()
+
+
+def test_engine_rebalancing_benchmark_collector_uses_sampling_seed_identity(tmp_path):
+    run_dir = tmp_path / "run"
+    samples_dir = run_dir / "runtime" / "traj_payload" / "run" / "samples"
+    samples_dir.mkdir(parents=True)
+    samples = [
+        ("z.json", "alpha", 29, 1),
+        ("a.json", "alpha", 11, 0),
+        ("y.json", "beta", 41, 0),
+        ("b.json", "beta", 17, 1),
+    ]
+    for filename, instance_id, sampling_seed, segment_index in samples:
+        (samples_dir / filename).write_text(
+            json.dumps(
+                {
+                    "instance_id": instance_id,
+                    "segment_index": segment_index,
+                    "tokens": [1, 2],
+                    "status": "complete",
+                    "reward": 1.0,
+                    "metadata": {"rollout_sampling_seed": sampling_seed},
+                    "loss_mask": [1, 1],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    result = _run_benchmark_heredoc(
+        "collect_run", str(run_dir), "run", "off", "0", "1", "2"
+    )
+
+    assert result.returncode == 0, result.stderr
+    hash_lines = (run_dir / "trajectory_hashes.txt").read_text(encoding="utf-8")
+    assert "instance_id=alpha sampling_seed=11 segment_index=0" in hash_lines
+    assert "instance_id=alpha sampling_seed=29 segment_index=1" in hash_lines
+    assert "instance_id=beta sampling_seed=17 segment_index=1" in hash_lines
+    assert hash_lines.index("instance_id=alpha sampling_seed=11") < hash_lines.index(
+        "instance_id=alpha sampling_seed=29"
+    )
+    metrics = json.loads((run_dir / "metrics.json").read_text(encoding="utf-8"))
+    assert not any("sampling seed" in error for error in metrics["acceptance_errors"])
+
+    duplicate = json.loads((samples_dir / "b.json").read_text(encoding="utf-8"))
+    duplicate["metadata"]["rollout_sampling_seed"] = 41
+    (samples_dir / "b.json").write_text(json.dumps(duplicate), encoding="utf-8")
+    duplicate_result = _run_benchmark_heredoc(
+        "collect_run", str(run_dir), "run", "off", "0", "1", "2"
+    )
+
+    assert duplicate_result.returncode == 0, duplicate_result.stderr
+    duplicate_metrics = json.loads((run_dir / "metrics.json").read_text(encoding="utf-8"))
+    assert any("sampling seed" in error for error in duplicate_metrics["acceptance_errors"])
+
+
+def _write_benchmark_sample(
+    path: Path,
+    *,
+    instance_id: str,
+    sampling_seed: int | None,
+    segment_index: int,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    metadata = {}
+    if sampling_seed is not None:
+        metadata["rollout_sampling_seed"] = sampling_seed
+    path.write_text(
+        json.dumps(
+            {
+                "instance_id": instance_id,
+                "segment_index": segment_index,
+                "tokens": [1, 2],
+                "status": "complete",
+                "reward": 1.0,
+                "metadata": metadata,
+                "loss_mask": [1, 1],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def _collect_benchmark_run(run_dir: Path) -> dict:
+    result = _run_benchmark_heredoc(
+        "collect_run", str(run_dir), "run", "off", "0", "1", "2"
+    )
+    assert result.returncode == 0, result.stderr
+    return json.loads((run_dir / "metrics.json").read_text(encoding="utf-8"))
+
+
+def test_engine_rebalancing_benchmark_collector_rejects_missing_sampling_seed(
+    tmp_path,
+):
+    samples = tmp_path / "runtime" / "traj_payload" / "run" / "samples"
+    _write_benchmark_sample(
+        samples / "a.json",
+        instance_id="alpha",
+        sampling_seed=11,
+        segment_index=0,
+    )
+    _write_benchmark_sample(
+        samples / "b.json",
+        instance_id="alpha",
+        sampling_seed=None,
+        segment_index=0,
+    )
+
+    metrics = _collect_benchmark_run(tmp_path)
+
+    assert any(
+        "instance alpha is missing a rollout sampling seed" in error
+        for error in metrics["acceptance_errors"]
+    )
+
+
+def test_engine_rebalancing_benchmark_collector_allows_segments_per_base_seed(
+    tmp_path,
+):
+    samples = tmp_path / "runtime" / "traj_payload" / "run" / "samples"
+    for sampling_seed in (11, 29):
+        for segment_index in (0, 1):
+            _write_benchmark_sample(
+                samples / f"{sampling_seed}-{segment_index}.json",
+                instance_id="alpha",
+                sampling_seed=sampling_seed,
+                segment_index=segment_index,
+            )
+
+    metrics = _collect_benchmark_run(tmp_path)
+
+    assert not any(
+        "sampling seed" in error for error in metrics["acceptance_errors"]
+    )
+
+
+def test_engine_rebalancing_benchmark_trajectory_hash_uses_seed_not_file_order(
+    tmp_path,
+):
+    records = [
+        ("alpha", 11, 0),
+        ("alpha", 29, 1),
+        ("beta", 17, 1),
+        ("beta", 41, 0),
+    ]
+    first_run = tmp_path / "first"
+    second_run = tmp_path / "second"
+    changed_seed_run = tmp_path / "changed-seed"
+    for index, (instance_id, sampling_seed, segment_index) in enumerate(records):
+        _write_benchmark_sample(
+            first_run
+            / "runtime"
+            / "traj_payload"
+            / "run"
+            / f"batch-{index}"
+            / "samples"
+            / f"sample-{index}.json",
+            instance_id=instance_id,
+            sampling_seed=sampling_seed,
+            segment_index=segment_index,
+        )
+        reverse_index = len(records) - index
+        _write_benchmark_sample(
+            second_run
+            / "runtime"
+            / "traj_payload"
+            / "run"
+            / f"batch-{reverse_index}"
+            / "samples"
+            / f"sample-{reverse_index}.json",
+            instance_id=instance_id,
+            sampling_seed=sampling_seed,
+            segment_index=segment_index,
+        )
+        _write_benchmark_sample(
+            changed_seed_run
+            / "runtime"
+            / "traj_payload"
+            / "run"
+            / f"batch-{index}"
+            / "samples"
+            / f"sample-{index}.json",
+            instance_id=instance_id,
+            sampling_seed=30 if sampling_seed == 29 else sampling_seed,
+            segment_index=segment_index,
+        )
+
+    first_hash = _collect_benchmark_run(first_run)["trajectory_hash"]
+    second_hash = _collect_benchmark_run(second_run)["trajectory_hash"]
+    changed_seed_hash = _collect_benchmark_run(changed_seed_run)["trajectory_hash"]
+
+    assert first_hash == second_hash
+    assert changed_seed_hash != first_hash
 
 
 def test_sync_local_script_gracefully_stops_proxy_before_ray():

@@ -108,6 +108,8 @@ class ProxyOptions(BaseModel):
     sticky_header_name: str = "X-SMG-Routing-Key"
     max_steps: int | None = Field(default=DEFAULT_PROXY_MAX_STEPS, gt=0)
     default_temperature: float | None = Field(default=None, ge=0)
+    sampling_mode: Literal["fill_missing", "force"] | None = None
+    sampling_seed_base: int | None = None
 
 
 class BindingInfo(BaseModel):

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import sys
 import time
 from typing import Any
 
@@ -67,6 +69,51 @@ def _backend_options_for_register(
     return merge_backend_options(blackbox_type, backend_options, args=args)
 
 
+async def _discard_session_context(
+    proxy_client: Any,
+    *,
+    session_id: str,
+    metadata: dict[str, Any],
+) -> None:
+    discard = getattr(proxy_client, "discard_session_context", None)
+    if not callable(discard):
+        return
+
+    async def capture_cleanup_error() -> BaseException | None:
+        try:
+            await maybe_await(discard(session_id))
+        except asyncio.CancelledError as exc:
+            return exc
+        except Exception as exc:
+            return exc
+        return None
+
+    cleanup_task = asyncio.create_task(capture_cleanup_error())
+    cancelled_error = None
+    while not cleanup_task.done():
+        try:
+            await asyncio.shield(cleanup_task)
+        except asyncio.CancelledError as exc:
+            if cancelled_error is None:
+                cancelled_error = exc
+        except Exception:
+            pass
+
+    cleanup_error = (
+        asyncio.CancelledError() if cleanup_task.cancelled() else cleanup_task.result()
+    )
+    if cleanup_error is not None:
+        summary = _exception_summary(cleanup_error)
+        metadata["session_context_discard_error"] = summary
+        logger.warning(
+            "failed to discard session context for session_id=%s: %s",
+            session_id,
+            summary,
+        )
+    if cancelled_error is not None:
+        raise cancelled_error
+
+
 async def generate(
     args: Any,
     sample: Any,
@@ -74,7 +121,6 @@ async def generate(
     evaluation: bool = False,
 ) -> Any:
     """Run one blackbox sandbox rollout and write proxy data back to Sample."""
-    del sampling_params
     if evaluation:
         raise ValueError("blackbox_dispatch does not support evaluation mode")
 
@@ -87,7 +133,9 @@ async def generate(
     metadata.pop("blackbox_expected_abort", None)
     metadata.pop("blackbox_agent_early_stop", None)
     metadata.pop("blackbox_agent_early_stop_kind", None)
+    metadata.pop("session_context_discard_error", None)
     metadata["execute_cmds"] = []
+    deterministic_session_id = metadata.get("dressage_deterministic_session_id")
     session_id = ensure_blackbox_session_id(sample)
     instance_id = _instance_id(sample)
     metadata["session_id"] = session_id
@@ -106,6 +154,9 @@ async def generate(
     paddock = None
     state = None
     initialized = False
+    proxy_client = None
+    context_owned = False
+    original_cancelled_error = None
     agent_response = ""
     try:
         execute_cmd_schedule = parse_blackbox_execute_cmds(
@@ -116,13 +167,20 @@ async def generate(
             metadata=metadata,
             blackbox_type=blackbox_type,
         )
+        sampling_seed = sampling_params.get("sampling_seed")
+        if sampling_seed is not None:
+            metadata["rollout_sampling_seed"] = int(sampling_seed)
+            if isinstance(backend_options, dict):
+                backend_options = dict(backend_options)
+                proxy_options = backend_options.get("proxy")
+                if not isinstance(proxy_options, dict):
+                    proxy_options = {}
+                backend_options["proxy"] = {
+                    **proxy_options,
+                    "sampling_mode": "force",
+                    "sampling_seed_base": int(sampling_seed),
+                }
         proxy_client = get_proxy_client()
-        await register_rollout_group_context(
-            proxy_client,
-            args=args,
-            sample=sample,
-            session_id=session_id,
-        )
         prewarm_requested = bool(metadata.get("prewarm_requested"))
         prewarm_t0 = time.monotonic()
         handle = await claim_prewarm(session_id)
@@ -148,8 +206,12 @@ async def generate(
             if prewarm_requested:
                 metadata["prewarm_hit"] = 0
             previous_session_id = session_id
-            sample.session_id = None
-            session_id = ensure_blackbox_session_id(sample)
+            if isinstance(deterministic_session_id, str):
+                session_id = f"{previous_session_id}-miss"
+                sample.session_id = session_id
+            else:
+                sample.session_id = None
+                session_id = ensure_blackbox_session_id(sample)
             metadata["session_id"] = session_id
             logger.debug(
                 "initializing sandbox with a new session_id after prewarm miss: "
@@ -186,6 +248,14 @@ async def generate(
             session_id=session_id,
             stage="before_agent",
         )
+        if callable(getattr(proxy_client, "register_session_context", None)):
+            context_owned = True
+            await register_rollout_group_context(
+                proxy_client,
+                args=args,
+                sample=sample,
+                session_id=session_id,
+            )
         call_payload: Any = None
         call_succeeded = False
         try:
@@ -234,6 +304,7 @@ async def generate(
         await proxy_client.finalize_session(
             session_id, instance_id=instance_id, label=getattr(sample, "label", None)
         )
+        context_owned = False
         trajectory_payload = await proxy_client.read_trajectory(
             trajectory_id=session_id,
             instance_id=instance_id,
@@ -279,6 +350,9 @@ async def generate(
                 exc_info=True,
             )
         return result
+    except asyncio.CancelledError as exc:
+        original_cancelled_error = exc
+        raise
     except Exception as exc:
         expected_abort = expected_abort_from_call_agent_exception(exc)
         if expected_abort is None:
@@ -316,9 +390,26 @@ async def generate(
         _set_status(sample, "ABORTED")
         return sample
     finally:
-        if initialized and paddock is not None:
-            schedule_terminate_paddock(
-                paddock,
-                session_id=session_id,
-                env_args=env_args,
-            )
+        active_error = sys.exception()
+        if original_cancelled_error is None and isinstance(
+            active_error, asyncio.CancelledError
+        ):
+            original_cancelled_error = active_error
+        try:
+            if context_owned:
+                try:
+                    await _discard_session_context(
+                        proxy_client,
+                        session_id=session_id,
+                        metadata=metadata,
+                    )
+                except asyncio.CancelledError:
+                    if original_cancelled_error is None:
+                        raise
+        finally:
+            if initialized and paddock is not None:
+                schedule_terminate_paddock(
+                    paddock,
+                    session_id=session_id,
+                    env_args=env_args,
+                )

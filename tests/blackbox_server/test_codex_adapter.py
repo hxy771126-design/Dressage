@@ -21,6 +21,7 @@ from blackbox_server.config import BlackboxServerConfig
 from blackbox_server.core.models import (
     BindingContext,
     BindingInfo,
+    ProxyOptions,
     SessionContext,
     SessionState,
     TurnContext,
@@ -69,6 +70,45 @@ def test_codex_options_default_to_full_access_noninteractive() -> None:
     assert options.skip_git_repo_check is True
     assert options.ignore_rules is True
     assert options.web_search == "disabled"
+
+
+def test_codex_adapter_passes_deterministic_sampling_to_rollout_proxy(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeRolloutLLMProxy:
+        def __init__(self, **kwargs: object) -> None:
+            captured.update(kwargs)
+
+        async def app(self, scope, receive, send):
+            return None
+
+    class FakeBackgroundUvicornServer:
+        def __init__(self, config: object) -> None:
+            self.config = config
+
+        async def serve(self) -> None:
+            return None
+
+    async def no_wait_for_proxy() -> None:
+        return None
+
+    async def run_test() -> None:
+        adapter = CodexAdapter()
+        options = CodexBackendOptions(
+            proxy=ProxyOptions(sampling_mode="force", sampling_seed_base=700)
+        )
+        monkeypatch.setattr(codex_module, "RolloutLLMProxy", FakeRolloutLLMProxy)
+        monkeypatch.setattr(codex_module, "_BackgroundUvicornServer", FakeBackgroundUvicornServer)
+        monkeypatch.setattr(adapter, "_find_free_port", lambda: 4567)
+        monkeypatch.setattr(adapter, "_wait_for_proxy", no_wait_for_proxy)
+        await adapter._start_proxy(_make_binding_context(tmp_path), options)
+
+    asyncio.run(run_test())
+
+    assert captured["sampling_mode"] == "force"
+    assert captured["sampling_seed_base"] == 700
 
 
 def test_codex_options_reject_invalid_agents_fields() -> None:

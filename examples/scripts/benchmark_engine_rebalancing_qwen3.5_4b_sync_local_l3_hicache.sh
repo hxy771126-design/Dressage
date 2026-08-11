@@ -6,6 +6,8 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 REPO_ROOT="${REPO_ROOT:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 SOURCE_RECIPE="${SCRIPT_DIR}/run_blackbox_qwen3.5_4b_sync_local_l3_hicache.sh"
 BENCHMARK_ROOT="${BENCHMARK_ROOT:-${REPO_ROOT}/log/benchmarks/engine_rebalancing}"
+PROMPT_SOURCE="${PROMPT_DATA:-${REPO_ROOT}/examples/data/dressage_dapo_prompts_dynamic_multi.jsonl}"
+PROMPT_EFFECTIVE="${BENCHMARK_ROOT}/prompts.deterministic.jsonl"
 
 BENCHMARK_SEED="${BENCHMARK_SEED:-20260806}"
 BENCHMARK_DRY_RUN="${BENCHMARK_DRY_RUN:-0}"
@@ -30,6 +32,8 @@ print_plan() {
   echo "Engine Rebalancing A/B benchmark"
   echo "  source recipe: ${SOURCE_RECIPE}"
   echo "  output root:   ${BENCHMARK_ROOT}"
+  echo "  prompt source: ${PROMPT_SOURCE}"
+  echo "  prompt data:   ${PROMPT_EFFECTIVE}"
   echo "  seed:          ${BENCHMARK_SEED}"
   echo "  temperature:   ${ROLLOUT_TEMPERATURE}"
   echo "  rollout batch: ${ROLLOUT_BATCH_SIZE}"
@@ -86,6 +90,128 @@ for run_name in "${RUN_NAMES[@]}"; do
 done
 
 mkdir -p "${BENCHMARK_ROOT}"
+
+prepare_deterministic_prompts() {
+  local source_path="$1"
+  local output_path="$2"
+  local seed="$3"
+
+  python3 - "${source_path}" "${output_path}" "${seed}" <<'PY'
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import pathlib
+import re
+import sys
+import tempfile
+
+source_path = pathlib.Path(sys.argv[1])
+output_path = pathlib.Path(sys.argv[2])
+seed = sys.argv[3]
+if source_path.exists() and output_path.exists():
+    paths_alias = source_path.samefile(output_path)
+else:
+    paths_alias = source_path.resolve() == output_path.resolve()
+if paths_alias:
+    raise SystemExit("prompt source and effective output are the same file")
+
+source_lines = source_path.read_text(encoding="utf-8").splitlines()
+if len(source_lines) != 255:
+    raise SystemExit(f"expected 255 prompt rows, found {len(source_lines)}")
+source_rows = [json.loads(line) for line in source_lines]
+
+source_instance_ids: list[str] = []
+tool_steps: set[int] = set()
+mktemp_count = 0
+date_count = 0
+for row in source_rows:
+    metadata = row.get("metadata")
+    if not isinstance(metadata, dict) or not isinstance(metadata.get("instance_id"), str):
+        raise SystemExit("prompt row is missing metadata.instance_id")
+    source_instance_ids.append(metadata["instance_id"])
+    prompt = row.get("prompt")
+    if not isinstance(prompt, list):
+        raise SystemExit("prompt row is missing prompt messages")
+    for message in prompt:
+        if not isinstance(message, dict) or not isinstance(message.get("content"), str):
+            raise SystemExit("prompt message is missing content")
+        content = message["content"]
+        mktemp_count += content.count("mktemp /tmp/dressage-step.XXXXXX")
+        date_count += content.count("date +%s%N > <PATH>")
+        match = re.search(r"exactly ([1-5]) sequential bash tool call\(s\)", content)
+        if match is None:
+            raise SystemExit("prompt row has an invalid tool-step count")
+        tool_steps.add(int(match.group(1)))
+
+if len(set(source_instance_ids)) != len(source_instance_ids):
+    raise SystemExit("prompt instance_id values must be unique")
+if tool_steps != {1, 2, 3, 4, 5}:
+    raise SystemExit("prompt data must cover one through five tool steps")
+if mktemp_count != 255:
+    raise SystemExit(f"expected 255 mktemp commands, found {mktemp_count}")
+if date_count != 195:
+    raise SystemExit(f"expected 195 date commands, found {date_count}")
+
+for row, instance_id in zip(source_rows, source_instance_ids, strict=True):
+    digest = hashlib.sha256(f"{seed}:{instance_id}".encode("utf-8")).hexdigest()
+    path = f"/tmp/dressage-step-{digest[:16]}"
+    timestamp = 1_700_000_000_000_000_000 + int(digest[16:28], 16) % 1_000_000_000_000
+    for message in row["prompt"]:
+        content = message["content"]
+        content = content.replace(
+            "mktemp /tmp/dressage-step.XXXXXX",
+            f"LC_ALL=C install -v -m 600 /dev/null {path}",
+        )
+        content = content.replace(
+            "date +%s%N > <PATH>",
+            f"printf '%s\\n' '{timestamp}' > {path}",
+        )
+        content = content.replace(
+            "Remember the returned filename as <PATH>.",
+            f"Use the deterministic filename `{path}` as <PATH>.",
+        )
+        content = content.replace(
+            "replacing <PATH> with the filename returned by the first call.",
+            f"replacing <PATH> with the deterministic filename `{path}`.",
+        )
+        message["content"] = content
+
+effective_instance_ids = [row["metadata"]["instance_id"] for row in source_rows]
+effective_contents = [
+    message["content"] for row in source_rows for message in row["prompt"]
+]
+if effective_instance_ids != source_instance_ids:
+    raise SystemExit("deterministic prompt instance_id order changed")
+if any("mktemp /tmp/dressage-step.XXXXXX" in content for content in effective_contents):
+    raise SystemExit("deterministic prompt data still contains mktemp")
+if any("date +%s%N > <PATH>" in content for content in effective_contents):
+    raise SystemExit("deterministic prompt data still contains date")
+if any("filename returned by the first call" in content for content in effective_contents):
+    raise SystemExit("deterministic prompt data still describes a returned filename")
+
+effective_data = "".join(
+    json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n"
+    for row in source_rows
+)
+with tempfile.NamedTemporaryFile(
+    mode="w",
+    encoding="utf-8",
+    dir=output_path.parent,
+    prefix=f".{output_path.name}.",
+    suffix=".tmp",
+    delete=False,
+) as handle:
+    handle.write(effective_data)
+    handle.flush()
+    os.fsync(handle.fileno())
+    temporary_path = handle.name
+os.replace(temporary_path, output_path)
+PY
+}
+
+prepare_deterministic_prompts "${PROMPT_SOURCE}" "${PROMPT_EFFECTIVE}" "${BENCHMARK_SEED}"
 TEMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/dressage-rebalancing-benchmark.XXXXXX")"
 trap 'rm -rf -- "${TEMP_DIR}"' EXIT
 
@@ -98,6 +224,8 @@ record_environment() {
     "${REPO_ROOT}" \
     "${SOURCE_RECIPE}" \
     "${BASH_SOURCE[0]}" \
+    "${PROMPT_SOURCE}" \
+    "${PROMPT_EFFECTIVE}" \
     "${output_path}" \
     "${run_name}" \
     "${mode}" \
@@ -112,7 +240,7 @@ import socket
 import subprocess
 import sys
 
-repo, source_recipe, benchmark_script, output, run_name, mode, seed = sys.argv[1:]
+repo, source_recipe, benchmark_script, prompt_source, prompt_effective, output, run_name, mode, seed = sys.argv[1:]
 repo_path = pathlib.Path(repo)
 
 
@@ -170,6 +298,8 @@ fingerprint_payload = {
     "slime_diff_sha256": digest(slime_diff),
     "source_recipe_sha256": file_digest(source_recipe),
     "benchmark_script_sha256": file_digest(benchmark_script),
+    "prompt_source_sha256": file_digest(prompt_source),
+    "prompt_effective_sha256": file_digest(prompt_effective),
 }
 code_fingerprint = digest(
     json.dumps(fingerprint_payload, sort_keys=True, separators=(",", ":")).encode()
@@ -190,6 +320,10 @@ values = {
     "slime_worktree_diff_sha256": digest(slime_diff),
     "source_recipe_sha256": fingerprint_payload["source_recipe_sha256"],
     "benchmark_script_sha256": fingerprint_payload["benchmark_script_sha256"],
+    "prompt_source": prompt_source,
+    "prompt_source_sha256": fingerprint_payload["prompt_source_sha256"],
+    "prompt_effective": prompt_effective,
+    "prompt_effective_sha256": fingerprint_payload["prompt_effective_sha256"],
     "code_fingerprint": code_fingerprint,
     "benchmark_seed": seed,
     "rollout_temperature": "0",
@@ -459,8 +593,16 @@ for sample_path in sample_paths:
         sample = json.loads(sample_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         continue
+    metadata = sample.get("metadata")
+    sampling_seed = None
+    if isinstance(metadata, dict):
+        try:
+            sampling_seed = int(metadata["rollout_sampling_seed"])
+        except (KeyError, TypeError, ValueError):
+            pass
     record = {
         "instance_id": str(sample.get("instance_id")),
+        "sampling_seed": sampling_seed,
         "segment_index": sample.get("segment_index"),
         "tokens": sample.get("tokens"),
         "status": sample.get("status"),
@@ -470,7 +612,6 @@ for sample_path in sample_paths:
     status_text = str(sample.get("status") or "").lower()
     if "abort" in status_text:
         aborted_sample_count += 1
-    metadata = sample.get("metadata")
     if isinstance(metadata, dict):
         try:
             artifact_retry_count += int(metadata.get("dressage_retry_count", 0) or 0)
@@ -485,7 +626,13 @@ for sample_path in sample_paths:
         except (TypeError, ValueError):
             effective_tokens_available = False
 
-records.sort(key=lambda item: (item["instance_id"], str(item["segment_index"])))
+records.sort(
+    key=lambda item: (
+        item["instance_id"],
+        item["sampling_seed"] if item["sampling_seed"] is not None else -1,
+        item["segment_index"] if isinstance(item["segment_index"], int) else -1,
+    )
+)
 canonical_chunks: list[bytes] = []
 for record in records:
     canonical = json.dumps(
@@ -498,6 +645,7 @@ for record in records:
     item_hash = hashlib.sha256(canonical).hexdigest()
     hash_lines.append(
         f"{item_hash} instance_id={record['instance_id']} "
+        f"sampling_seed={record['sampling_seed']} "
         f"segment_index={record['segment_index']}"
     )
 aggregate_hash = hashlib.sha256(b"\n".join(canonical_chunks)).hexdigest() if records else None
@@ -640,6 +788,23 @@ if artifact_retry_count:
     acceptance_errors.append(f"trajectory artifacts report {artifact_retry_count} rollout retries")
 if aborted_sample_count:
     acceptance_errors.append(f"found {aborted_sample_count} aborted trajectory samples")
+sampling_seeds_by_instance: dict[str, set[int]] = defaultdict(set)
+missing_sampling_seed_instances: set[str] = set()
+for record in records:
+    if record["sampling_seed"] is None:
+        missing_sampling_seed_instances.add(record["instance_id"])
+    else:
+        sampling_seeds_by_instance[record["instance_id"]].add(record["sampling_seed"])
+for instance_id in sorted({record["instance_id"] for record in records}):
+    if instance_id in missing_sampling_seed_instances:
+        acceptance_errors.append(
+            f"instance {instance_id} is missing a rollout sampling seed"
+        )
+    elif len(sampling_seeds_by_instance[instance_id]) != 2:
+        acceptance_errors.append(
+            f"instance {instance_id} has {len(sampling_seeds_by_instance[instance_id])} "
+            "distinct rollout sampling seeds, expected 2"
+        )
 for key, matches in error_matches.items():
     if matches:
         acceptance_errors.append(f"detected {key}: {len(matches)} matching log lines")
@@ -727,6 +892,7 @@ run_one() {
     export DRESSAGE_BENCHMARK_SOURCE_SCRIPT_DIR="${SCRIPT_DIR}"
     export DRESSAGE_BENCHMARK_OUTPUT_DIR="${run_dir}"
     export RUN_NAME="${run_name}"
+    export PROMPT_DATA="${PROMPT_EFFECTIVE}"
     export LOG_DIR="${run_dir}/runtime"
     export GPU_UTIL_STATE_DIR="${TEMP_DIR}/gpu-state-${run_name}"
     export GPU_UTIL_LOG_DIR="${run_dir}/gpu"

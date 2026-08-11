@@ -22,7 +22,7 @@ from blackbox_server.adapters.claude_code import (
     convert_claude_code_stream_events,
 )
 from blackbox_server.config import BlackboxServerConfig
-from blackbox_server.core.models import BindingContext, BindingInfo, TurnContext, utcnow
+from blackbox_server.core.models import BindingContext, BindingInfo, ProxyOptions, TurnContext, utcnow
 
 EXPECTED_CLAUDE_CODE_PERMISSION_ALLOW = [
     "Bash(*)",
@@ -75,6 +75,47 @@ def test_claude_code_options_reject_unknown_fields() -> None:
 
 def test_claude_code_options_default_to_root_safe_permission_mode() -> None:
     assert ClaudeCodeBackendOptions().permission_mode == "default"
+
+
+def test_claude_code_adapter_passes_deterministic_sampling_to_rollout_proxy(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeRolloutLLMProxy:
+        def __init__(self, **kwargs: object) -> None:
+            captured.update(kwargs)
+
+        async def app(self, scope, receive, send):
+            return None
+
+    class FakeBackgroundUvicornServer:
+        def __init__(self, config: object) -> None:
+            self.config = config
+
+        async def serve(self) -> None:
+            return None
+
+    async def no_wait_for_proxy() -> None:
+        return None
+
+    async def run_test() -> None:
+        adapter = ClaudeCodeAdapter()
+        options = ClaudeCodeBackendOptions(
+            proxy=ProxyOptions(sampling_mode="force", sampling_seed_base=700)
+        )
+        monkeypatch.setattr(claude_code_module, "RolloutLLMProxy", FakeRolloutLLMProxy)
+        monkeypatch.setattr(
+            claude_code_module, "_BackgroundUvicornServer", FakeBackgroundUvicornServer
+        )
+        monkeypatch.setattr(adapter, "_find_free_port", lambda: 4567)
+        monkeypatch.setattr(adapter, "_wait_for_proxy", no_wait_for_proxy)
+        await adapter._start_proxy(_make_binding_context(tmp_path), options)
+
+    asyncio.run(run_test())
+
+    assert captured["sampling_mode"] == "force"
+    assert captured["sampling_seed_base"] == 700
 
 
 def test_config_compiler_defaults_keep_thinking_and_disable_prompt_caching(tmp_path: Path) -> None:

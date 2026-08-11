@@ -114,6 +114,50 @@ def _consume_task_exception(task: asyncio.Task[Any]) -> None:
         task.exception()
 
 
+async def _settle_routing_lease(settle: Any) -> None:
+    async def capture_settle_error() -> BaseException | None:
+        try:
+            await settle
+        except asyncio.CancelledError as exc:
+            return exc
+        except Exception as exc:
+            return exc
+        return None
+
+    settle_task = asyncio.create_task(
+        capture_settle_error(),
+        name="dressage-routing-lease-settle",
+    )
+    cancelled_error = None
+    while not settle_task.done():
+        try:
+            await asyncio.shield(settle_task)
+        except asyncio.CancelledError as exc:
+            if cancelled_error is None:
+                cancelled_error = exc
+        except Exception:
+            break
+
+    settle_error = (
+        asyncio.CancelledError() if settle_task.cancelled() else settle_task.result()
+    )
+    if cancelled_error is not None:
+        if settle_error is not None:
+            logger.warning(
+                "routing lease settle failed after caller cancellation",
+                exc_info=(
+                    type(settle_error),
+                    settle_error,
+                    settle_error.__traceback__,
+                ),
+            )
+        raise cancelled_error
+    if isinstance(settle_error, asyncio.CancelledError):
+        raise RuntimeError("routing lease settle was cancelled") from settle_error
+    if settle_error is not None:
+        raise settle_error
+
+
 def _positive_int(value: str) -> int:
     try:
         parsed = int(value)
@@ -412,6 +456,15 @@ def _build_sampling_params(
         "no_stop_trim": True,
         "spaces_between_special_tokens": False,
     }
+    if "seed" in body:
+        seed = body["seed"]
+        if (
+            not isinstance(seed, int)
+            or isinstance(seed, bool)
+            or not -(2**63) <= seed <= 2**63 - 1
+        ):
+            raise ValueError("seed must be a signed 64-bit integer")
+        sampling_params["sampling_seed"] = seed
     if requested_max_tokens is not None and max_output_tokens is not None:
         sampling_params["max_new_tokens"] = min(
             requested_max_tokens,
@@ -1689,11 +1742,14 @@ def create_app(
                 lineage_segment_boundary_before = True
             request_logprob_start_len = -1 if token_build_mode == "tito" else 0
             prompt_tokens = len(input_ids)
-            sampling_params = _build_sampling_params(
-                body,
-                max_output_tokens,
-                rollout_temperature,
-            )
+            try:
+                sampling_params = _build_sampling_params(
+                    body,
+                    max_output_tokens,
+                    rollout_temperature,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
             configured_max_tokens = sampling_params.get("max_new_tokens")
             max_tokens = int(configured_max_tokens or 0)
             context_remaining_tokens = (
@@ -1751,6 +1807,9 @@ def create_app(
                 )
 
             expected_version = request.headers.get("X-Dressage-Expected-Version")
+            require_registered_context = (
+                request.headers.get("X-Dressage-Partial-Rollout") == "1"
+            )
             _raise_if_cross_version_trajectory(
                 session=session,
                 candidate_versions=[
@@ -1770,6 +1829,7 @@ def create_app(
                     ),
                     context_remaining_tokens=context_remaining_tokens,
                     expected_version=expected_version,
+                    require_registered_context=require_registered_context,
                 )
             except RuntimeError as exc:
                 raise HTTPException(
@@ -1799,7 +1859,18 @@ def create_app(
                         context_window=context_window,
                     )
                 except BaseException:
-                    await engine_rebalancer.fail(routing_lease)
+                    try:
+                        await _settle_routing_lease(
+                            engine_rebalancer.fail(routing_lease)
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        logger.warning(
+                            "engine rebalancing failure settle failed; "
+                            "generation error is unaffected",
+                            exc_info=True,
+                        )
                     raise
             except GenerationVersionMismatch as exc:
                 raise HTTPException(
@@ -1872,11 +1943,13 @@ def create_app(
                 ) from exc
 
             try:
-                await engine_rebalancer.complete(
-                    routing_lease,
-                    response_meta=router_response.meta_info,
-                    output_tokens=len(router_response.output_ids),
-                    committed_tokens=list(router_response.all_token_ids),
+                await _settle_routing_lease(
+                    engine_rebalancer.complete(
+                        routing_lease,
+                        response_meta=router_response.meta_info,
+                        output_tokens=len(router_response.output_ids),
+                        committed_tokens=list(router_response.all_token_ids),
+                    )
                 )
             except Exception:
                 logger.warning(
@@ -2371,6 +2444,12 @@ def create_app(
             task_key=(None if body.get("task_key") is None else str(body["task_key"])),
             default_step_max_tokens=default_step_max_tokens,
         )
+        return {"success": True, "session_id": session_id}
+
+    @app.delete("/v1/session/context/{session_id}")
+    async def discard_session_context(session_id: str, request: Request):
+        _check_auth(request)
+        await engine_rebalancer.discard_session_context(session_id)
         return {"success": True, "session_id": session_id}
 
     @app.get("/v1/engines/load")

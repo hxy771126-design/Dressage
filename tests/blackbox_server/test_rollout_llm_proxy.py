@@ -1945,6 +1945,78 @@ def test_rollout_proxy_overrides_model_after_protocol_conversion(path, payload):
     assert requests[0]["seed"] == 700
 
 
+def test_rollout_proxy_force_seed_advances_across_explicit_seed_requests():
+    proxy = _make_proxy(sampling_mode="force", sampling_seed_base=700)
+    requests: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(
+            200,
+            json={
+                "id": "resp-1",
+                "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+            },
+        )
+
+    async def run_test() -> None:
+        proxy._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=proxy.app),
+            base_url="http://proxy",
+        ) as client:
+            for sequence, explicit_seed in enumerate((11, 22)):
+                await proxy.open_turn(
+                    f"turn-{sequence}", backend_session_id=f"session-{sequence}"
+                )
+                response = await client.post(
+                    "/v1/chat/completions",
+                    json={"messages": [], "stream": False, "seed": explicit_seed},
+                )
+                await proxy.drain_turn(timeout=1.0)
+                await proxy.clear_turn()
+                assert response.status_code == 200
+        await proxy._client.aclose()
+
+    asyncio.run(run_test())
+
+    assert [request["seed"] for request in requests] == [700, 701]
+
+
+def test_rollout_proxy_without_sampling_config_keeps_seed_absent():
+    proxy = _make_proxy()
+    requests: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(
+            200,
+            json={
+                "id": "resp-1",
+                "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+            },
+        )
+
+    async def run_test() -> None:
+        proxy._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        await proxy.open_turn("turn-001", backend_session_id="session-1")
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=proxy.app),
+            base_url="http://proxy",
+        ) as client:
+            response = await client.post(
+                "/v1/chat/completions", json={"messages": [], "stream": False}
+            )
+        await proxy.drain_turn(timeout=1.0)
+        await proxy.clear_turn()
+        await proxy._client.aclose()
+        assert response.status_code == 200
+
+    asyncio.run(run_test())
+
+    assert "seed" not in requests[0]
+
+
 def test_rollout_proxy_preserves_explicit_zero_temperature():
     proxy = _make_proxy(default_temperature=0.7)
     requests: list[dict[str, object]] = []

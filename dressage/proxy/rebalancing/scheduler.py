@@ -1459,6 +1459,7 @@ class EngineRebalancer:
         step_max_new_tokens: int | None = None,
         context_remaining_tokens: int | None = None,
         expected_version: str | None = None,
+        require_registered_context: bool = False,
     ) -> RoutingLease:
         if not self.config.enabled:
             budget = self._resolve_step_budget(
@@ -1493,7 +1494,14 @@ class EngineRebalancer:
 
         async with self._lock:
             now = time.monotonic()
-            session = self.sessions.setdefault(session_id, SessionRoutingState())
+            session = self.sessions.get(session_id)
+            if session is None:
+                if require_registered_context:
+                    raise RuntimeError(
+                        f"session context is not registered or was discarded: {session_id}"
+                    )
+                session = SessionRoutingState()
+                self.sessions[session_id] = session
             healthy_urls = self._healthy_urls(now=now)
             if expected_version is not None:
                 healthy_urls = [
@@ -2484,9 +2492,9 @@ class EngineRebalancer:
                 load.reserved_tokens = max(
                     0, load.reserved_tokens - lease.reserved_tokens
                 )
-            session = self.sessions.setdefault(
-                lease.decision.session_id, SessionRoutingState()
-            )
+            session = self.sessions.get(lease.decision.session_id)
+            if session is None:
+                return
             if not success:
                 session.pending_owner_worker_url = None
                 return
@@ -2722,6 +2730,8 @@ class EngineRebalancer:
         task_key: str | None,
         default_step_max_tokens: int | None = None,
     ) -> None:
+        if not self.config.enabled:
+            return
         async with self._lock:
             state = self.sessions.setdefault(session_id, SessionRoutingState())
             state.group_id = group_id
@@ -2732,6 +2742,10 @@ class EngineRebalancer:
                 if default_step_max_tokens is None
                 else max(1, int(default_step_max_tokens))
             )
+
+    async def discard_session_context(self, session_id: str) -> None:
+        async with self._lock:
+            self.sessions.pop(session_id, None)
 
     async def finalize_session(self, session_id: str) -> None:
         async with self._lock:

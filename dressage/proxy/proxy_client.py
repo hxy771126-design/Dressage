@@ -108,6 +108,14 @@ class ProxyClient:
         response.raise_for_status()
         return response.json()
 
+    async def discard_session_context(self, session_id: str) -> dict:
+        response = await self._client.delete(
+            f"{self._proxy_url}/v1/session/context/{session_id}",
+            headers=self._headers(),
+        )
+        response.raise_for_status()
+        return response.json()
+
     async def engine_loads(self) -> dict:
         response = await self._client.get(
             f"{self._proxy_url}/v1/engines/load",

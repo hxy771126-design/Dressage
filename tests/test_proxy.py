@@ -43,6 +43,44 @@ _UNSET = object()
 _STRICT_TOOL_CALL_ID_RE = re.compile(r"^call[0-9a-f]{8}$")
 
 
+@pytest.mark.parametrize("seed", [-(2**63), 2**63 - 1])
+def test_proxy_maps_signed_int64_seed_to_sglang(seed):
+    client, _, _, sglang_client = make_client(make_response("hello"))
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"X-Session-Id": f"sess-seed-{seed}", "X-Instance-Id": "inst"},
+        json={
+            "model": "fake-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "seed": seed,
+        },
+    )
+
+    assert response.status_code == 200
+    assert sglang_client.calls[0]["sampling_params"]["sampling_seed"] == seed
+
+
+@pytest.mark.parametrize("seed", ["700", True, -(2**63) - 1, 2**63])
+def test_proxy_rejects_non_signed_int64_seed_with_http_400(seed):
+    original_client, _, _, sglang_client = make_client(make_response("hello"))
+    client = TestClient(original_client.app, raise_server_exceptions=False)
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"X-Session-Id": "sess-invalid-seed", "X-Instance-Id": "inst"},
+        json={
+            "model": "fake-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "seed": seed,
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {"detail": "seed must be a signed 64-bit integer"}
+    assert sglang_client.calls == []
+
+
 class FakeTokenizer:
     def apply_chat_template(
         self,
