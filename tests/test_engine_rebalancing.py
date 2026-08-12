@@ -1819,15 +1819,29 @@ def test_existing_session_uses_base_load_improvement_threshold(
 
 
 @pytest.mark.parametrize(
-    ("target_running", "owner_turns", "expected_worker", "expected_reason", "required"),
+    (
+        "min_hold_turns",
+        "target_running",
+        "owner_turns",
+        "expected_worker",
+        "expected_reason",
+        "required",
+    ),
     [
-        (50, 1, "source", "return_hysteresis_below_threshold", 0.60),
-        (40, 1, "target", "load_improvement_threshold_met", 0.60),
-        (50, 2, "target", "load_improvement_threshold_met", 0.30),
+        (1, 50, 1, "source", "return_hysteresis_below_threshold", 0.60),
+        (1, 40, 1, "target", "load_improvement_threshold_met", 0.60),
+        (2, 50, 2, "source", "return_hysteresis_below_threshold", 0.60),
+        (2, 40, 2, "target", "load_improvement_threshold_met", 0.60),
+        (2, 50, 3, "target", "load_improvement_threshold_met", 0.30),
     ],
 )
 def test_previous_owner_uses_double_threshold_only_for_first_step(
-    target_running, owner_turns, expected_worker, expected_reason, required
+    min_hold_turns,
+    target_running,
+    owner_turns,
+    expected_worker,
+    expected_reason,
+    required,
 ):
     client = ControlPlaneClient(shared_l3=True)
 
@@ -1840,7 +1854,10 @@ def test_previous_owner_uses_double_threshold_only_for_first_step(
 
     rebalancer = EngineRebalancer(
         client,
-        config=EngineRebalancingConfig(enabled=True, min_hold_turns=1),
+        config=EngineRebalancingConfig(
+            enabled=True,
+            min_hold_turns=min_hold_turns,
+        ),
         model_id="model",
         model_config=simple_model_config(),
         calibration_benchmark=benchmark,

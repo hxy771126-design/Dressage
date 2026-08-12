@@ -1825,8 +1825,10 @@ class EngineRebalancer:
             else 0.0
         )
         required_ratio = self.config.min_load_improvement_ratio
+        first_eligible_owner_turn = max(1, self.config.min_hold_turns)
         returning_to_previous_owner = (
-            target == session.previous_owner_worker_url and session.owner_turns == 1
+            target == session.previous_owner_worker_url
+            and session.owner_turns == first_eligible_owner_turn
         )
         if returning_to_previous_owner:
             required_ratio = min(1.0, 2.0 * required_ratio)
