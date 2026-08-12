@@ -5,8 +5,9 @@ set -Eeuo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 REPO_ROOT="${REPO_ROOT:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 SOURCE_RECIPE="${SCRIPT_DIR}/run_blackbox_qwen3.5_4b_sync_local_l3_hicache.sh"
+LONG_TAIL_TOOL="${REPO_ROOT}/examples/data/prepare_dapo_long_tail.py"
 BENCHMARK_ROOT="${BENCHMARK_ROOT:-${REPO_ROOT}/log/benchmarks/engine_rebalancing}"
-PROMPT_SOURCE="${PROMPT_DATA:-${REPO_ROOT}/examples/data/dressage_dapo_prompts_dynamic_multi.jsonl}"
+PROMPT_SOURCE="${PROMPT_DATA:-${REPO_ROOT}/examples/data/dressage_dapo_prompts_long_tail.jsonl}"
 PROMPT_EFFECTIVE="${BENCHMARK_ROOT}/prompts.deterministic.jsonl"
 
 BENCHMARK_SEED="${BENCHMARK_SEED:-20260806}"
@@ -15,9 +16,10 @@ BENCHMARK_DRY_RUN="${BENCHMARK_DRY_RUN:-0}"
 # These values intentionally are not tunable in the A/B benchmark. Keeping the
 # workload fixed is part of the validity check.
 ROLLOUT_TEMPERATURE=0
-ROLLOUT_BATCH_SIZE=128
-N_SAMPLES_PER_PROMPT=2
+ROLLOUT_BATCH_SIZE=256
+N_SAMPLES_PER_PROMPT=1
 GLOBAL_BATCH_SIZE=256
+ROLLOUT_MAX_RESPONSE_LEN=32768
 DRESSAGE_BLACKBOX_SLOTS_PER_NODE=16
 DRESSAGE_BLACKBOX_MAX_STEPS=20
 MOONCAKE_GLOBAL_SEGMENT_SIZE=16gb
@@ -39,6 +41,7 @@ print_plan() {
   echo "  rollout batch: ${ROLLOUT_BATCH_SIZE}"
   echo "  samples/prompt:${N_SAMPLES_PER_PROMPT}"
   echo "  global batch:  ${GLOBAL_BATCH_SIZE}"
+  echo "  response max:  ${ROLLOUT_MAX_RESPONSE_LEN}"
   echo "  sandbox slots: ${DRESSAGE_BLACKBOX_SLOTS_PER_NODE}"
   echo "  Blackbox max steps: ${DRESSAGE_BLACKBOX_MAX_STEPS}"
   echo "  Mooncake size: ${MOONCAKE_GLOBAL_SEGMENT_SIZE}"
@@ -63,6 +66,10 @@ fi
 
 if [[ ! -f "${SOURCE_RECIPE}" ]]; then
   echo "Cannot find source recipe: ${SOURCE_RECIPE}" >&2
+  exit 1
+fi
+if [[ ! -f "${LONG_TAIL_TOOL}" ]]; then
+  echo "Cannot find long-tail preparation tool: ${LONG_TAIL_TOOL}" >&2
   exit 1
 fi
 
@@ -91,127 +98,18 @@ done
 
 mkdir -p "${BENCHMARK_ROOT}"
 
-prepare_deterministic_prompts() {
+prepare_long_tail_prompts() {
   local source_path="$1"
   local output_path="$2"
   local seed="$3"
 
-  python3 - "${source_path}" "${output_path}" "${seed}" <<'PY'
-from __future__ import annotations
-
-import hashlib
-import json
-import os
-import pathlib
-import re
-import sys
-import tempfile
-
-source_path = pathlib.Path(sys.argv[1])
-output_path = pathlib.Path(sys.argv[2])
-seed = sys.argv[3]
-if source_path.exists() and output_path.exists():
-    paths_alias = source_path.samefile(output_path)
-else:
-    paths_alias = source_path.resolve() == output_path.resolve()
-if paths_alias:
-    raise SystemExit("prompt source and effective output are the same file")
-
-source_lines = source_path.read_text(encoding="utf-8").splitlines()
-if len(source_lines) != 255:
-    raise SystemExit(f"expected 255 prompt rows, found {len(source_lines)}")
-source_rows = [json.loads(line) for line in source_lines]
-
-source_instance_ids: list[str] = []
-tool_steps: set[int] = set()
-mktemp_count = 0
-date_count = 0
-for row in source_rows:
-    metadata = row.get("metadata")
-    if not isinstance(metadata, dict) or not isinstance(metadata.get("instance_id"), str):
-        raise SystemExit("prompt row is missing metadata.instance_id")
-    source_instance_ids.append(metadata["instance_id"])
-    prompt = row.get("prompt")
-    if not isinstance(prompt, list):
-        raise SystemExit("prompt row is missing prompt messages")
-    for message in prompt:
-        if not isinstance(message, dict) or not isinstance(message.get("content"), str):
-            raise SystemExit("prompt message is missing content")
-        content = message["content"]
-        mktemp_count += content.count("mktemp /tmp/dressage-step.XXXXXX")
-        date_count += content.count("date +%s%N > <PATH>")
-        match = re.search(r"exactly ([1-5]) sequential bash tool call\(s\)", content)
-        if match is None:
-            raise SystemExit("prompt row has an invalid tool-step count")
-        tool_steps.add(int(match.group(1)))
-
-if len(set(source_instance_ids)) != len(source_instance_ids):
-    raise SystemExit("prompt instance_id values must be unique")
-if tool_steps != {1, 2, 3, 4, 5}:
-    raise SystemExit("prompt data must cover one through five tool steps")
-if mktemp_count != 255:
-    raise SystemExit(f"expected 255 mktemp commands, found {mktemp_count}")
-if date_count != 195:
-    raise SystemExit(f"expected 195 date commands, found {date_count}")
-
-for row, instance_id in zip(source_rows, source_instance_ids, strict=True):
-    digest = hashlib.sha256(f"{seed}:{instance_id}".encode("utf-8")).hexdigest()
-    path = f"/tmp/dressage-step-{digest[:16]}"
-    timestamp = 1_700_000_000_000_000_000 + int(digest[16:28], 16) % 1_000_000_000_000
-    for message in row["prompt"]:
-        content = message["content"]
-        content = content.replace(
-            "mktemp /tmp/dressage-step.XXXXXX",
-            f"LC_ALL=C install -v -m 600 /dev/null {path}",
-        )
-        content = content.replace(
-            "date +%s%N > <PATH>",
-            f"printf '%s\\n' '{timestamp}' > {path}",
-        )
-        content = content.replace(
-            "Remember the returned filename as <PATH>.",
-            f"Use the deterministic filename `{path}` as <PATH>.",
-        )
-        content = content.replace(
-            "replacing <PATH> with the filename returned by the first call.",
-            f"replacing <PATH> with the deterministic filename `{path}`.",
-        )
-        message["content"] = content
-
-effective_instance_ids = [row["metadata"]["instance_id"] for row in source_rows]
-effective_contents = [
-    message["content"] for row in source_rows for message in row["prompt"]
-]
-if effective_instance_ids != source_instance_ids:
-    raise SystemExit("deterministic prompt instance_id order changed")
-if any("mktemp /tmp/dressage-step.XXXXXX" in content for content in effective_contents):
-    raise SystemExit("deterministic prompt data still contains mktemp")
-if any("date +%s%N > <PATH>" in content for content in effective_contents):
-    raise SystemExit("deterministic prompt data still contains date")
-if any("filename returned by the first call" in content for content in effective_contents):
-    raise SystemExit("deterministic prompt data still describes a returned filename")
-
-effective_data = "".join(
-    json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n"
-    for row in source_rows
-)
-with tempfile.NamedTemporaryFile(
-    mode="w",
-    encoding="utf-8",
-    dir=output_path.parent,
-    prefix=f".{output_path.name}.",
-    suffix=".tmp",
-    delete=False,
-) as handle:
-    handle.write(effective_data)
-    handle.flush()
-    os.fsync(handle.fileno())
-    temporary_path = handle.name
-os.replace(temporary_path, output_path)
-PY
+  python3 "${LONG_TAIL_TOOL}" sample \
+    --input "${source_path}" \
+    --output "${output_path}" \
+    --seed "${seed}"
 }
 
-prepare_deterministic_prompts "${PROMPT_SOURCE}" "${PROMPT_EFFECTIVE}" "${BENCHMARK_SEED}"
+prepare_long_tail_prompts "${PROMPT_SOURCE}" "${PROMPT_EFFECTIVE}" "${BENCHMARK_SEED}"
 TEMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/dressage-rebalancing-benchmark.XXXXXX")"
 trap 'rm -rf -- "${TEMP_DIR}"' EXIT
 
@@ -229,7 +127,15 @@ record_environment() {
     "${output_path}" \
     "${run_name}" \
     "${mode}" \
-    "${BENCHMARK_SEED}" <<'PY'
+    "${BENCHMARK_SEED}" \
+    "${ROLLOUT_TEMPERATURE}" \
+    "${ROLLOUT_BATCH_SIZE}" \
+    "${N_SAMPLES_PER_PROMPT}" \
+    "${GLOBAL_BATCH_SIZE}" \
+    "${ROLLOUT_MAX_RESPONSE_LEN}" \
+    "${DRESSAGE_BLACKBOX_SLOTS_PER_NODE}" \
+    "${DRESSAGE_BLACKBOX_MAX_STEPS}" \
+    "${MOONCAKE_GLOBAL_SEGMENT_SIZE}" <<'PY'
 from __future__ import annotations
 
 import datetime as dt
@@ -239,8 +145,27 @@ import pathlib
 import socket
 import subprocess
 import sys
+from collections import Counter
 
-repo, source_recipe, benchmark_script, prompt_source, prompt_effective, output, run_name, mode, seed = sys.argv[1:]
+(
+    repo,
+    source_recipe,
+    benchmark_script,
+    prompt_source,
+    prompt_effective,
+    output,
+    run_name,
+    mode,
+    seed,
+    rollout_temperature,
+    rollout_batch_size,
+    n_samples_per_prompt,
+    global_batch_size,
+    rollout_max_response_len,
+    sandbox_slots_per_node,
+    blackbox_max_steps,
+    mooncake_global_segment_size,
+) = sys.argv[1:]
 repo_path = pathlib.Path(repo)
 
 
@@ -261,6 +186,20 @@ def digest(data: bytes) -> str:
 
 def file_digest(path: str) -> str:
     return digest(pathlib.Path(path).read_bytes())
+
+
+def workload_distribution(path: str) -> str:
+    counts: Counter[str] = Counter()
+    try:
+        lines = pathlib.Path(path).read_text(encoding="utf-8").splitlines()
+        for line in lines:
+            row = json.loads(line)
+            workload_class = row.get("metadata", {}).get("workload_class")
+            if isinstance(workload_class, str):
+                counts[workload_class] += 1
+    except (OSError, json.JSONDecodeError, AttributeError):
+        return "{}"
+    return json.dumps(dict(sorted(counts.items())), sort_keys=True, separators=(",", ":"))
 
 
 git_head = command(["git", "rev-parse", "HEAD"])
@@ -322,17 +261,20 @@ values = {
     "benchmark_script_sha256": fingerprint_payload["benchmark_script_sha256"],
     "prompt_source": prompt_source,
     "prompt_source_sha256": fingerprint_payload["prompt_source_sha256"],
+    "prompt_source_workload_distribution_json": workload_distribution(prompt_source),
     "prompt_effective": prompt_effective,
     "prompt_effective_sha256": fingerprint_payload["prompt_effective_sha256"],
+    "prompt_effective_workload_distribution_json": workload_distribution(prompt_effective),
     "code_fingerprint": code_fingerprint,
     "benchmark_seed": seed,
-    "rollout_temperature": "0",
-    "rollout_batch_size": "128",
-    "n_samples_per_prompt": "2",
-    "global_batch_size": "256",
-    "sandbox_slots_per_node": "16",
-    "blackbox_max_steps": "20",
-    "mooncake_global_segment_size": "16gb",
+    "rollout_temperature": rollout_temperature,
+    "rollout_batch_size": rollout_batch_size,
+    "n_samples_per_prompt": n_samples_per_prompt,
+    "global_batch_size": global_batch_size,
+    "rollout_max_response_len": rollout_max_response_len,
+    "sandbox_slots_per_node": sandbox_slots_per_node,
+    "blackbox_max_steps": blackbox_max_steps,
+    "mooncake_global_segment_size": mooncake_global_segment_size,
 }
 
 path = pathlib.Path(output)
@@ -514,7 +456,8 @@ collect_run() {
     "${mode}" \
     "${process_status}" \
     "${process_started_epoch}" \
-    "${process_ended_epoch}" <<'PY'
+    "${process_ended_epoch}" \
+    "${N_SAMPLES_PER_PROMPT}" <<'PY'
 from __future__ import annotations
 
 import ast
@@ -533,6 +476,7 @@ mode = sys.argv[3]
 process_status = int(sys.argv[4])
 process_started_epoch = int(sys.argv[5])
 process_ended_epoch = int(sys.argv[6])
+expected_sampling_seeds = int(sys.argv[7])
 
 run_log_path = run_dir / "run.log"
 run_log = run_log_path.read_text(encoding="utf-8", errors="replace") if run_log_path.exists() else ""
@@ -800,10 +744,10 @@ for instance_id in sorted({record["instance_id"] for record in records}):
         acceptance_errors.append(
             f"instance {instance_id} is missing a rollout sampling seed"
         )
-    elif len(sampling_seeds_by_instance[instance_id]) != 2:
+    elif len(sampling_seeds_by_instance[instance_id]) != expected_sampling_seeds:
         acceptance_errors.append(
             f"instance {instance_id} has {len(sampling_seeds_by_instance[instance_id])} "
-            "distinct rollout sampling seeds, expected 2"
+            f"distinct rollout sampling seeds, expected {expected_sampling_seeds}"
         )
 for key, matches in error_matches.items():
     if matches:
@@ -904,6 +848,7 @@ run_one() {
     export ROLLOUT_BATCH_SIZE
     export N_SAMPLES_PER_PROMPT
     export GLOBAL_BATCH_SIZE
+    export ROLLOUT_MAX_RESPONSE_LEN
     export DRESSAGE_BLACKBOX_SLOTS_PER_NODE
     export DRESSAGE_BLACKBOX_MAX_STEPS
     export MOONCAKE_GLOBAL_SEGMENT_SIZE

@@ -187,10 +187,10 @@ def test_config_defaults_propagate_to_online_models():
     assert config.snapshot()["load_poll_interval_ms"] == 125
     assert config.snapshot()["history_size"] == 128
     assert config.snapshot()["min_samples"] == 16
-    assert config.snapshot()["min_hold_turns"] == 5
+    assert config.snapshot()["min_hold_turns"] == 2
     assert config.snapshot()["min_risk_ms"] == 10
     assert config.snapshot()["cold_start_hit_probability"] == 1.0
-    assert config.snapshot()["min_load_improvement_ratio"] == 0.30
+    assert config.snapshot()["min_load_improvement_ratio"] == 0.20
 
     rebalancer = EngineRebalancer(
         ControlPlaneClient(),
@@ -3319,7 +3319,7 @@ def test_cli_exposes_single_rebalancing_switch(monkeypatch):
     )
     args = parse_args()
     assert args.enable_engine_rebalancing is True
-    assert args.engine_rebalancing_min_load_improvement_ratio == 0.30
+    assert args.engine_rebalancing_min_load_improvement_ratio == 0.20
 
 
 def test_cli_accepts_load_improvement_ratio(monkeypatch):
@@ -3400,10 +3400,10 @@ def test_enabled_proxy_places_first_request_directly_and_reports_state():
         assert loads["effective_config"]["load_poll_interval_ms"] == 125
         assert loads["effective_config"]["history_size"] == 128
         assert loads["effective_config"]["min_samples"] == 16
-        assert loads["effective_config"]["min_hold_turns"] == 5
+        assert loads["effective_config"]["min_hold_turns"] == 2
         assert loads["effective_config"]["min_risk_ms"] == 10
         assert loads["effective_config"]["cold_start_hit_probability"] == 1.0
-        assert loads["effective_config"]["min_load_improvement_ratio"] == 0.30
+        assert loads["effective_config"]["min_load_improvement_ratio"] == 0.20
         assert loads["compatibility_pools"][0]["state"] in {
             "BOOTSTRAP",
             "ACTIVE",
@@ -3525,6 +3525,8 @@ def test_engine_rebalancing_benchmark_defaults_to_one_off_on_pair(tmp_path):
     assert result.returncode == 0, result.stderr
     assert "seed20260806-off-r1" in result.stdout
     assert "seed20260806-on-r1" in result.stdout
+    assert "response max:  32768" in result.stdout
+    assert "dressage_dapo_prompts_long_tail.jsonl" in result.stdout
     assert "warm-up" not in result.stdout
     assert "off-r2" not in result.stdout
     assert "on-r2" not in result.stdout
@@ -3532,6 +3534,22 @@ def test_engine_rebalancing_benchmark_defaults_to_one_off_on_pair(tmp_path):
     assert "Median rollout speedup" not in source
     assert "Warm-up" not in source
     assert not (tmp_path / "benchmark").exists()
+
+
+def test_engine_rebalancing_benchmark_samples_long_tail_dataset_once():
+    source = Path(
+        "examples/scripts/benchmark_engine_rebalancing_qwen3.5_4b_sync_local_l3_hicache.sh"
+    ).read_text(encoding="utf-8")
+    prepare_call = (
+        'prepare_long_tail_prompts "${PROMPT_SOURCE}" "${PROMPT_EFFECTIVE}" '
+        '"${BENCHMARK_SEED}"'
+    )
+    run_one = source[source.index("run_one() {") : source.index("write_summary() {")]
+
+    assert source.count(prepare_call) == 1
+    assert 'python3 "${LONG_TAIL_TOOL}" sample' in source
+    assert "prepare_long_tail_prompts" not in run_one
+    assert "ROLLOUT_MAX_RESPONSE_LEN=32768" in source
 
 
 def test_disabled_rebalancer_does_not_create_session_context_state():
@@ -4111,122 +4129,12 @@ def _run_benchmark_heredoc(
     )
 
 
-def test_engine_rebalancing_benchmark_generates_seeded_tool_prompts_once(tmp_path):
-    source = Path("examples/data/dressage_dapo_prompts_dynamic_multi.jsonl")
-    source_bytes = source.read_bytes()
-    source_mtime_ns = source.stat().st_mtime_ns
-    output = tmp_path / "prompts.deterministic.jsonl"
-
-    result = _run_benchmark_heredoc(
-        "prepare_deterministic_prompts", str(source), str(output), "20260806"
-    )
-
-    assert result.returncode == 0, result.stderr
-    assert source.read_bytes() == source_bytes
-    assert source.stat().st_mtime_ns == source_mtime_ns
-
-    source_rows = [json.loads(line) for line in source.read_text(encoding="utf-8").splitlines()]
-    output_bytes = output.read_bytes()
-    output_rows = [json.loads(line) for line in output_bytes.decode("utf-8").splitlines()]
-    assert len(source_rows) == len(output_rows) == 255
-    assert [row["metadata"]["instance_id"] for row in output_rows] == [
-        row["metadata"]["instance_id"] for row in source_rows
-    ]
-
-    source_contents = [row["prompt"][0]["content"] for row in source_rows]
-    output_contents = [row["prompt"][0]["content"] for row in output_rows]
-    assert sum(content.count("mktemp /tmp/dressage-step.XXXXXX") for content in source_contents) == 255
-    assert sum(content.count("date +%s%N > <PATH>") for content in source_contents) == 195
-    assert "mktemp /tmp/dressage-step.XXXXXX" not in "\n".join(output_contents)
-    assert "date +%s%N > <PATH>" not in "\n".join(output_contents)
-    assert "filename returned by the first call" not in "\n".join(output_contents)
-
-    expected_paths = []
-    expected_timestamps = []
-    for row in source_rows:
-        instance_id = row["metadata"]["instance_id"]
-        digest = hashlib.sha256(f"20260806:{instance_id}".encode()).hexdigest()
-        expected_paths.append(f"/tmp/dressage-step-{digest[:16]}")
-        expected_timestamps.append(1_700_000_000_000_000_000 + int(digest[16:28], 16) % 1_000_000_000_000)
-
-    for source_content, output_content, path, timestamp in zip(
-        source_contents, output_contents, expected_paths, expected_timestamps, strict=True
-    ):
-        assert f"LC_ALL=C install -v -m 600 /dev/null {path}" in output_content
-        if "date +%s%N > <PATH>" in source_content:
-            assert f"printf '%s\\n' '{timestamp}' > {path}" in output_content
-        assert re.search(
-            r"This session requires exactly [1-5] sequential bash tool call\(s\)",
-            output_content,
-        )
-
-    same_seed = tmp_path / "prompts.same-seed.jsonl"
-    different_seed = tmp_path / "prompts.different-seed.jsonl"
-    assert _run_benchmark_heredoc(
-        "prepare_deterministic_prompts", str(source), str(same_seed), "20260806"
-    ).returncode == 0
-    assert _run_benchmark_heredoc(
-        "prepare_deterministic_prompts", str(source), str(different_seed), "20260807"
-    ).returncode == 0
-    assert same_seed.read_bytes() == output_bytes
-    assert different_seed.read_bytes() != output_bytes
-
-
-@pytest.mark.parametrize("alias_kind", ["same", "symlink", "hardlink"])
-def test_engine_rebalancing_benchmark_rejects_prompt_output_aliases(
-    tmp_path, alias_kind
-):
-    source = tmp_path / "source.jsonl"
-    source.write_bytes(
-        Path("examples/data/dressage_dapo_prompts_dynamic_multi.jsonl").read_bytes()
-    )
-    if alias_kind == "same":
-        effective = source
-    else:
-        effective = tmp_path / "effective.jsonl"
-        if alias_kind == "symlink":
-            effective.symlink_to(source)
-        else:
-            effective.hardlink_to(source)
-    source_bytes = source.read_bytes()
-    source_mtime_ns = source.stat().st_mtime_ns
-
-    result = _run_benchmark_heredoc(
-        "prepare_deterministic_prompts", str(source), str(effective), "20260806"
-    )
-
-    assert result.returncode != 0
-    assert "same file" in result.stderr
-    assert source.read_bytes() == source_bytes
-    assert source.stat().st_mtime_ns == source_mtime_ns
-
-
-def test_engine_rebalancing_benchmark_generation_failure_preserves_effective_file(
-    tmp_path,
-):
-    source = Path("examples/data/dressage_dapo_prompts_dynamic_multi.jsonl")
-    effective = tmp_path / "prompts.deterministic.jsonl"
-    original_effective = b"existing effective prompt data\n"
-    effective.write_bytes(original_effective)
-
-    result = _run_benchmark_heredoc(
-        "prepare_deterministic_prompts",
-        str(source),
-        str(effective),
-        "20260806",
-        file_size_limit=1024,
-    )
-
-    assert result.returncode != 0
-    assert effective.read_bytes() == original_effective
-
-
 def test_engine_rebalancing_benchmark_prepares_once_before_both_runs():
     source = Path(
         "examples/scripts/benchmark_engine_rebalancing_qwen3.5_4b_sync_local_l3_hicache.sh"
     ).read_text(encoding="utf-8")
     prepare_call = (
-        'prepare_deterministic_prompts "${PROMPT_SOURCE}" '
+        'prepare_long_tail_prompts "${PROMPT_SOURCE}" '
         '"${PROMPT_EFFECTIVE}" "${BENCHMARK_SEED}"'
     )
     run_loop = 'for index in "${!RUN_NAMES[@]}"; do\n  run_one'
@@ -4235,7 +4143,7 @@ def test_engine_rebalancing_benchmark_prepares_once_before_both_runs():
     assert source.count(prepare_call) == 1
     assert source.index(prepare_call) < source.index(run_loop)
     assert run_one.count('export PROMPT_DATA="${PROMPT_EFFECTIVE}"') == 1
-    assert "prepare_deterministic_prompts" not in run_one
+    assert "prepare_long_tail_prompts" not in run_one
 
 
 def test_engine_rebalancing_benchmark_environment_records_prompt_fingerprints(
@@ -4249,7 +4157,7 @@ def test_engine_rebalancing_benchmark_environment_records_prompt_fingerprints(
     source_recipe = repo / (
         "examples/scripts/run_blackbox_qwen3.5_4b_sync_local_l3_hicache.sh"
     )
-    prompt_source = repo / "examples/data/dressage_dapo_prompts_dynamic_multi.jsonl"
+    prompt_source = repo / "examples/data/dressage_dapo_prompts_long_tail.jsonl"
     prompt_effective = tmp_path / "prompts.deterministic.jsonl"
     prompt_effective.write_text("effective\n", encoding="utf-8")
     output = tmp_path / "environment.txt"
@@ -4273,6 +4181,14 @@ def test_engine_rebalancing_benchmark_environment_records_prompt_fingerprints(
         "seed20260806-off-r1",
         "off",
         "20260806",
+        "0",
+        "256",
+        "1",
+        "256",
+        "32768",
+        "16",
+        "20",
+        "16gb",
         env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"},
     )
 
@@ -4289,6 +4205,12 @@ def test_engine_rebalancing_benchmark_environment_records_prompt_fingerprints(
     assert environment["prompt_effective_sha256"] == hashlib.sha256(
         prompt_effective.read_bytes()
     ).hexdigest()
+    assert environment["rollout_batch_size"] == "256"
+    assert environment["n_samples_per_prompt"] == "1"
+    assert environment["global_batch_size"] == "256"
+    assert environment["rollout_max_response_len"] == "32768"
+    assert "prompt_source_workload_distribution_json" in environment
+    assert "prompt_effective_workload_distribution_json" in environment
 
 
 def test_engine_rebalancing_benchmark_collector_uses_sampling_seed_identity(tmp_path):
@@ -4318,7 +4240,7 @@ def test_engine_rebalancing_benchmark_collector_uses_sampling_seed_identity(tmp_
         )
 
     result = _run_benchmark_heredoc(
-        "collect_run", str(run_dir), "run", "off", "0", "1", "2"
+        "collect_run", str(run_dir), "run", "off", "0", "1", "2", "2"
     )
 
     assert result.returncode == 0, result.stderr
@@ -4336,12 +4258,31 @@ def test_engine_rebalancing_benchmark_collector_uses_sampling_seed_identity(tmp_
     duplicate["metadata"]["rollout_sampling_seed"] = 41
     (samples_dir / "b.json").write_text(json.dumps(duplicate), encoding="utf-8")
     duplicate_result = _run_benchmark_heredoc(
-        "collect_run", str(run_dir), "run", "off", "0", "1", "2"
+        "collect_run", str(run_dir), "run", "off", "0", "1", "2", "2"
     )
 
     assert duplicate_result.returncode == 0, duplicate_result.stderr
     duplicate_metrics = json.loads((run_dir / "metrics.json").read_text(encoding="utf-8"))
     assert any("sampling seed" in error for error in duplicate_metrics["acceptance_errors"])
+
+
+def test_engine_rebalancing_benchmark_collector_accepts_one_sample_per_prompt(tmp_path):
+    run_dir = tmp_path / "run"
+    sample_path = run_dir / "runtime" / "traj_payload" / "run" / "samples" / "a.json"
+    _write_benchmark_sample(
+        sample_path,
+        instance_id="alpha",
+        sampling_seed=11,
+        segment_index=0,
+    )
+
+    result = _run_benchmark_heredoc(
+        "collect_run", str(run_dir), "run", "off", "0", "1", "2", "1"
+    )
+
+    assert result.returncode == 0, result.stderr
+    metrics = json.loads((run_dir / "metrics.json").read_text(encoding="utf-8"))
+    assert not any("sampling seed" in error for error in metrics["acceptance_errors"])
 
 
 def _write_benchmark_sample(
@@ -4373,7 +4314,7 @@ def _write_benchmark_sample(
 
 def _collect_benchmark_run(run_dir: Path) -> dict:
     result = _run_benchmark_heredoc(
-        "collect_run", str(run_dir), "run", "off", "0", "1", "2"
+        "collect_run", str(run_dir), "run", "off", "0", "1", "2", "2"
     )
     assert result.returncode == 0, result.stderr
     return json.loads((run_dir / "metrics.json").read_text(encoding="utf-8"))
