@@ -7,7 +7,7 @@ REPO_ROOT="${REPO_ROOT:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 SOURCE_RECIPE="${SCRIPT_DIR}/run_blackbox_qwen3.5_4b_sync_local_l3_hicache.sh"
 LONG_TAIL_TOOL="${REPO_ROOT}/examples/data/prepare_dapo_long_tail.py"
 BENCHMARK_ROOT="${BENCHMARK_ROOT:-${REPO_ROOT}/log/benchmarks/engine_rebalancing}"
-PROMPT_SOURCE="${PROMPT_DATA:-${REPO_ROOT}/examples/data/dressage_dapo_prompts_long_tail.jsonl}"
+PROMPT_SOURCE="${LONG_TAIL_PROMPT_DATA:-${REPO_ROOT}/examples/data/dressage_dapo_prompts_long_tail.jsonl}"
 PROMPT_EFFECTIVE="${BENCHMARK_ROOT}/prompts.deterministic.jsonl"
 
 BENCHMARK_SEED="${BENCHMARK_SEED:-20260806}"
@@ -19,8 +19,9 @@ ROLLOUT_TEMPERATURE=0
 ROLLOUT_BATCH_SIZE=256
 N_SAMPLES_PER_PROMPT=1
 GLOBAL_BATCH_SIZE=256
-ROLLOUT_MAX_RESPONSE_LEN=32768
+ROLLOUT_MAX_RESPONSE_LEN=12288
 DRESSAGE_BLACKBOX_SLOTS_PER_NODE=16
+DRESSAGE_BLACKBOX_ACQUIRE_TIMEOUT_SEC=3600
 DRESSAGE_BLACKBOX_MAX_STEPS=20
 MOONCAKE_GLOBAL_SEGMENT_SIZE=16gb
 
@@ -43,6 +44,7 @@ print_plan() {
   echo "  global batch:  ${GLOBAL_BATCH_SIZE}"
   echo "  response max:  ${ROLLOUT_MAX_RESPONSE_LEN}"
   echo "  sandbox slots: ${DRESSAGE_BLACKBOX_SLOTS_PER_NODE}"
+  echo "  slot timeout:  ${DRESSAGE_BLACKBOX_ACQUIRE_TIMEOUT_SEC}"
   echo "  Blackbox max steps: ${DRESSAGE_BLACKBOX_MAX_STEPS}"
   echo "  Mooncake size: ${MOONCAKE_GLOBAL_SEGMENT_SIZE}"
   echo "  fixed flags:   --seed ${BENCHMARK_SEED} --rollout-seed ${BENCHMARK_SEED}"
@@ -134,6 +136,7 @@ record_environment() {
     "${GLOBAL_BATCH_SIZE}" \
     "${ROLLOUT_MAX_RESPONSE_LEN}" \
     "${DRESSAGE_BLACKBOX_SLOTS_PER_NODE}" \
+    "${DRESSAGE_BLACKBOX_ACQUIRE_TIMEOUT_SEC}" \
     "${DRESSAGE_BLACKBOX_MAX_STEPS}" \
     "${MOONCAKE_GLOBAL_SEGMENT_SIZE}" <<'PY'
 from __future__ import annotations
@@ -163,6 +166,7 @@ from collections import Counter
     global_batch_size,
     rollout_max_response_len,
     sandbox_slots_per_node,
+    sandbox_acquire_timeout_sec,
     blackbox_max_steps,
     mooncake_global_segment_size,
 ) = sys.argv[1:]
@@ -273,6 +277,7 @@ values = {
     "global_batch_size": global_batch_size,
     "rollout_max_response_len": rollout_max_response_len,
     "sandbox_slots_per_node": sandbox_slots_per_node,
+    "sandbox_acquire_timeout_sec": sandbox_acquire_timeout_sec,
     "blackbox_max_steps": blackbox_max_steps,
     "mooncake_global_segment_size": mooncake_global_segment_size,
 }
@@ -850,6 +855,7 @@ run_one() {
     export GLOBAL_BATCH_SIZE
     export ROLLOUT_MAX_RESPONSE_LEN
     export DRESSAGE_BLACKBOX_SLOTS_PER_NODE
+    export DRESSAGE_BLACKBOX_ACQUIRE_TIMEOUT_SEC
     export DRESSAGE_BLACKBOX_MAX_STEPS
     export MOONCAKE_GLOBAL_SEGMENT_SIZE
 

@@ -1858,6 +1858,7 @@ def test_previous_owner_uses_double_threshold_only_for_first_step(
         config=EngineRebalancingConfig(
             enabled=True,
             min_hold_turns=min_hold_turns,
+            min_load_improvement_ratio=0.30,
         ),
         model_id="model",
         model_config=simple_model_config(),
@@ -1942,7 +1943,7 @@ def test_min_hold_turns_blocks_otherwise_beneficial_migration():
     run(scenario())
 
 
-def test_default_hold_blocks_next_hop_until_fifth_owner_turn():
+def test_default_hold_blocks_next_hop_until_second_owner_turn():
     client = ControlPlaneClient(shared_l3=True)
     client.urls.append("http://node-c:30000")
 
@@ -1977,25 +1978,24 @@ def test_default_hold_blocks_next_hop_until_fifth_owner_turn():
             owner_turns=1,
         )
 
-        for owner_turn in range(1, 5):
-            sticky = await rebalancer.acquire(
-                session_id="multi-hop",
-                input_ids=[1] * 100,
-            )
-            assert sticky.worker_url == source
-            assert sticky.decision.reason == "min_hold_turns_not_met"
-            await rebalancer.complete(
-                sticky,
-                response_meta={
-                    "cached_tokens": 100,
-                    "queue_time": 0.0,
-                    "e2e_latency": 1.0,
-                    "decode_throughput": 10.0,
-                },
-                output_tokens=1,
-                committed_tokens=[1] * 100,
-            )
-            assert rebalancer.sessions["multi-hop"].owner_turns == owner_turn + 1
+        sticky = await rebalancer.acquire(
+            session_id="multi-hop",
+            input_ids=[1] * 100,
+        )
+        assert sticky.worker_url == source
+        assert sticky.decision.reason == "min_hold_turns_not_met"
+        await rebalancer.complete(
+            sticky,
+            response_meta={
+                "cached_tokens": 100,
+                "queue_time": 0.0,
+                "e2e_latency": 1.0,
+                "decode_throughput": 10.0,
+            },
+            output_tokens=1,
+            committed_tokens=[1] * 100,
+        )
+        assert rebalancer.sessions["multi-hop"].owner_turns == 2
 
         movable = await rebalancer.acquire(
             session_id="multi-hop",
@@ -3516,6 +3516,9 @@ def test_engine_rebalancing_benchmark_defaults_to_one_off_on_pair(tmp_path):
             "BENCHMARK_DRY_RUN": "1",
             "BENCHMARK_ROOT": str(tmp_path / "benchmark"),
             "BENCHMARK_SEED": "20260806",
+            "PROMPT_DATA": str(
+                Path("examples/data/dressage_dapo_prompts_dynamic_multi.jsonl")
+            ),
         },
         check=False,
         capture_output=True,
@@ -3525,7 +3528,11 @@ def test_engine_rebalancing_benchmark_defaults_to_one_off_on_pair(tmp_path):
     assert result.returncode == 0, result.stderr
     assert "seed20260806-off-r1" in result.stdout
     assert "seed20260806-on-r1" in result.stdout
-    assert "response max:  32768" in result.stdout
+    assert "rollout batch: 256" in result.stdout
+    assert "global batch:  256" in result.stdout
+    assert "response max:  12288" in result.stdout
+    assert "sandbox slots: 16" in result.stdout
+    assert "slot timeout:  3600" in result.stdout
     assert "dressage_dapo_prompts_long_tail.jsonl" in result.stdout
     assert "warm-up" not in result.stdout
     assert "off-r2" not in result.stdout
@@ -3549,7 +3556,11 @@ def test_engine_rebalancing_benchmark_samples_long_tail_dataset_once():
     assert source.count(prepare_call) == 1
     assert 'python3 "${LONG_TAIL_TOOL}" sample' in source
     assert "prepare_long_tail_prompts" not in run_one
-    assert "ROLLOUT_MAX_RESPONSE_LEN=32768" in source
+    assert "ROLLOUT_BATCH_SIZE=256" in source
+    assert "GLOBAL_BATCH_SIZE=256" in source
+    assert "ROLLOUT_MAX_RESPONSE_LEN=12288" in source
+    assert "DRESSAGE_BLACKBOX_SLOTS_PER_NODE=16" in source
+    assert "DRESSAGE_BLACKBOX_ACQUIRE_TIMEOUT_SEC=3600" in source
 
 
 def test_disabled_rebalancer_does_not_create_session_context_state():
@@ -4185,8 +4196,9 @@ def test_engine_rebalancing_benchmark_environment_records_prompt_fingerprints(
         "256",
         "1",
         "256",
-        "32768",
+        "12288",
         "16",
+        "3600",
         "20",
         "16gb",
         env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"},
@@ -4208,7 +4220,9 @@ def test_engine_rebalancing_benchmark_environment_records_prompt_fingerprints(
     assert environment["rollout_batch_size"] == "256"
     assert environment["n_samples_per_prompt"] == "1"
     assert environment["global_batch_size"] == "256"
-    assert environment["rollout_max_response_len"] == "32768"
+    assert environment["rollout_max_response_len"] == "12288"
+    assert environment["sandbox_slots_per_node"] == "16"
+    assert environment["sandbox_acquire_timeout_sec"] == "3600"
     assert "prompt_source_workload_distribution_json" in environment
     assert "prompt_effective_workload_distribution_json" in environment
 
