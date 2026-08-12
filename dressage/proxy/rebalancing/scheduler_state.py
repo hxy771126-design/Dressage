@@ -27,7 +27,7 @@ class EngineRebalancingConfig:
     metrics_stale_ms: int = 2_000
     history_size: int = 128
     min_samples: int = 16
-    min_hold_turns: int = 1
+    min_hold_turns: int = 2
     min_risk_ms: int = 10
     cold_start_hit_probability: float = 1.0
     min_load_improvement_ratio: float = 0.30

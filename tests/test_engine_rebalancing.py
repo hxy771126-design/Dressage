@@ -187,7 +187,7 @@ def test_config_defaults_propagate_to_online_models():
     assert config.snapshot()["load_poll_interval_ms"] == 250
     assert config.snapshot()["history_size"] == 128
     assert config.snapshot()["min_samples"] == 16
-    assert config.snapshot()["min_hold_turns"] == 1
+    assert config.snapshot()["min_hold_turns"] == 2
     assert config.snapshot()["min_risk_ms"] == 10
     assert config.snapshot()["cold_start_hit_probability"] == 1.0
     assert config.snapshot()["min_load_improvement_ratio"] == 0.30
@@ -1611,6 +1611,136 @@ def test_reservations_spread_simultaneous_new_sessions():
 
 @pytest.mark.parametrize(
     (
+        "source_running",
+        "target_running",
+        "source_queued",
+        "target_queued",
+        "source_prefill",
+        "target_prefill",
+        "expected_worker",
+        "expected_reason",
+    ),
+    [
+        (2, 1, 0, 0, 0, 0, "source", "backlog_advantage_not_met"),
+        (1, 2, 0, 0, 0, 0, "source", "backlog_advantage_not_met"),
+        (2, 0, 1, 1, 0, 0, "source", "backlog_advantage_not_met"),
+        (2, 0, 0, 1, 0, 0, "source", "backlog_advantage_not_met"),
+        (2, 1, 1, 0, 0, 0, "target", "load_improvement_threshold_met"),
+        (2, 1, 0, 0, 1_000, 0, "target", "load_improvement_threshold_met"),
+    ],
+)
+def test_existing_session_requires_strict_backlog_advantage(
+    source_running,
+    target_running,
+    source_queued,
+    target_queued,
+    source_prefill,
+    target_prefill,
+    expected_worker,
+    expected_reason,
+):
+    client = ControlPlaneClient(shared_l3=True)
+
+    async def benchmark(task, payload):
+        del task
+        return CalibrationSample(
+            latency_seconds=0.01,
+            bandwidth_bytes_per_second=max(1, payload * 10),
+        )
+
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(enabled=True, min_hold_turns=1),
+        model_id="model",
+        model_config=simple_model_config(),
+        calibration_benchmark=benchmark,
+    )
+
+    async def scenario():
+        await rebalancer.refresh()
+        source, target = client.urls
+        rebalancer.loads[source].running = source_running
+        rebalancer.loads[source].queued = source_queued
+        rebalancer.loads[source].waiting_uncached_tokens = source_prefill
+        rebalancer.loads[target].running = target_running
+        rebalancer.loads[target].queued = target_queued
+        rebalancer.loads[target].waiting_uncached_tokens = target_prefill
+        fingerprint = rebalancer.deployments[source].cache_fingerprint
+        rebalancer.sessions["backlog"] = SessionRoutingState(
+            owner_worker_url=source,
+            fingerprint=fingerprint,
+            previous_committed_tokens=[1] * 100,
+            seen_engines={source},
+            owner_turns=2,
+        )
+
+        lease = await rebalancer.acquire(
+            session_id="backlog",
+            input_ids=[1] * 100,
+        )
+        try:
+            assert lease.worker_url == (
+                source if expected_worker == "source" else target
+            )
+            assert lease.decision.reason == expected_reason
+        finally:
+            await rebalancer.fail(lease)
+
+    run(scenario())
+
+
+def test_existing_session_selects_lowest_load_target_with_backlog_advantage():
+    client = ControlPlaneClient(shared_l3=True)
+    client.urls.append("http://node-c:30000")
+
+    async def benchmark(task, payload):
+        del task
+        return CalibrationSample(
+            latency_seconds=0.01,
+            bandwidth_bytes_per_second=max(1, payload * 10),
+        )
+
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(enabled=True, min_hold_turns=1),
+        model_id="model",
+        model_config=simple_model_config(),
+        calibration_benchmark=benchmark,
+    )
+
+    async def scenario():
+        await rebalancer.refresh()
+        source, lowest_load_without_advantage, eligible_target = client.urls
+        rebalancer.loads[source].running = 4
+        rebalancer.loads[source].queued = 1
+        rebalancer.loads[lowest_load_without_advantage].queued = 1
+        rebalancer.loads[eligible_target].running = 2
+        fingerprint = rebalancer.deployments[source].cache_fingerprint
+        rebalancer.sessions["backlog-target"] = SessionRoutingState(
+            owner_worker_url=source,
+            fingerprint=fingerprint,
+            previous_committed_tokens=[1] * 100,
+            seen_engines={source},
+            owner_turns=2,
+        )
+
+        lease = await rebalancer.acquire(
+            session_id="backlog-target",
+            input_ids=[1] * 100,
+        )
+        try:
+            assert lease.worker_url == eligible_target
+            assert lease.decision.reason == "load_improvement_threshold_met"
+            assert lease.decision.target_base_load is not None
+            assert lease.decision.target_base_load.queue_pressure == 0.0
+        finally:
+            await rebalancer.fail(lease)
+
+    run(scenario())
+
+
+@pytest.mark.parametrize(
+    (
         "target_running",
         "minimum_ratio",
         "expected_worker",
@@ -1650,6 +1780,7 @@ def test_existing_session_uses_base_load_improvement_threshold(
         await rebalancer.refresh()
         source, target = client.urls
         rebalancer.loads[source].running = 100
+        rebalancer.loads[source].waiting_uncached_tokens = 1
         rebalancer.loads[target].running = target_running
         fingerprint = rebalancer.deployments[source].cache_fingerprint
         rebalancer.sessions["threshold"] = SessionRoutingState(
@@ -1672,7 +1803,11 @@ def test_existing_session_uses_base_load_improvement_threshold(
             assert lease.decision.source_base_load is not None
             assert lease.decision.target_base_load is not None
             assert lease.decision.load_improvement_ratio == pytest.approx(
-                (100 - target_running) / 100
+                (
+                    lease.decision.source_base_load.total
+                    - lease.decision.target_base_load.total
+                )
+                / lease.decision.source_base_load.total
             )
             assert lease.decision.required_load_improvement_ratio == minimum_ratio
             assert lease.decision.source_context is None
@@ -1705,7 +1840,7 @@ def test_previous_owner_uses_double_threshold_only_for_first_step(
 
     rebalancer = EngineRebalancer(
         client,
-        config=EngineRebalancingConfig(enabled=True),
+        config=EngineRebalancingConfig(enabled=True, min_hold_turns=1),
         model_id="model",
         model_config=simple_model_config(),
         calibration_benchmark=benchmark,
@@ -1715,6 +1850,7 @@ def test_previous_owner_uses_double_threshold_only_for_first_step(
         await rebalancer.refresh()
         source, target = client.urls
         rebalancer.loads[source].running = 100
+        rebalancer.loads[source].waiting_uncached_tokens = 1
         rebalancer.loads[target].running = target_running
         fingerprint = rebalancer.deployments[source].cache_fingerprint
         rebalancer.sessions["return"] = SessionRoutingState(
@@ -1788,6 +1924,73 @@ def test_min_hold_turns_blocks_otherwise_beneficial_migration():
     run(scenario())
 
 
+def test_default_hold_blocks_next_hop_then_allows_it_after_sticky_step():
+    client = ControlPlaneClient(shared_l3=True)
+    client.urls.append("http://node-c:30000")
+
+    async def benchmark(task, payload):
+        del task
+        return CalibrationSample(
+            latency_seconds=0.01,
+            bandwidth_bytes_per_second=max(1, payload * 10),
+        )
+
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(enabled=True),
+        model_id="model",
+        model_config=simple_model_config(),
+        calibration_benchmark=benchmark,
+    )
+
+    async def scenario():
+        await rebalancer.refresh()
+        previous_owner, source, target = client.urls
+        rebalancer.loads[previous_owner].running = 100
+        rebalancer.loads[source].running = 4
+        rebalancer.loads[source].queued = 1
+        fingerprint = rebalancer.deployments[source].cache_fingerprint
+        rebalancer.sessions["multi-hop"] = SessionRoutingState(
+            owner_worker_url=source,
+            previous_owner_worker_url=previous_owner,
+            fingerprint=fingerprint,
+            previous_committed_tokens=[1] * 100,
+            seen_engines={previous_owner, source},
+            owner_turns=1,
+        )
+
+        sticky = await rebalancer.acquire(
+            session_id="multi-hop",
+            input_ids=[1] * 100,
+        )
+        assert sticky.worker_url == source
+        assert sticky.decision.reason == "min_hold_turns_not_met"
+        await rebalancer.complete(
+            sticky,
+            response_meta={
+                "cached_tokens": 100,
+                "queue_time": 0.0,
+                "e2e_latency": 1.0,
+                "decode_throughput": 10.0,
+            },
+            output_tokens=1,
+            committed_tokens=[1] * 100,
+        )
+        assert rebalancer.sessions["multi-hop"].owner_turns == 2
+
+        movable = await rebalancer.acquire(
+            session_id="multi-hop",
+            input_ids=[1] * 100,
+        )
+        try:
+            assert movable.worker_url == target
+            assert movable.decision.reason == "load_improvement_threshold_met"
+        finally:
+            await rebalancer.fail(movable)
+
+    run(scenario())
+
+
 def test_seen_engine_without_shared_l3_is_not_a_migration_target():
     client = ControlPlaneClient(shared_l3=False)
     rebalancer = EngineRebalancer(
@@ -1801,6 +2004,7 @@ def test_seen_engine_without_shared_l3_is_not_a_migration_target():
         await rebalancer.refresh()
         source, target = client.urls
         rebalancer.loads[source].running = 100
+        rebalancer.loads[source].waiting_uncached_tokens = 1
         fingerprint = rebalancer.deployments[source].cache_fingerprint
         rebalancer.sessions["seen-no-l3"] = SessionRoutingState(
             owner_worker_url=source,
@@ -1857,6 +2061,7 @@ def test_existing_session_rejects_move_when_projected_target_is_busier():
         rebalancer.loads[source].running = 100
         rebalancer.loads[source].request_capacity = 100
         rebalancer.loads[source].token_capacity = 1_000
+        rebalancer.loads[source].waiting_uncached_tokens = 1
         rebalancer.loads[target].running = 6
         rebalancer.loads[target].request_capacity = 10
         rebalancer.loads[target].token_capacity = 100
@@ -1876,7 +2081,13 @@ def test_existing_session_rejects_move_when_projected_target_is_busier():
         try:
             assert lease.worker_url == source
             assert lease.decision.reason == "projected_load_safety_check_failed"
-            assert lease.decision.load_improvement_ratio == pytest.approx(0.4)
+            assert lease.decision.load_improvement_ratio == pytest.approx(
+                (
+                    lease.decision.source_base_load.total
+                    - lease.decision.target_base_load.total
+                )
+                / lease.decision.source_base_load.total
+            )
             assert (
                 lease.decision.target_projected_load.total
                 > lease.decision.source_projected_load.total
@@ -2418,6 +2629,7 @@ def test_active_scheduler_routes_from_load_without_prediction_history():
                 decode_throughput=10,
             )
         rebalancer.loads[source].running = 100
+        rebalancer.loads[source].waiting_uncached_tokens = 1
         rebalancer.loads[target].running = 50
         rebalancer.sessions["session"] = SessionRoutingState(
             owner_worker_url=source,
@@ -2447,7 +2659,7 @@ def test_active_scheduler_routes_from_load_without_prediction_history():
                 > lease.decision.target_base_load.total
             )
             snapshot = lease.decision.snapshot()
-            assert snapshot["source_base_load"]["total"] == pytest.approx(1.0)
+            assert snapshot["source_base_load"]["total"] == pytest.approx(1.00001)
             assert snapshot["target_base_load"]["total"] == pytest.approx(0.5)
         finally:
             await rebalancer.fail(lease)
@@ -2514,7 +2726,7 @@ def test_prefill_pressure_can_prevent_load_ratio_migration():
             assert lease.decision.state is SchedulerState.ACTIVE
             assert lease.decision.moved is False
             assert lease.worker_url == source
-            assert lease.decision.reason == "owner_min_load"
+            assert lease.decision.reason == "backlog_advantage_not_met"
             assert lease.decision.target_base_load is not None
             assert lease.decision.target_base_load.prefill_pressure == pytest.approx(
                 0.4
@@ -2541,6 +2753,7 @@ def test_mooncake_prior_does_not_affect_load_routing():
             config=EngineRebalancingConfig(
                 enabled=True,
                 cold_start_hit_probability=cold_start_probability,
+                min_hold_turns=1,
             ),
             model_id="model",
             model_config=simple_model_config(),
@@ -3168,7 +3381,7 @@ def test_enabled_proxy_places_first_request_directly_and_reports_state():
         assert loads["effective_config"]["load_poll_interval_ms"] == 250
         assert loads["effective_config"]["history_size"] == 128
         assert loads["effective_config"]["min_samples"] == 16
-        assert loads["effective_config"]["min_hold_turns"] == 1
+        assert loads["effective_config"]["min_hold_turns"] == 2
         assert loads["effective_config"]["min_risk_ms"] == 10
         assert loads["effective_config"]["cold_start_hit_probability"] == 1.0
         assert loads["effective_config"]["min_load_improvement_ratio"] == 0.30

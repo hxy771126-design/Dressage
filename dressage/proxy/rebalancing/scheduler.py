@@ -1794,6 +1794,29 @@ class EngineRebalancer:
                 hashlib.sha256(f"{session_id}\0{url}".encode()).hexdigest(),
             ),
         )
+        backlog_targets: list[str] = []
+        if session.owner_turns >= self.config.min_hold_turns:
+            source_backlog = (
+                base_scores[source].queue_pressure
+                + base_scores[source].prefill_pressure
+            )
+            backlog_targets = [
+                candidate
+                for candidate in eligible_targets
+                if source_backlog
+                > (
+                    base_scores[candidate].queue_pressure
+                    + base_scores[candidate].prefill_pressure
+                )
+            ]
+            if backlog_targets:
+                target = min(
+                    backlog_targets,
+                    key=lambda url: (
+                        base_scores[url].total,
+                        hashlib.sha256(f"{session_id}\0{url}".encode()).hexdigest(),
+                    ),
+                )
         source_base = base_scores[source]
         target_base = base_scores[target]
         improvement = (
@@ -1809,10 +1832,12 @@ class EngineRebalancer:
             required_ratio = min(1.0, 2.0 * required_ratio)
 
         moved = False
-        if target_base.total >= source_base.total:
-            reason = "owner_min_load"
-        elif session.owner_turns < self.config.min_hold_turns:
+        if session.owner_turns < self.config.min_hold_turns:
             reason = "min_hold_turns_not_met"
+        elif not backlog_targets:
+            reason = "backlog_advantage_not_met"
+        elif target_base.total >= source_base.total:
+            reason = "owner_min_load"
         elif improvement < required_ratio:
             reason = (
                 "return_hysteresis_below_threshold"
