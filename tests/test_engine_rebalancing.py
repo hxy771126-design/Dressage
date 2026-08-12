@@ -184,10 +184,10 @@ def test_config_derives_metrics_staleness():
 
 def test_config_defaults_propagate_to_online_models():
     config = EngineRebalancingConfig(enabled=True)
-    assert config.snapshot()["load_poll_interval_ms"] == 250
+    assert config.snapshot()["load_poll_interval_ms"] == 125
     assert config.snapshot()["history_size"] == 128
     assert config.snapshot()["min_samples"] == 16
-    assert config.snapshot()["min_hold_turns"] == 2
+    assert config.snapshot()["min_hold_turns"] == 5
     assert config.snapshot()["min_risk_ms"] == 10
     assert config.snapshot()["cold_start_hit_probability"] == 1.0
     assert config.snapshot()["min_load_improvement_ratio"] == 0.30
@@ -1303,8 +1303,8 @@ def test_router_waiting_backoff_and_runtime_outage_logging(caplog, monkeypatch):
         for record in caplog.records
         if "waiting_for_router" in record.getMessage()
     ]
-    assert delays[:5] == [0.25, 1.0, 2.0, 5.0, 5.0]
-    assert all(delay == 0.25 for delay in delays[5:])
+    assert delays[:5] == [0.125, 1.0, 2.0, 5.0, 5.0]
+    assert all(delay == 0.125 for delay in delays[5:])
     assert sum(record.levelno == logging.INFO for record in waiting_records) == 1
     assert not any(record.levelno >= logging.WARNING for record in waiting_records)
     assert all(record.exc_info is None for record in waiting_records)
@@ -1769,6 +1769,7 @@ def test_existing_session_uses_base_load_improvement_threshold(
         client,
         config=EngineRebalancingConfig(
             enabled=True,
+            min_hold_turns=1,
             min_load_improvement_ratio=minimum_ratio,
         ),
         model_id="model",
@@ -1941,7 +1942,7 @@ def test_min_hold_turns_blocks_otherwise_beneficial_migration():
     run(scenario())
 
 
-def test_default_hold_blocks_next_hop_then_allows_it_after_sticky_step():
+def test_default_hold_blocks_next_hop_until_fifth_owner_turn():
     client = ControlPlaneClient(shared_l3=True)
     client.urls.append("http://node-c:30000")
 
@@ -1976,24 +1977,25 @@ def test_default_hold_blocks_next_hop_then_allows_it_after_sticky_step():
             owner_turns=1,
         )
 
-        sticky = await rebalancer.acquire(
-            session_id="multi-hop",
-            input_ids=[1] * 100,
-        )
-        assert sticky.worker_url == source
-        assert sticky.decision.reason == "min_hold_turns_not_met"
-        await rebalancer.complete(
-            sticky,
-            response_meta={
-                "cached_tokens": 100,
-                "queue_time": 0.0,
-                "e2e_latency": 1.0,
-                "decode_throughput": 10.0,
-            },
-            output_tokens=1,
-            committed_tokens=[1] * 100,
-        )
-        assert rebalancer.sessions["multi-hop"].owner_turns == 2
+        for owner_turn in range(1, 5):
+            sticky = await rebalancer.acquire(
+                session_id="multi-hop",
+                input_ids=[1] * 100,
+            )
+            assert sticky.worker_url == source
+            assert sticky.decision.reason == "min_hold_turns_not_met"
+            await rebalancer.complete(
+                sticky,
+                response_meta={
+                    "cached_tokens": 100,
+                    "queue_time": 0.0,
+                    "e2e_latency": 1.0,
+                    "decode_throughput": 10.0,
+                },
+                output_tokens=1,
+                committed_tokens=[1] * 100,
+            )
+            assert rebalancer.sessions["multi-hop"].owner_turns == owner_turn + 1
 
         movable = await rebalancer.acquire(
             session_id="multi-hop",
@@ -2066,7 +2068,7 @@ def test_existing_session_rejects_move_when_projected_target_is_busier():
 
     rebalancer = EngineRebalancer(
         client,
-        config=EngineRebalancingConfig(enabled=True),
+        config=EngineRebalancingConfig(enabled=True, min_hold_turns=1),
         model_id="model",
         model_config=simple_model_config(),
         calibration_benchmark=benchmark,
@@ -3395,10 +3397,10 @@ def test_enabled_proxy_places_first_request_directly_and_reports_state():
         loads = http_client.get("/v1/engines/load").json()
         assert loads["enabled"] is True
         assert loads["effective_config"]["metrics_stale_ms"] == 2_000
-        assert loads["effective_config"]["load_poll_interval_ms"] == 250
+        assert loads["effective_config"]["load_poll_interval_ms"] == 125
         assert loads["effective_config"]["history_size"] == 128
         assert loads["effective_config"]["min_samples"] == 16
-        assert loads["effective_config"]["min_hold_turns"] == 2
+        assert loads["effective_config"]["min_hold_turns"] == 5
         assert loads["effective_config"]["min_risk_ms"] == 10
         assert loads["effective_config"]["cold_start_hit_probability"] == 1.0
         assert loads["effective_config"]["min_load_improvement_ratio"] == 0.30
