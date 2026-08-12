@@ -1619,17 +1619,68 @@ def test_reservations_spread_simultaneous_new_sessions():
         "target_prefill",
         "expected_worker",
         "expected_reason",
+        "expected_required_ratio",
     ),
     [
-        (2, 1, 0, 0, 0, 0, "source", "backlog_advantage_not_met"),
-        (1, 2, 0, 0, 0, 0, "source", "backlog_advantage_not_met"),
-        (2, 0, 1, 1, 0, 0, "source", "backlog_advantage_not_met"),
-        (2, 0, 0, 1, 0, 0, "source", "backlog_advantage_not_met"),
-        (2, 1, 1, 0, 0, 0, "target", "load_improvement_threshold_met"),
-        (2, 1, 0, 0, 1_000, 0, "target", "load_improvement_threshold_met"),
+        (
+            100,
+            61,
+            0,
+            0,
+            0,
+            0,
+            "source",
+            "no_backlog_load_improvement_below_threshold",
+            0.40,
+        ),
+        (
+            100,
+            60,
+            0,
+            0,
+            0,
+            0,
+            "target",
+            "no_backlog_load_improvement_threshold_met",
+            0.40,
+        ),
+        (
+            2,
+            1,
+            0,
+            0,
+            0,
+            0,
+            "target",
+            "no_backlog_load_improvement_threshold_met",
+            0.40,
+        ),
+        (
+            2,
+            0,
+            1,
+            1,
+            0,
+            0,
+            "target",
+            "no_backlog_load_improvement_threshold_met",
+            0.40,
+        ),
+        (2, 1, 1, 0, 0, 0, "target", "load_improvement_threshold_met", 0.20),
+        (
+            2,
+            1,
+            0,
+            0,
+            1_000,
+            0,
+            "target",
+            "load_improvement_threshold_met",
+            0.20,
+        ),
     ],
 )
-def test_existing_session_requires_strict_backlog_advantage(
+def test_existing_session_uses_two_level_backlog_threshold(
     source_running,
     target_running,
     source_queued,
@@ -1638,6 +1689,7 @@ def test_existing_session_requires_strict_backlog_advantage(
     target_prefill,
     expected_worker,
     expected_reason,
+    expected_required_ratio,
 ):
     client = ControlPlaneClient(shared_l3=True)
 
@@ -1683,6 +1735,10 @@ def test_existing_session_requires_strict_backlog_advantage(
                 source if expected_worker == "source" else target
             )
             assert lease.decision.reason == expected_reason
+            assert (
+                lease.decision.required_load_improvement_ratio
+                == expected_required_ratio
+            )
         finally:
             await rebalancer.fail(lease)
 
@@ -1733,6 +1789,57 @@ def test_existing_session_selects_lowest_load_target_with_backlog_advantage():
             assert lease.decision.reason == "load_improvement_threshold_met"
             assert lease.decision.target_base_load is not None
             assert lease.decision.target_base_load.queue_pressure == 0.0
+        finally:
+            await rebalancer.fail(lease)
+
+    run(scenario())
+
+
+def test_existing_session_selects_lowest_load_target_without_backlog_advantage():
+    client = ControlPlaneClient(shared_l3=True)
+    client.urls.append("http://node-c:30000")
+
+    async def benchmark(task, payload):
+        del task
+        return CalibrationSample(
+            latency_seconds=0.01,
+            bandwidth_bytes_per_second=max(1, payload * 10),
+        )
+
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(enabled=True, min_hold_turns=1),
+        model_id="model",
+        model_config=simple_model_config(),
+        calibration_benchmark=benchmark,
+    )
+
+    async def scenario():
+        await rebalancer.refresh()
+        source, lowest_load, higher_load = client.urls
+        rebalancer.loads[source].running = 100
+        rebalancer.loads[lowest_load].running = 20
+        rebalancer.loads[higher_load].running = 50
+        fingerprint = rebalancer.deployments[source].cache_fingerprint
+        rebalancer.sessions["no-backlog-target"] = SessionRoutingState(
+            owner_worker_url=source,
+            fingerprint=fingerprint,
+            previous_committed_tokens=[1] * 100,
+            seen_engines={source},
+            owner_turns=2,
+        )
+
+        lease = await rebalancer.acquire(
+            session_id="no-backlog-target",
+            input_ids=[1] * 100,
+        )
+        try:
+            assert lease.worker_url == lowest_load
+            assert (
+                lease.decision.reason
+                == "no_backlog_load_improvement_threshold_met"
+            )
+            assert lease.decision.required_load_improvement_ratio == 0.40
         finally:
             await rebalancer.fail(lease)
 
@@ -1891,6 +1998,60 @@ def test_previous_owner_uses_double_threshold_only_for_first_step(
             )
             assert lease.decision.reason == expected_reason
             assert lease.decision.required_load_improvement_ratio == required
+        finally:
+            await rebalancer.fail(lease)
+
+    run(scenario())
+
+
+def test_no_backlog_and_previous_owner_share_one_double_threshold():
+    client = ControlPlaneClient(shared_l3=True)
+
+    async def benchmark(task, payload):
+        del task
+        return CalibrationSample(
+            latency_seconds=0.01,
+            bandwidth_bytes_per_second=max(1, payload * 10),
+        )
+
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(
+            enabled=True,
+            min_hold_turns=2,
+            min_load_improvement_ratio=0.20,
+        ),
+        model_id="model",
+        model_config=simple_model_config(),
+        calibration_benchmark=benchmark,
+    )
+
+    async def scenario():
+        await rebalancer.refresh()
+        source, previous_owner = client.urls
+        rebalancer.loads[source].running = 100
+        rebalancer.loads[previous_owner].running = 50
+        fingerprint = rebalancer.deployments[source].cache_fingerprint
+        rebalancer.sessions["no-backlog-return"] = SessionRoutingState(
+            owner_worker_url=source,
+            previous_owner_worker_url=previous_owner,
+            fingerprint=fingerprint,
+            previous_committed_tokens=[1] * 100,
+            seen_engines={source, previous_owner},
+            owner_turns=2,
+        )
+
+        lease = await rebalancer.acquire(
+            session_id="no-backlog-return",
+            input_ids=[1] * 100,
+        )
+        try:
+            assert lease.worker_url == previous_owner
+            assert (
+                lease.decision.reason
+                == "no_backlog_load_improvement_threshold_met"
+            )
+            assert lease.decision.required_load_improvement_ratio == 0.40
         finally:
             await rebalancer.fail(lease)
 
@@ -2080,7 +2241,6 @@ def test_existing_session_rejects_move_when_projected_target_is_busier():
         rebalancer.loads[source].running = 100
         rebalancer.loads[source].request_capacity = 100
         rebalancer.loads[source].token_capacity = 1_000
-        rebalancer.loads[source].waiting_uncached_tokens = 1
         rebalancer.loads[target].running = 6
         rebalancer.loads[target].request_capacity = 10
         rebalancer.loads[target].token_capacity = 100
@@ -2100,6 +2260,7 @@ def test_existing_session_rejects_move_when_projected_target_is_busier():
         try:
             assert lease.worker_url == source
             assert lease.decision.reason == "projected_load_safety_check_failed"
+            assert lease.decision.required_load_improvement_ratio == 0.40
             assert lease.decision.load_improvement_ratio == pytest.approx(
                 (
                     lease.decision.source_base_load.total
@@ -2745,7 +2906,7 @@ def test_prefill_pressure_can_prevent_load_ratio_migration():
             assert lease.decision.state is SchedulerState.ACTIVE
             assert lease.decision.moved is False
             assert lease.worker_url == source
-            assert lease.decision.reason == "backlog_advantage_not_met"
+            assert lease.decision.reason == "owner_min_load"
             assert lease.decision.target_base_load is not None
             assert lease.decision.target_base_load.prefill_pressure == pytest.approx(
                 0.4

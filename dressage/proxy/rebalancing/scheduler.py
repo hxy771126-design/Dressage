@@ -1830,26 +1830,33 @@ class EngineRebalancer:
             target == session.previous_owner_worker_url
             and session.owner_turns == first_eligible_owner_turn
         )
-        if returning_to_previous_owner:
+        has_backlog_advantage = bool(backlog_targets)
+        if not has_backlog_advantage or returning_to_previous_owner:
             required_ratio = min(1.0, 2.0 * required_ratio)
 
         moved = False
         if session.owner_turns < self.config.min_hold_turns:
             reason = "min_hold_turns_not_met"
-        elif not backlog_targets:
-            reason = "backlog_advantage_not_met"
         elif target_base.total >= source_base.total:
             reason = "owner_min_load"
         elif improvement < required_ratio:
             reason = (
                 "return_hysteresis_below_threshold"
                 if returning_to_previous_owner
-                else "load_improvement_below_threshold"
+                else (
+                    "load_improvement_below_threshold"
+                    if has_backlog_advantage
+                    else "no_backlog_load_improvement_below_threshold"
+                )
             )
         elif projected_scores[target].total > projected_scores[source].total:
             reason = "projected_load_safety_check_failed"
         else:
-            reason = "load_improvement_threshold_met"
+            reason = (
+                "load_improvement_threshold_met"
+                if has_backlog_advantage
+                else "no_backlog_load_improvement_threshold_met"
+            )
             moved = True
 
         selected = target if moved else source
