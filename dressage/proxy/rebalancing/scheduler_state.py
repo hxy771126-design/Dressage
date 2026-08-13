@@ -23,7 +23,7 @@ class SchedulerState(str, Enum):
 @dataclass
 class EngineRebalancingConfig:
     enabled: bool = False
-    load_poll_interval_ms: int = 125
+    load_poll_interval_ms: int = 250
     metrics_stale_ms: int = 2_000
     history_size: int = 256
     min_samples: int = 16

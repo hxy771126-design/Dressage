@@ -184,7 +184,7 @@ def test_config_derives_metrics_staleness():
 
 def test_config_defaults_propagate_to_online_models():
     config = EngineRebalancingConfig(enabled=True)
-    assert config.snapshot()["load_poll_interval_ms"] == 125
+    assert config.snapshot()["load_poll_interval_ms"] == 250
     assert config.snapshot()["history_size"] == 256
     assert config.snapshot()["min_samples"] == 16
     assert config.snapshot()["min_hold_turns"] == 2
@@ -1303,8 +1303,8 @@ def test_router_waiting_backoff_and_runtime_outage_logging(caplog, monkeypatch):
         for record in caplog.records
         if "waiting_for_router" in record.getMessage()
     ]
-    assert delays[:5] == [0.125, 1.0, 2.0, 5.0, 5.0]
-    assert all(delay == 0.125 for delay in delays[5:])
+    assert delays[:5] == [0.25, 1.0, 2.0, 5.0, 5.0]
+    assert all(delay == 0.25 for delay in delays[5:])
     assert sum(record.levelno == logging.INFO for record in waiting_records) == 1
     assert not any(record.levelno >= logging.WARNING for record in waiting_records)
     assert all(record.exc_info is None for record in waiting_records)
@@ -3558,7 +3558,7 @@ def test_enabled_proxy_places_first_request_directly_and_reports_state():
         loads = http_client.get("/v1/engines/load").json()
         assert loads["enabled"] is True
         assert loads["effective_config"]["metrics_stale_ms"] == 2_000
-        assert loads["effective_config"]["load_poll_interval_ms"] == 125
+        assert loads["effective_config"]["load_poll_interval_ms"] == 250
         assert loads["effective_config"]["history_size"] == 256
         assert loads["effective_config"]["min_samples"] == 16
         assert loads["effective_config"]["min_hold_turns"] == 2
