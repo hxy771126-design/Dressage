@@ -1906,6 +1906,267 @@ def test_partial_and_all_batch_fetch_failure_exclude_untrusted_engines():
     run(scenario())
 
 
+def test_batch_malformed_numeric_load_is_invalid_without_failing_other_engine():
+    client = ControlledBatchLoadClient()
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(enabled=True),
+        model_id="model",
+        model_config=simple_model_config(),
+    )
+
+    async def scenario():
+        await rebalancer.refresh()
+        invalid, valid = client.urls
+        client.control_batch_loads()
+        task = asyncio.create_task(
+            rebalancer.acquire(session_id="malformed-load", input_ids=[1] * 10)
+        )
+        await wait_for_condition(
+            lambda: sum(client.batch_load_calls.values()) == len(client.urls)
+        )
+        client.batch_load_futures[invalid][0].set_result(
+            {
+                "loads": [
+                    {
+                        "num_running_reqs": "not-a-number",
+                        "max_total_num_tokens": 100_000,
+                        "max_running_requests": 100,
+                    }
+                ]
+            }
+        )
+        client.resolve_url(valid, 0)
+        lease = await task
+        trace = (await rebalancer.snapshot())["recent_load_batches"][-1]
+
+        assert lease.worker_url == valid
+        assert {
+            engine["url"]: engine["fetch_status"] for engine in trace["engines"]
+        } == {invalid: "invalid", valid: "ok"}
+        await rebalancer.fail(lease)
+
+    run(scenario())
+
+
+def test_batch_commit_revalidation_fails_only_step_with_newly_unhealthy_target(
+    monkeypatch,
+):
+    client = ControlledBatchLoadClient()
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(enabled=True),
+        model_id="model",
+        model_config=simple_model_config(),
+    )
+
+    async def scenario():
+        await rebalancer.refresh()
+        source, target = client.urls
+        fingerprint = rebalancer.deployments[source].cache_fingerprint
+        rebalancer.sessions["safe-sticky"] = SessionRoutingState(
+            owner_worker_url=source,
+            fingerprint=fingerprint,
+            previous_committed_tokens=[1] * 10,
+            seen_engines={source},
+        )
+        original_solve = rebalancer._solve_frozen_batch
+
+        def make_selected_target_unhealthy(frozen):
+            solved = original_solve(frozen)
+            assert dict(solved.assignment)["unsafe-new"] == target
+            rebalancer.loads[target].healthy = False
+            return solved
+
+        monkeypatch.setattr(
+            rebalancer,
+            "_solve_frozen_batch",
+            make_selected_target_unhealthy,
+        )
+        client.control_batch_loads()
+        unsafe = asyncio.create_task(
+            rebalancer.acquire(session_id="unsafe-new", input_ids=[2] * 10)
+        )
+        safe = asyncio.create_task(
+            rebalancer.acquire(session_id="safe-sticky", input_ids=[1] * 10)
+        )
+        await wait_for_condition(
+            lambda: sum(client.batch_load_calls.values()) == len(client.urls)
+        )
+        client.resolve_url(source, 0, running=80)
+        client.resolve_url(target, 0, running=0)
+        unsafe_result, safe_result = await asyncio.gather(
+            unsafe,
+            safe,
+            return_exceptions=True,
+        )
+        trace = (await rebalancer.snapshot())["recent_load_batches"][-1]
+
+        assert isinstance(unsafe_result, RuntimeError)
+        assert isinstance(safe_result, RoutingLease)
+        assert safe_result.worker_url == source
+        assert trace["batch"]["solved_count"] == 2
+        assert trace["batch"]["committed_count"] == 1
+        assert trace["batch"]["failed_count"] == 1
+        assert all(
+            entry.engine_url != target
+            for entry in rebalancer._reservations.values()
+        )
+        await rebalancer.fail(safe_result)
+
+    run(scenario())
+
+
+def test_batch_commit_revalidation_rejects_fixed_owner_that_became_unhealthy(
+    monkeypatch,
+):
+    client = ControlledBatchLoadClient()
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(enabled=True),
+        model_id="model",
+        model_config=simple_model_config(),
+    )
+
+    async def scenario():
+        await rebalancer.refresh()
+        source, target = client.urls
+        fingerprint = rebalancer.deployments[source].cache_fingerprint
+        rebalancer.sessions["fixed-became-unhealthy"] = SessionRoutingState(
+            owner_worker_url=source,
+            fingerprint=fingerprint,
+            previous_committed_tokens=[1] * 10,
+            seen_engines={source},
+        )
+        original_solve = rebalancer._solve_frozen_batch
+
+        def make_fixed_owner_unhealthy(frozen):
+            solved = original_solve(frozen)
+            rebalancer.loads[source].healthy = False
+            return solved
+
+        monkeypatch.setattr(
+            rebalancer,
+            "_solve_frozen_batch",
+            make_fixed_owner_unhealthy,
+        )
+        client.control_batch_loads()
+        task = asyncio.create_task(
+            rebalancer.acquire(
+                session_id="fixed-became-unhealthy",
+                input_ids=[1] * 10,
+                step_max_new_tokens=7,
+            )
+        )
+        await wait_for_condition(
+            lambda: sum(client.batch_load_calls.values()) == len(client.urls)
+        )
+        client.fail_url(source, 0)
+        client.resolve_url(target, 0)
+
+        with pytest.raises(RuntimeError, match="eligible"):
+            await task
+        trace = (await rebalancer.snapshot())["recent_load_batches"][-1]
+        step = trace["steps"][0]
+        assert step["source"] == source
+        assert step["candidate_urls"] == [source]
+        assert step["estimated_output"] == 7
+        assert step["status"] == "failed"
+        assert rebalancer._reservations == {}
+
+    run(scenario())
+
+
+def test_batch_collect_time_stops_at_atomic_seal(monkeypatch):
+    client = ControlledBatchLoadClient()
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(enabled=True),
+        model_id="model",
+        model_config=simple_model_config(),
+    )
+    original_solve = rebalancer._solve_frozen_batch
+    original_commit = rebalancer._commit_batch
+
+    def slow_solve(frozen):
+        time.sleep(0.05)
+        return original_solve(frozen)
+
+    async def slow_commit(*args, **kwargs):
+        await asyncio.sleep(0.05)
+        return await original_commit(*args, **kwargs)
+
+    monkeypatch.setattr(rebalancer, "_solve_frozen_batch", slow_solve)
+    monkeypatch.setattr(rebalancer, "_commit_batch", slow_commit)
+
+    async def scenario():
+        await rebalancer.refresh()
+        client.control_batch_loads()
+        task = asyncio.create_task(
+            rebalancer.acquire(session_id="seal-timing", input_ids=[1] * 10)
+        )
+        await wait_for_condition(
+            lambda: sum(client.batch_load_calls.values()) == len(client.urls)
+        )
+        client.resolve_batch(0)
+        lease = await task
+        trace = (await rebalancer.snapshot())["recent_load_batches"][-1]
+
+        assert trace["batch"]["collect_seconds"] < 0.04
+        assert trace["batch"]["total_seconds"] >= 0.09
+        await rebalancer.fail(lease)
+
+    run(scenario())
+
+
+@pytest.mark.parametrize("terminal", ["error", "cancel"])
+def test_batch_success_trace_is_not_republished_by_late_runner_failure(
+    monkeypatch,
+    terminal,
+):
+    client = ControlledBatchLoadClient()
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(enabled=True),
+        model_id="model",
+        model_config=simple_model_config(),
+    )
+
+    async def scenario():
+        await rebalancer.refresh()
+        original_commit = rebalancer._commit_batch
+
+        async def late_terminal(*args, **kwargs):
+            await original_commit(*args, **kwargs)
+            if terminal == "cancel":
+                raise asyncio.CancelledError
+            raise RuntimeError("after successful commit")
+
+        monkeypatch.setattr(rebalancer, "_commit_batch", late_terminal)
+        client.control_batch_loads()
+        task = asyncio.create_task(
+            rebalancer.acquire(session_id=f"late-{terminal}", input_ids=[1] * 10)
+        )
+        await wait_for_condition(
+            lambda: sum(client.batch_load_calls.values()) == len(client.urls)
+        )
+        client.resolve_batch(0)
+        lease = await task
+        await wait_for_condition(lambda: not rebalancer._batch_runner_tasks)
+        snapshot = await rebalancer.snapshot()
+
+        assert len(snapshot["recent_load_batches"]) == 1
+        assert snapshot["recent_load_batches"][0]["batch"]["committed_count"] == 1
+        assert snapshot["recent_load_batches"][0]["batch"]["failed_count"] == 0
+        assert json.loads(json.dumps(snapshot["recent_load_batches"])) == snapshot[
+            "recent_load_batches"
+        ]
+        assert lease.reservation_id in rebalancer._reservations
+        await rebalancer.fail(lease)
+
+    run(scenario())
+
+
 @pytest.mark.parametrize(
     ("sticky_j", "optimized_j", "required", "expected_plan"),
     [

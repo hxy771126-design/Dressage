@@ -428,6 +428,8 @@ class _OpenBatch:
     started_wall: float
     steps: list[_PendingBatchStep] = field(default_factory=list)
     sealed: bool = False
+    sealed_monotonic: float | None = None
+    terminal_published: bool = False
 
 
 @dataclass(frozen=True)
@@ -1925,7 +1927,10 @@ class EngineRebalancer:
                 url, "error", time.monotonic() - started, 0, None
             )
         rows = payload.get("loads") if isinstance(payload, Mapping) else None
-        load = self._normalize_load(url, payload, now=time.monotonic())
+        try:
+            load = self._normalize_load(url, payload, now=time.monotonic())
+        except (TypeError, ValueError, OverflowError):
+            load = None
         if (
             load is None
             or load.request_capacity <= 0
@@ -2470,6 +2475,7 @@ class EngineRebalancer:
                 fetch_finished = time.monotonic()
                 async with self._batch_lock:
                     batch.sealed = True
+                    batch.sealed_monotonic = time.monotonic()
                     if self._open_batch is batch:
                         self._open_batch = None
                 frozen = await self._freeze_batch(batch, fetch_results)
@@ -2551,6 +2557,60 @@ class EngineRebalancer:
                 )
                 try:
                     assignment = dict(solved.assignment)
+                    selected_targets: dict[int, str] = {}
+                    for frozen_step in frozen.steps:
+                        step = frozen_step.pending
+                        if step.cancelled or frozen_step.failure is not None:
+                            continue
+                        target = frozen_step.fixed_target or assignment.get(
+                            step.session_id
+                        )
+                        if target is None:
+                            failures.append(
+                                (step, RuntimeError("batch assignment is missing"))
+                            )
+                            continue
+                        deployment = self.deployments.get(target)
+                        current_load = self.loads.get(target)
+                        current_session = self.sessions.get(step.session_id)
+                        fingerprint = (
+                            None
+                            if current_session is None
+                            else current_session.fingerprint
+                        ) or frozen_step.fingerprint
+                        frozen_target = (
+                            target == frozen_step.fixed_target
+                            or any(
+                                edge.engine_url == target
+                                for edge in frozen_step.edges
+                            )
+                        )
+                        if not (
+                            frozen_target
+                            and deployment is not None
+                            and deployment.worker_url == target
+                            and current_load is not None
+                            and current_load.healthy
+                            and (
+                                step.expected_version is None
+                                or deployment.weight_version
+                                == step.expected_version
+                            )
+                            and (
+                                fingerprint is None
+                                or deployment.cache_fingerprint == fingerprint
+                            )
+                        ):
+                            failures.append(
+                                (
+                                    step,
+                                    RuntimeError(
+                                        "batch assignment target is no longer eligible"
+                                    ),
+                                )
+                            )
+                            continue
+                        selected_targets[step.arrival_id] = target
                     increments = {
                         engine.url: [0.0, 0.0, 0.0]
                         for engine in frozen.decision_engines
@@ -2558,9 +2618,11 @@ class EngineRebalancer:
                     for frozen_step in frozen.steps:
                         if frozen_step.pending.cancelled or frozen_step.failure:
                             continue
-                        target = frozen_step.fixed_target or assignment.get(
-                            frozen_step.pending.session_id
+                        target = selected_targets.get(
+                            frozen_step.pending.arrival_id
                         )
+                        if target is None:
+                            continue
                         edge = next(
                             (
                                 item
@@ -2613,13 +2675,8 @@ class EngineRebalancer:
                                 (step, RuntimeError(frozen_step.failure))
                             )
                             continue
-                        target = frozen_step.fixed_target or assignment.get(
-                            step.session_id
-                        )
+                        target = selected_targets.get(step.arrival_id)
                         if target is None:
-                            failures.append(
-                                (step, RuntimeError("batch assignment is missing"))
-                            )
                             continue
                         session = self.sessions.get(step.session_id)
                         if session is None:
@@ -2708,6 +2765,7 @@ class EngineRebalancer:
                         solved=solved,
                     )
                     self._load_batch_history.record(LoadBatchTrace(trace))
+                    batch.terminal_published = True
                 except BaseException:
                     self.sessions = sessions_before
                     self._reservations = reservations_before
@@ -2772,18 +2830,72 @@ class EngineRebalancer:
     ) -> dict[str, Any]:
         lease_by_arrival = {step.arrival_id: lease for step, lease in leases}
         failed_arrivals = {step.arrival_id for step, _ in failures}
+        frozen_by_arrival = {
+            step.pending.arrival_id: step
+            for step in (() if frozen is None else frozen.steps)
+        }
+        solved_assignment = {} if solved is None else dict(solved.assignment)
+
+        def frozen_trace_inputs(
+            step: _PendingBatchStep,
+        ) -> tuple[str | None, int | None, list[str]]:
+            frozen_step = frozen_by_arrival.get(step.arrival_id)
+            if frozen_step is None:
+                return (
+                    None,
+                    None,
+                    [
+                        result.url
+                        for result in fetch_results
+                        if result.status == "ok"
+                    ],
+                )
+            candidate_urls = (
+                [frozen_step.fixed_target]
+                if frozen_step.fixed_target is not None
+                else [edge.engine_url for edge in frozen_step.edges]
+            )
+            target = frozen_step.fixed_target or solved_assignment.get(
+                step.session_id
+            )
+            budgets = dict(frozen_step.budgets)
+            budget = budgets.get(target)
+            if budget is None and len(budgets) == 1:
+                budget = next(iter(budgets.values()))
+            return (
+                frozen_step.source,
+                None if budget is None else budget.estimated_step_output_tokens,
+                candidate_urls,
+            )
+
+        trace_inputs = {
+            step.arrival_id: frozen_trace_inputs(step) for step in batch.steps
+        }
+        solved_count = (
+            len(leases)
+            if frozen is None
+            else sum(
+                not step.pending.cancelled
+                and step.failure is None
+                and (step.fixed_target is not None or bool(step.edges))
+                for step in frozen.steps
+            )
+        )
         return {
             "batch": {
                 "id": batch.id,
                 "completed_at": time.time(),
                 "registered_count": len(batch.steps),
-                "solved_count": len(leases),
+                "solved_count": solved_count,
                 "committed_count": len(leases),
                 "failed_count": len(failures),
                 "cancelled_count": sum(step.cancelled for step in batch.steps),
                 "wait_for_previous_seconds": wait_previous_seconds,
                 "collect_seconds": max(
-                    0.0, completed_at - batch.started_monotonic - fetch_seconds
+                    0.0,
+                    (batch.sealed_monotonic or completed_at)
+                    - batch.started_monotonic
+                    - fetch_seconds,
                 ),
                 "fetch_seconds": fetch_seconds,
                 "solve_seconds": 0.0 if solved is None else solved.elapsed_seconds,
@@ -2794,21 +2906,19 @@ class EngineRebalancer:
                     "arrival_id": step.arrival_id,
                     "session_id": step.session_id,
                     "source": (
-                        None
-                        if step.arrival_id not in lease_by_arrival
-                        else lease_by_arrival[step.arrival_id].decision.source_worker_url
-                    ),
-                    "prompt_token_count": len(step.input_ids),
-                    "estimated_output": (
-                        None
+                        trace_inputs[step.arrival_id][0]
                         if step.arrival_id not in lease_by_arrival
                         else lease_by_arrival[
                             step.arrival_id
-                        ].expected_output_tokens
+                        ].decision.source_worker_url
                     ),
-                    "candidate_urls": [
-                        result.url for result in fetch_results if result.status == "ok"
-                    ],
+                    "prompt_token_count": len(step.input_ids),
+                    "estimated_output": (
+                        trace_inputs[step.arrival_id][1]
+                        if step.arrival_id not in lease_by_arrival
+                        else lease_by_arrival[step.arrival_id].expected_output_tokens
+                    ),
+                    "candidate_urls": trace_inputs[step.arrival_id][2],
                     "status": (
                         "cancelled"
                         if step.cancelled
@@ -2922,27 +3032,32 @@ class EngineRebalancer:
         frozen: _FrozenBatch | None = None,
     ) -> None:
         async with self._batch_lock:
-            batch.sealed = True
-            if self._open_batch is batch:
-                self._open_batch = None
-            failures = [
-                (step, exc) for step in batch.steps if not step.cancelled
-            ]
-            self._load_batch_history.record(
-                LoadBatchTrace(
-                    self._batch_trace(
-                        batch,
-                        fetch_results,
-                        leases=[],
-                        failures=failures,
-                        wait_previous_seconds=0.0,
-                        fetch_seconds=0.0,
-                        completed_at=time.monotonic(),
-                        fallback_reason="runner_failure",
-                        frozen=frozen,
+            async with self._lock:
+                batch.sealed = True
+                if batch.sealed_monotonic is None:
+                    batch.sealed_monotonic = time.monotonic()
+                if self._open_batch is batch:
+                    self._open_batch = None
+                failures = [
+                    (step, exc) for step in batch.steps if not step.cancelled
+                ]
+                if not batch.terminal_published:
+                    self._load_batch_history.record(
+                        LoadBatchTrace(
+                            self._batch_trace(
+                                batch,
+                                fetch_results,
+                                leases=[],
+                                failures=failures,
+                                wait_previous_seconds=0.0,
+                                fetch_seconds=0.0,
+                                completed_at=time.monotonic(),
+                                fallback_reason="runner_failure",
+                                frozen=frozen,
+                            )
+                        )
                     )
-                )
-            )
+                    batch.terminal_published = True
         for step, _ in failures:
             if not step.future.done():
                 step.future.set_exception(exc)
