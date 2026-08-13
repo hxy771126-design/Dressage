@@ -2573,20 +2573,53 @@ class EngineRebalancer:
                         deployment = self.deployments.get(target)
                         current_load = self.loads.get(target)
                         current_session = self.sessions.get(step.session_id)
+                        if (
+                            self._batch_session_signature(current_session)
+                            != frozen_step.session_signature
+                        ):
+                            failures.append(
+                                (
+                                    step,
+                                    RuntimeError(
+                                        "batch assignment target is no longer eligible"
+                                    ),
+                                )
+                            )
+                            continue
                         fingerprint = (
                             None
                             if current_session is None
                             else current_session.fingerprint
                         ) or frozen_step.fingerprint
+                        selected_edge = next(
+                            (
+                                edge
+                                for edge in frozen_step.edges
+                                if edge.engine_url == target
+                            ),
+                            None,
+                        )
+                        voluntary_path_ready = (
+                            selected_edge is None
+                            or not selected_edge.voluntary_migration
+                            or (
+                                current_session is not None
+                                and current_session.owner_worker_url is not None
+                                and self._candidate_path_readiness(
+                                    current_session,
+                                    current_session.owner_worker_url,
+                                    target,
+                                ).cache_source
+                                is CacheSource.MOONCAKE
+                            )
+                        )
                         frozen_target = (
                             target == frozen_step.fixed_target
-                            or any(
-                                edge.engine_url == target
-                                for edge in frozen_step.edges
-                            )
+                            or selected_edge is not None
                         )
                         if not (
                             frozen_target
+                            and voluntary_path_ready
                             and deployment is not None
                             and deployment.worker_url == target
                             and current_load is not None

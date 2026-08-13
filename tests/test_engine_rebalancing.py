@@ -2077,6 +2077,179 @@ def test_batch_commit_revalidation_rejects_fixed_owner_that_became_unhealthy(
     run(scenario())
 
 
+@pytest.mark.parametrize(
+    "changed_field",
+    ["owner", "pending_owner", "fingerprint", "previous_committed"],
+)
+def test_batch_commit_revalidation_rejects_session_signature_drift_only(
+    monkeypatch,
+    changed_field,
+):
+    client = ControlledBatchLoadClient()
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(enabled=True),
+        model_id="model",
+        model_config=simple_model_config(),
+    )
+
+    async def scenario():
+        await rebalancer.refresh()
+        source, target = client.urls
+        fingerprint = rebalancer.deployments[source].cache_fingerprint
+        rebalancer.sessions["signature-drift"] = SessionRoutingState(
+            owner_worker_url=source,
+            fingerprint=fingerprint,
+            previous_committed_tokens=[1] * 10,
+            seen_engines={source},
+        )
+        original_solve = rebalancer._solve_frozen_batch
+
+        def change_session_during_solve(frozen):
+            solved = original_solve(frozen)
+            session = rebalancer.sessions["signature-drift"]
+            if changed_field == "owner":
+                session.owner_worker_url = target
+            elif changed_field == "pending_owner":
+                session.pending_owner_worker_url = target
+            elif changed_field == "fingerprint":
+                session.fingerprint = None
+            else:
+                session.previous_committed_tokens.append(9)
+            return solved
+
+        monkeypatch.setattr(
+            rebalancer,
+            "_solve_frozen_batch",
+            change_session_during_solve,
+        )
+        client.control_batch_loads()
+        drifted = asyncio.create_task(
+            rebalancer.acquire(
+                session_id="signature-drift",
+                input_ids=[1] * 10,
+            )
+        )
+        safe = asyncio.create_task(
+            rebalancer.acquire(
+                session_id="signature-safe",
+                input_ids=[2] * 10,
+            )
+        )
+        await wait_for_condition(
+            lambda: sum(client.batch_load_calls.values()) == len(client.urls)
+        )
+        client.fail_url(source, 0)
+        client.resolve_url(target, 0)
+        drifted_result, safe_result = await asyncio.gather(
+            drifted,
+            safe,
+            return_exceptions=True,
+        )
+        trace = (await rebalancer.snapshot())["recent_load_batches"][-1]
+
+        assert isinstance(drifted_result, RuntimeError)
+        assert isinstance(safe_result, RoutingLease)
+        assert safe_result.worker_url == target
+        assert trace["batch"]["solved_count"] == 2
+        assert trace["batch"]["committed_count"] == 1
+        assert trace["batch"]["failed_count"] == 1
+        assert set(rebalancer._reservations) == {safe_result.reservation_id}
+        await rebalancer.fail(safe_result)
+
+    run(scenario())
+
+
+def test_batch_commit_revalidation_rejects_lost_mooncake_migration_only(
+    monkeypatch,
+):
+    client = ControlledBatchLoadClient()
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(
+            enabled=True,
+            min_load_improvement_ratio=0.0,
+        ),
+        model_id="model",
+        model_config=simple_model_config(),
+    )
+
+    async def scenario():
+        await rebalancer.refresh()
+        source, target = client.urls
+        fingerprint = rebalancer.deployments[source].cache_fingerprint
+        rebalancer.sessions["readiness-lost"] = SessionRoutingState(
+            owner_worker_url=source,
+            fingerprint=fingerprint,
+            previous_committed_tokens=[1] * 10,
+            seen_engines={source},
+        )
+        mooncake_ready = True
+
+        def current_readiness(*args):
+            return ContextPathReadiness(
+                source,
+                target,
+                CacheSource.MOONCAKE if mooncake_ready else CacheSource.NONE,
+                True,
+                True,
+            )
+
+        monkeypatch.setattr(
+            rebalancer,
+            "_candidate_path_readiness",
+            current_readiness,
+        )
+        original_solve = rebalancer._solve_frozen_batch
+
+        def lose_readiness_during_solve(frozen):
+            nonlocal mooncake_ready
+            solved = original_solve(frozen)
+            mooncake_ready = False
+            return solved
+
+        monkeypatch.setattr(
+            rebalancer,
+            "_solve_frozen_batch",
+            lose_readiness_during_solve,
+        )
+        client.control_batch_loads()
+        migration = asyncio.create_task(
+            rebalancer.acquire(
+                session_id="readiness-lost",
+                input_ids=[1] * 10,
+            )
+        )
+        safe = asyncio.create_task(
+            rebalancer.acquire(
+                session_id="readiness-safe",
+                input_ids=[2] * 10,
+            )
+        )
+        await wait_for_condition(
+            lambda: sum(client.batch_load_calls.values()) == len(client.urls)
+        )
+        client.resolve_url(source, 0, running=80)
+        client.resolve_url(target, 0, running=0)
+        migration_result, safe_result = await asyncio.gather(
+            migration,
+            safe,
+            return_exceptions=True,
+        )
+        trace = (await rebalancer.snapshot())["recent_load_batches"][-1]
+
+        assert isinstance(migration_result, RuntimeError)
+        assert isinstance(safe_result, RoutingLease)
+        assert safe_result.worker_url == target
+        assert trace["batch"]["solved_count"] == 2
+        assert trace["batch"]["committed_count"] == 1
+        assert trace["batch"]["failed_count"] == 1
+        assert set(rebalancer._reservations) == {safe_result.reservation_id}
+        await rebalancer.fail(safe_result)
+
+    run(scenario())
+
+
 def test_batch_collect_time_stops_at_atomic_seal(monkeypatch):
     client = ControlledBatchLoadClient()
     rebalancer = EngineRebalancer(
