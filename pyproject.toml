@@ -9,6 +9,7 @@ dependencies = [
     "httpx>=0.27.0,<1.0.0",
     "pydantic>=2.8.0,<3.0.0",
     "ray==2.55.1",
+    "scipy>=1.11,<2",
     "uvicorn>=0.30.0,<1.0.0",
     "transformers==5.12.1",
 ]

@@ -37,7 +37,7 @@ The proxy runs as a standalone FastAPI service (CLI: `dressage-proxy`) and is de
 - **Routing Replay (R3)** — For Mixture-of-Experts (MoE) models, the proxy captures routed expert IDs per generated token via `--use-rollout-routing-replay`. This data is stored as base64-encoded chunks and forwarded to training for faithful MoE routing replay.
 - **Configurable Parsers** — Pluggable tool call and reasoning extraction backends (`local`, `sglang_api`, `hybrid`). Both parser backends default to `sglang_api`; `local` parses model output directly, and `hybrid` tries SGLang first with local fallback. Reasoning parsers extract `<think>` blocks for models like Qwen3.
 - **Version and Context Safety** — Non-partial trajectories are rejected if the model weight version or rollout epoch changes mid-trajectory (`trajectory_version_changed`). Proxy-side context checks return stable `context_overflow` payloads and clamp generation to the exact remaining context budget. `--max-output-tokens` is an optional additional per-request hard cap.
-- **Engine Rebalancing** — Optional turn-boundary routing compares source and target queue, context-preparation, and remaining-generation time. The Proxy always sends complete `input_ids`; native SGLang HiCache decides the real cache hit and safely falls back to prefill.
+- **Engine Rebalancing** — Optional turn-boundary routing groups concurrently arriving steps into on-demand load batches and jointly minimizes the maximum Engine pressure. The Proxy always sends complete `input_ids`; native SGLang HiCache decides the real cache hit and safely falls back to prefill.
 
 ## 🧱 Core Modules
 
@@ -53,7 +53,9 @@ The proxy codebase is organized into focused, single-responsibility modules:
  | `tool_call_parser.py` | Model-specific tool call extraction from assistant responses. Supports multiple backend modes (`local` for direct parsing, `sglang_api` for SGLang-native, `hybrid` for fallback chain). Currently optimized for Qwen3.5 tool call format. |
  | `reasoning_parser.py` | Reasoning-content parsing for models that produce structured thinking blocks (e.g., Qwen3's `<think>...</think>` format). Separates reasoning tokens from action tokens for selective loss masking. |
  | `rebalancing/scheduler_state.py` | Per-cache-fingerprint `OFF → BOOTSTRAP → ACTIVE ↔ DEGRADED` lifecycle and internal defaults. |
- | `rebalancing/scheduler.py` | Engine discovery, output-aware reservations, sticky ownership, anti-flapping, and context-benefit routing decisions. |
+ | `rebalancing/scheduler.py` | Engine discovery, on-demand batch coordination, live reservations, sticky ownership, assignment validation, and atomic commit. |
+ | `rebalancing/_batch_milp.py` | CPU HiGHS assignment solver for sticky and migration-enabled batch plans. |
+ | `rebalancing/load_batch_trace.py` | Bounded, in-memory observation history for completed load batches. |
  | `rebalancing/model_cache_profile.py` / `cache_hit_estimator.py` | Deployment-derived cache-size estimates and online `cached_tokens`-based hit prediction. These are performance models, not cache-correctness logic. |
  | `rebalancing/transfer_calibrator.py` / `ray_calibration.py` | Machine-level Ray preflight plans, CUDA/Mooncake measurement, and an independent calibration lifecycle. |
  | `rebalancing/context_recovery_model.py` | Online queue, prefill, TPOT, context-preparation, and prediction-error models. |
@@ -281,32 +283,49 @@ dressage-proxy \
 
 Each compatible Engine pool starts in `BOOTSTRAP`, enters `ACTIVE` after load,
 queue, prefill, and at least one conservative candidate path are ready, and moves to
-`DEGRADED` if those prerequisites are later lost. New sessions use projected
-least-load placement in every enabled state. Existing sessions migrate only in
-`ACTIVE`; `BOOTSTRAP` and `DEGRADED` retain a healthy owner, with full-input
-failover if that owner fails. SGLang versions older than `v0.5.15.post1` are
-listed under `excluded_engines` and cannot join a rebalancing pool.
+`DEGRADED` if those prerequisites are later lost. SGLang versions older than
+`v0.5.15.post1` are listed under `excluded_engines` and cannot join a
+rebalancing pool.
 
-For every new turn the scheduler estimates:
+The first waiting step creates a load batch and concurrently fetches one fresh
+`/v1/loads` snapshot from every healthy Engine. Steps arriving before that fetch
+finishes join the same batch; later steps form the next batch. Batches are
+strictly serialized from fetch through commit, so a later snapshot is taken
+only after the preceding batch reservations have been published. The periodic
+load refresh controlled by `load_poll_interval_ms` remains available for pool
+readiness and diagnostics, but assignment uses only the batch's on-demand
+snapshot.
 
-```text
-T_stay = Q_source + Context_source + Remaining_source
-T_move = Q_target + Context_target + Remaining_target + Risk
-```
+For each batch the scheduler freezes the successful snapshots and live lease
+reservations, using `max(snapshot, live reservation)` independently for request,
+token, and prefill baselines. It then solves two CPU MILPs with a shared one-second
+deadline:
 
-It changes the owner only when `T_move < T_stay`, after the two-turn hold and
-reverse-migration hysteresis checks. With no shared L3, an unseen target's
-context cost is a full prefill. With shared Mooncake L3, the target cost is the
-expected native restore plus prefill cost, weighted by online `cached_tokens`
-history. Missing or failed transport calibration does not block the pool: that
-directed path is estimated as a full prefill until a usable baseline exists.
-The Proxy never supplies a cache prefix length or manipulates FULL/SWA/MAMBA
-pools; it sends complete `input_ids` and lets SGLang restore or prefill.
+1. A sticky baseline fixes healthy existing sessions to their owners while
+   jointly placing new sessions and mandatory failovers.
+2. An optimized model additionally opens compatible voluntary migration edges.
 
-The decode term represents one model call, not the complete multi-turn
-trajectory. The scheduler combines request, Proxy, rollout and context limits;
-successful step-length P75 and group remaining length can tighten that bound.
-Reservations include both the input and expected output tokens.
+Both models first minimize the maximum normalized Engine pressure, then the
+number of voluntary migrations, and finally use a stable hash to break ties.
+The optimized plan is adopted only when its maximum-pressure improvement reaches
+`--engine-rebalancing-min-load-improvement-ratio`; otherwise the sticky plan is
+committed. Solver failure or a stale frozen state falls back to a deterministic
+sticky greedy assignment. Fingerprint, weight-version, Mooncake readiness, and
+step capability checks still define migration eligibility. Mandatory failover
+does not depend on Mooncake readiness or the voluntary-migration gate.
+
+Every committed lease owns a uniquely identified live reservation. Completion,
+failure, and cancellation release it idempotently; a later complete load
+generation retires only its prefill component. The Proxy never supplies a cache
+prefix length or manipulates FULL/SWA/MAMBA pools; it sends complete `input_ids`
+and lets SGLang restore or prefill.
+
+`GET /v1/engines/load` retains its existing fields and adds
+`recent_load_batches`. Each terminal batch contributes exactly one bounded,
+in-memory trace containing batch membership, normalized Engine inputs, solver
+outcomes, the adopted plan, and per-step reservation deltas. The trace excludes
+token IDs, prompt text, raw `/v1/loads` responses, server-info payloads, and
+exception tracebacks; it is observation-only and never feeds routing decisions.
 
 An advanced deployment JSON can be supplied through
 `DRESSAGE_ENGINE_REBALANCING_DEPLOYMENT_CONFIG`; it is not a CLI switch. The
