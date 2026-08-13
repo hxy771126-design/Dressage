@@ -185,7 +185,7 @@ def test_config_derives_metrics_staleness():
 def test_config_defaults_propagate_to_online_models():
     config = EngineRebalancingConfig(enabled=True)
     assert config.snapshot()["load_poll_interval_ms"] == 125
-    assert config.snapshot()["history_size"] == 128
+    assert config.snapshot()["history_size"] == 256
     assert config.snapshot()["min_samples"] == 16
     assert config.snapshot()["min_hold_turns"] == 2
     assert config.snapshot()["min_risk_ms"] == 10
@@ -3559,7 +3559,7 @@ def test_enabled_proxy_places_first_request_directly_and_reports_state():
         assert loads["enabled"] is True
         assert loads["effective_config"]["metrics_stale_ms"] == 2_000
         assert loads["effective_config"]["load_poll_interval_ms"] == 125
-        assert loads["effective_config"]["history_size"] == 128
+        assert loads["effective_config"]["history_size"] == 256
         assert loads["effective_config"]["min_samples"] == 16
         assert loads["effective_config"]["min_hold_turns"] == 2
         assert loads["effective_config"]["min_risk_ms"] == 10

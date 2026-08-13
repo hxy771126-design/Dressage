@@ -25,7 +25,7 @@ class EngineRebalancingConfig:
     enabled: bool = False
     load_poll_interval_ms: int = 125
     metrics_stale_ms: int = 2_000
-    history_size: int = 128
+    history_size: int = 256
     min_samples: int = 16
     min_hold_turns: int = 2
     min_risk_ms: int = 10
