@@ -11,11 +11,22 @@ import re
 import socket
 import time
 from collections import defaultdict, deque
+from copy import deepcopy
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Deque, Mapping
 from urllib.parse import urlsplit
 
+from ._batch_milp import (
+    BatchProblem,
+    BatchSolution,
+    EngineBaseline,
+    FeasibleEdge,
+    SolverStatus,
+    BatchSolverError,
+    solve_batch_greedy,
+    solve_batch_milp,
+)
 from .cache_hit_estimator import (
     CacheHitEstimator,
     CacheSource,
@@ -23,6 +34,7 @@ from .cache_hit_estimator import (
     context_bucket,
     longest_common_prefix_length,
 )
+from .load_batch_trace import LoadBatchHistory, LoadBatchTrace
 from .context_recovery_model import ContextRecoveryModel, PerformanceHistory, percentile
 from .model_cache_profile import ModelCacheProfile, canonical_fingerprint
 from .ray_calibration import (
@@ -395,6 +407,101 @@ class _ReservationEntry:
     prefill_active: bool
 
 
+@dataclass
+class _PendingBatchStep:
+    arrival_id: int
+    session_id: str
+    input_ids: tuple[int, ...]
+    step_max_new_tokens: int | None
+    context_remaining_tokens: int | None
+    expected_version: str | None
+    require_registered_context: bool
+    future: asyncio.Future[RoutingLease]
+    cancelled: bool = False
+    lease: RoutingLease | None = None
+
+
+@dataclass
+class _OpenBatch:
+    id: int
+    started_monotonic: float
+    started_wall: float
+    steps: list[_PendingBatchStep] = field(default_factory=list)
+    sealed: bool = False
+
+
+@dataclass(frozen=True)
+class _BatchFetchResult:
+    url: str
+    status: str
+    duration_seconds: float
+    row_count: int
+    load: EngineLoad | None
+
+
+@dataclass(frozen=True)
+class _FrozenBatchStep:
+    pending: _PendingBatchStep
+    session: SessionRoutingState
+    session_signature: tuple[Any, ...]
+    source: str | None
+    fingerprint: str | None
+    edges: tuple[FeasibleEdge, ...]
+    budgets: tuple[tuple[str, StepGenerationBudget], ...]
+    base_tokens: tuple[tuple[str, int], ...]
+    fixed_target: str | None = None
+    failure: str | None = None
+
+
+@dataclass(frozen=True)
+class _FrozenBatchEngineTrace:
+    url: str
+    fetch_status: str
+    fetch_duration_seconds: float
+    health: bool
+    version: str | None
+    fingerprint: str | None
+    row_count: int
+    running: int | None
+    active_tokens: int | None
+    request_capacity: int | None
+    token_capacity: int | None
+    token_usage: float | None
+    queued: int | None
+    queue_pressure: float | None
+    waiting_uncached_tokens: int | None
+    live_ledger_requests: int
+    live_ledger_tokens: int
+    live_ledger_prefill: int
+    base_requests: int | None
+    base_tokens: int | None
+    base_prefill: int | None
+
+
+@dataclass(frozen=True)
+class _FrozenBatch:
+    reservation_revision: int
+    topology_signature: tuple[tuple[str, bool, str, str], ...]
+    engines: tuple[EngineBaseline, ...]
+    decision_engines: tuple[EngineBaseline, ...]
+    engine_traces: tuple[_FrozenBatchEngineTrace, ...]
+    steps: tuple[_FrozenBatchStep, ...]
+    sticky_problem: BatchProblem | None
+    optimized_problem: BatchProblem | None
+
+
+@dataclass(frozen=True)
+class _SolvedBatch:
+    assignment: tuple[tuple[str, str], ...]
+    sticky_greedy: BatchSolution | None
+    sticky: BatchSolution | None
+    optimized: BatchSolution | None
+    adopted: str
+    improvement_ratio: float | None
+    fallback_reason: str | None
+    elapsed_seconds: float
+
+
 class GroupLengthEstimator:
     def __init__(self, *, history_size: int, min_task_samples: int = 32) -> None:
         self.history_size = history_size
@@ -569,6 +676,14 @@ class EngineRebalancer:
         self._snapshot_tasks: set[asyncio.Task[None]] = set()
         self._final_snapshot_written = False
         self._lock = asyncio.Lock()
+        self._batch_lock = asyncio.Lock()
+        self._batch_run_lock = asyncio.Lock()
+        self._open_batch: _OpenBatch | None = None
+        self._pending_acquires: dict[str, _PendingBatchStep] = {}
+        self._next_batch_id = 1
+        self._next_arrival_id = 1
+        self._batch_runner_tasks: set[asyncio.Task[None]] = set()
+        self._load_batch_history = LoadBatchHistory(config.history_size)
         self._refresh_lock = asyncio.Lock()
         self._poll_task: asyncio.Task | None = None
         self._calibration_task: asyncio.Task | None = None
@@ -616,6 +731,16 @@ class EngineRebalancer:
 
     async def close(self) -> None:
         self._stopping = True
+        async with self._batch_lock:
+            runners = tuple(self._batch_runner_tasks)
+            for task in runners:
+                task.cancel()
+            pending = tuple(self._pending_acquires.values())
+        if runners:
+            await asyncio.gather(*runners, return_exceptions=True)
+        for step in pending:
+            if not step.future.done():
+                step.future.set_exception(RuntimeError("engine rebalancer is closed"))
         if self._calibration_task is not None:
             self._calibration_task.cancel()
             try:
@@ -1127,51 +1252,76 @@ class EngineRebalancer:
                     )
 
     def _update_load(self, url: str, payload: Mapping[str, Any], *, now: float) -> None:
-        rows = payload.get("loads") if isinstance(payload, Mapping) else None
-        if not isinstance(rows, list):
-            rows = []
-        valid = [row for row in rows if isinstance(row, Mapping)]
+        normalized = self._normalize_load(url, payload, now=now)
         load = self.loads.setdefault(url, EngineLoad(worker_url=url))
-        if not valid:
+        if normalized is None:
             load.healthy = True
             return
-        load.healthy = True
-        load.metrics_timestamp = now
-        load.running = sum(int(row.get("num_running_reqs") or 0) for row in valid)
-        load.queued = sum(
-            int(row.get("num_waiting_reqs") or row.get("num_queue_reqs") or 0)
-            for row in valid
+        reserved = (
+            load.reserved_requests,
+            load.reserved_tokens,
+            load.reserved_prefill_tokens,
         )
-        load.active_tokens = sum(
-            int(row.get("num_total_tokens") or row.get("num_used_tokens") or 0)
-            for row in valid
-        )
-        load.token_capacity = sum(
-            int(row.get("max_total_num_tokens") or 0) for row in valid
-        )
-        load.request_capacity = sum(
-            int(row.get("max_running_requests") or 0) for row in valid
-        )
-        load.token_usage = max(float(row.get("token_usage") or 0.0) for row in valid)
-        load.waiting_uncached_tokens = sum(
-            int(row.get("num_waiting_uncached_tokens") or 0) for row in valid
-        )
-        load.gen_throughput = sum(
-            float(row.get("gen_throughput") or 0.0) for row in valid
-        )
+        load.__dict__.update(normalized.__dict__)
+        (
+            load.reserved_requests,
+            load.reserved_tokens,
+            load.reserved_prefill_tokens,
+        ) = reserved
+        if load.live_queue_metrics_available:
+            self._advance_prefill_reservation_generation(url)
+
+    @staticmethod
+    def _normalize_load(
+        url: str,
+        payload: Mapping[str, Any],
+        *,
+        now: float,
+    ) -> EngineLoad | None:
+        rows = payload.get("loads") if isinstance(payload, Mapping) else None
+        if not isinstance(rows, list) or not rows:
+            return None
+        valid = [row for row in rows if isinstance(row, Mapping)]
+        if len(valid) != len(rows):
+            return None
         queues = [
             row.get("queues") if isinstance(row.get("queues"), Mapping) else {}
             for row in valid
         ]
-        load.queue_waiting = sum(int(queue.get("waiting") or 0) for queue in queues)
-        load.queue_paused = sum(int(queue.get("paused") or 0) for queue in queues)
-        load.queue_retracted = sum(int(queue.get("retracted") or 0) for queue in queues)
-        load.queue_grammar = sum(int(queue.get("grammar") or 0) for queue in queues)
-        load.live_queue_metrics_available = all(
-            row.get("num_waiting_uncached_tokens") is not None for row in valid
+        return EngineLoad(
+            worker_url=url,
+            healthy=True,
+            metrics_timestamp=now,
+            running=sum(int(row.get("num_running_reqs") or 0) for row in valid),
+            queued=sum(
+                int(row.get("num_waiting_reqs") or row.get("num_queue_reqs") or 0)
+                for row in valid
+            ),
+            active_tokens=sum(
+                int(row.get("num_total_tokens") or row.get("num_used_tokens") or 0)
+                for row in valid
+            ),
+            token_capacity=sum(
+                int(row.get("max_total_num_tokens") or 0) for row in valid
+            ),
+            request_capacity=sum(
+                int(row.get("max_running_requests") or 0) for row in valid
+            ),
+            token_usage=max(float(row.get("token_usage") or 0.0) for row in valid),
+            waiting_uncached_tokens=sum(
+                int(row.get("num_waiting_uncached_tokens") or 0) for row in valid
+            ),
+            gen_throughput=sum(
+                float(row.get("gen_throughput") or 0.0) for row in valid
+            ),
+            queue_waiting=sum(int(queue.get("waiting") or 0) for queue in queues),
+            queue_paused=sum(int(queue.get("paused") or 0) for queue in queues),
+            queue_retracted=sum(int(queue.get("retracted") or 0) for queue in queues),
+            queue_grammar=sum(int(queue.get("grammar") or 0) for queue in queues),
+            live_queue_metrics_available=all(
+                row.get("num_waiting_uncached_tokens") is not None for row in valid
+            ),
         )
-        if load.live_queue_metrics_available:
-            self._advance_prefill_reservation_generation(url)
 
     def _advance_prefill_reservation_generation(self, url: str) -> None:
         """Retire reservations after one complete observable load generation."""
@@ -1555,6 +1705,15 @@ class EngineRebalancer:
             except Exception:
                 logger.warning("initial engine discovery failed", exc_info=True)
 
+        return await self._enqueue_batch_acquire(
+            session_id=session_id,
+            input_ids=input_ids,
+            step_max_new_tokens=step_max_new_tokens,
+            context_remaining_tokens=context_remaining_tokens,
+            expected_version=expected_version,
+            require_registered_context=require_registered_context,
+        )
+
         async with self._lock:
             now = time.monotonic()
             session = self.sessions.get(session_id)
@@ -1689,6 +1848,1104 @@ class EngineRebalancer:
                 base_tokens=base_tokens,
                 budget=budget,
             )
+
+    async def _enqueue_batch_acquire(
+        self,
+        *,
+        session_id: str,
+        input_ids: list[int],
+        step_max_new_tokens: int | None,
+        context_remaining_tokens: int | None,
+        expected_version: str | None,
+        require_registered_context: bool,
+    ) -> RoutingLease:
+        loop = asyncio.get_running_loop()
+        async with self._batch_lock:
+            if session_id in self._pending_acquires:
+                raise RuntimeError(f"session already has a pending acquire: {session_id}")
+            step = _PendingBatchStep(
+                arrival_id=self._next_arrival_id,
+                session_id=session_id,
+                input_ids=tuple(input_ids),
+                step_max_new_tokens=step_max_new_tokens,
+                context_remaining_tokens=context_remaining_tokens,
+                expected_version=(
+                    None if expected_version is None else str(expected_version)
+                ),
+                require_registered_context=require_registered_context,
+                future=loop.create_future(),
+            )
+            self._next_arrival_id += 1
+            batch = self._open_batch
+            if batch is None:
+                batch = _OpenBatch(
+                    id=self._next_batch_id,
+                    started_monotonic=time.monotonic(),
+                    started_wall=time.time(),
+                )
+                self._next_batch_id += 1
+                self._open_batch = batch
+                runner = asyncio.create_task(
+                    self._run_batch(batch),
+                    name=f"engine-rebalancing-batch-{batch.id}",
+                )
+                self._batch_runner_tasks.add(runner)
+                runner.add_done_callback(self._batch_runner_tasks.discard)
+            batch.steps.append(step)
+            self._pending_acquires[session_id] = step
+        try:
+            return await asyncio.shield(step.future)
+        except asyncio.CancelledError:
+            async with self._batch_lock:
+                step.cancelled = True
+                lease = step.lease
+            if lease is not None:
+                await asyncio.shield(self.fail(lease))
+            raise
+        finally:
+            async with self._batch_lock:
+                if self._pending_acquires.get(session_id) is step:
+                    self._pending_acquires.pop(session_id, None)
+
+    async def _fetch_batch_load(self, url: str) -> _BatchFetchResult:
+        started = time.monotonic()
+        try:
+            payload = await asyncio.wait_for(
+                self.client.get_worker_loads(url),
+                timeout=1.0,
+            )
+        except asyncio.TimeoutError:
+            return _BatchFetchResult(
+                url, "timeout", time.monotonic() - started, 0, None
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return _BatchFetchResult(
+                url, "error", time.monotonic() - started, 0, None
+            )
+        rows = payload.get("loads") if isinstance(payload, Mapping) else None
+        load = self._normalize_load(url, payload, now=time.monotonic())
+        if (
+            load is None
+            or load.request_capacity <= 0
+            or load.token_capacity <= 0
+        ):
+            return _BatchFetchResult(
+                url,
+                "invalid",
+                time.monotonic() - started,
+                len(rows) if isinstance(rows, list) else 0,
+                None,
+            )
+        return _BatchFetchResult(
+            url,
+            "ok",
+            time.monotonic() - started,
+            len(rows),
+            load,
+        )
+
+    @staticmethod
+    def _batch_session_signature(
+        session: SessionRoutingState | None,
+    ) -> tuple[Any, ...] | None:
+        if session is None:
+            return None
+        return (
+            session.owner_worker_url,
+            session.pending_owner_worker_url,
+            session.fingerprint,
+            tuple(session.previous_committed_tokens),
+            tuple(sorted(session.seen_engines)),
+            session.owner_turns,
+            session.previous_owner_worker_url,
+            session.group_id,
+            session.group_size,
+            session.task_key,
+            session.generated_tokens,
+            session.default_step_max_tokens,
+        )
+
+    def _batch_topology_signature(self) -> tuple[tuple[str, bool, str, str], ...]:
+        return tuple(
+            sorted(
+                (
+                    url,
+                    self.loads.get(url) is not None and self.loads[url].healthy,
+                    deployment.weight_version,
+                    deployment.cache_fingerprint,
+                )
+                for url, deployment in self.deployments.items()
+            )
+        )
+
+    async def _freeze_batch(
+        self,
+        batch: _OpenBatch,
+        fetch_results: tuple[_BatchFetchResult, ...],
+    ) -> _FrozenBatch:
+        async with self._lock:
+            successful = {
+                result.url: result.load
+                for result in fetch_results
+                if result.status == "ok" and result.load is not None
+            }
+            for url, snapshot in successful.items():
+                current = self.loads.get(url)
+                control_healthy = current is not None and current.healthy
+                published = deepcopy(snapshot)
+                published.healthy = control_healthy
+                self.loads[url] = published
+                self._synchronize_reserved_load(url)
+                if published.live_queue_metrics_available:
+                    self._advance_prefill_reservation_generation(url)
+
+            successful_urls = tuple(
+                sorted(
+                    url
+                    for url in successful
+                    if url in self.deployments
+                    and self.loads[url].healthy
+                )
+            )
+            max_successful_queued = max(
+                (successful[url].queued for url in successful_urls),
+                default=0,
+            )
+            engines = []
+            engine_traces = []
+            baselines: dict[str, EngineBaseline] = {}
+            for url in successful_urls:
+                snapshot = successful[url]
+                live_requests, live_tokens, live_prefill = (
+                    self._live_reservation_totals(url)
+                )
+                baseline = EngineBaseline(
+                    url=url,
+                    base_requests=max(snapshot.running, live_requests),
+                    base_tokens=max(snapshot.active_tokens, live_tokens),
+                    base_prefill=max(
+                        snapshot.waiting_uncached_tokens,
+                        live_prefill,
+                    ),
+                    request_capacity=snapshot.request_capacity,
+                    token_capacity=snapshot.token_capacity,
+                    token_usage=snapshot.token_usage,
+                    queue_pressure=snapshot.queued
+                    / max(
+                        1,
+                        snapshot.request_capacity,
+                        max_successful_queued,
+                    ),
+                )
+                engines.append(baseline)
+                baselines[url] = baseline
+
+            for result in fetch_results:
+                deployment = self.deployments.get(result.url)
+                control_load = self.loads.get(result.url)
+                snapshot = result.load
+                live_requests, live_tokens, live_prefill = (
+                    self._live_reservation_totals(result.url)
+                )
+                baseline = baselines.get(result.url)
+                engine_traces.append(
+                    _FrozenBatchEngineTrace(
+                        url=result.url,
+                        fetch_status=result.status,
+                        fetch_duration_seconds=result.duration_seconds,
+                        health=control_load is not None and control_load.healthy,
+                        version=(
+                            None if deployment is None else deployment.weight_version
+                        ),
+                        fingerprint=(
+                            None
+                            if deployment is None
+                            else deployment.cache_fingerprint
+                        ),
+                        row_count=result.row_count,
+                        running=None if snapshot is None else snapshot.running,
+                        active_tokens=(
+                            None if snapshot is None else snapshot.active_tokens
+                        ),
+                        request_capacity=(
+                            None if snapshot is None else snapshot.request_capacity
+                        ),
+                        token_capacity=(
+                            None if snapshot is None else snapshot.token_capacity
+                        ),
+                        token_usage=(
+                            None if snapshot is None else snapshot.token_usage
+                        ),
+                        queued=None if snapshot is None else snapshot.queued,
+                        queue_pressure=(
+                            None if baseline is None else baseline.queue_pressure
+                        ),
+                        waiting_uncached_tokens=(
+                            None
+                            if snapshot is None
+                            else snapshot.waiting_uncached_tokens
+                        ),
+                        live_ledger_requests=live_requests,
+                        live_ledger_tokens=live_tokens,
+                        live_ledger_prefill=live_prefill,
+                        base_requests=(
+                            None if baseline is None else int(baseline.base_requests)
+                        ),
+                        base_tokens=(
+                            None if baseline is None else int(baseline.base_tokens)
+                        ),
+                        base_prefill=(
+                            None if baseline is None else int(baseline.base_prefill)
+                        ),
+                    )
+                )
+
+            frozen_steps: list[_FrozenBatchStep] = []
+            sticky_edges: dict[str, tuple[FeasibleEdge, ...]] = {}
+            optimized_edges: dict[str, tuple[FeasibleEdge, ...]] = {}
+            for pending in sorted(batch.steps, key=lambda item: item.arrival_id):
+                existing = self.sessions.get(pending.session_id)
+                signature = self._batch_session_signature(existing)
+                if pending.cancelled:
+                    frozen_steps.append(
+                        _FrozenBatchStep(
+                            pending=pending,
+                            session=deepcopy(existing or SessionRoutingState()),
+                            session_signature=signature,
+                            source=(
+                                None if existing is None else existing.owner_worker_url
+                            ),
+                            fingerprint=(
+                                None if existing is None else existing.fingerprint
+                            ),
+                            edges=(),
+                            budgets=(),
+                            base_tokens=(),
+                        )
+                    )
+                    continue
+                if existing is None and pending.require_registered_context:
+                    frozen_steps.append(
+                        _FrozenBatchStep(
+                            pending=pending,
+                            session=SessionRoutingState(),
+                            session_signature=signature,
+                            source=None,
+                            fingerprint=None,
+                            edges=(),
+                            budgets=(),
+                            base_tokens=(),
+                            failure=(
+                                "session context is not registered or was discarded: "
+                                f"{pending.session_id}"
+                            ),
+                        )
+                    )
+                    continue
+
+                session = deepcopy(existing or SessionRoutingState())
+                source = session.owner_worker_url
+                source_deployment = (
+                    None if source is None else self.deployments.get(source)
+                )
+                fingerprint = session.fingerprint or (
+                    None
+                    if source_deployment is None
+                    else source_deployment.cache_fingerprint
+                )
+                version_valid_owner = (
+                    source_deployment is not None
+                    and (
+                        pending.expected_version is None
+                        or source_deployment.weight_version
+                        == pending.expected_version
+                    )
+                )
+                healthy_owner = (
+                    source is not None
+                    and version_valid_owner
+                    and self.loads.get(source) is not None
+                    and self.loads[source].healthy
+                )
+                owner_snapshot_ok = source in successful_urls
+                if healthy_owner and not owner_snapshot_ok:
+                    budget = self._resolve_step_budget(
+                        session=session,
+                        fingerprint=fingerprint or "",
+                        step_max_new_tokens=pending.step_max_new_tokens,
+                        context_remaining_tokens=pending.context_remaining_tokens,
+                    )
+                    base = longest_common_prefix_length(
+                        session.previous_committed_tokens,
+                        pending.input_ids,
+                    )
+                    frozen_steps.append(
+                        _FrozenBatchStep(
+                            pending=pending,
+                            session=session,
+                            session_signature=signature,
+                            source=source,
+                            fingerprint=fingerprint,
+                            edges=(),
+                            budgets=((source, budget),),
+                            base_tokens=((source, base),),
+                            fixed_target=source,
+                        )
+                    )
+                    continue
+
+                candidates = [
+                    url
+                    for url in successful_urls
+                    if pending.expected_version is None
+                    or self.deployments[url].weight_version
+                    == pending.expected_version
+                ]
+                if source is not None:
+                    candidates = [
+                        url
+                        for url in candidates
+                        if fingerprint is not None
+                        and self.deployments[url].cache_fingerprint == fingerprint
+                    ]
+
+                edges: list[FeasibleEdge] = []
+                budgets: list[tuple[str, StepGenerationBudget]] = []
+                bases: list[tuple[str, int]] = []
+                lcp = (
+                    0
+                    if source is None
+                    else longest_common_prefix_length(
+                        session.previous_committed_tokens,
+                        pending.input_ids,
+                    )
+                )
+                mandatory_failover = source is not None and not healthy_owner
+                for target in candidates:
+                    voluntary = False
+                    if source is not None and not mandatory_failover and target != source:
+                        if (
+                            self._candidate_path_readiness(
+                                session,
+                                source,
+                                target,
+                            ).cache_source
+                            is not CacheSource.MOONCAKE
+                        ):
+                            continue
+                        voluntary = True
+                    budget = self._resolve_step_budget(
+                        session=session,
+                        fingerprint=self.deployments[target].cache_fingerprint,
+                        step_max_new_tokens=pending.step_max_new_tokens,
+                        context_remaining_tokens=pending.context_remaining_tokens,
+                    )
+                    prompt_tokens = len(pending.input_ids)
+                    edges.append(
+                        FeasibleEdge(
+                            session_id=pending.session_id,
+                            engine_url=target,
+                            request_increment=1,
+                            token_increment=(
+                                prompt_tokens
+                                + (budget.estimated_step_output_tokens or 0)
+                            ),
+                            prefill_increment=(
+                                prompt_tokens - lcp
+                                if healthy_owner and target == source
+                                else prompt_tokens
+                            ),
+                            voluntary_migration=voluntary,
+                        )
+                    )
+                    budgets.append((target, budget))
+                    bases.append((target, lcp))
+
+                if not edges:
+                    frozen_steps.append(
+                        _FrozenBatchStep(
+                            pending=pending,
+                            session=session,
+                            session_signature=signature,
+                            source=source,
+                            fingerprint=fingerprint,
+                            edges=(),
+                            budgets=(),
+                            base_tokens=(),
+                            failure=(
+                                "engine rebalancing batch found no eligible worker "
+                                "with a successful load snapshot"
+                            ),
+                        )
+                    )
+                    continue
+                frozen_edges = tuple(edges)
+                frozen_steps.append(
+                    _FrozenBatchStep(
+                        pending=pending,
+                        session=session,
+                        session_signature=signature,
+                        source=source,
+                        fingerprint=fingerprint,
+                        edges=frozen_edges,
+                        budgets=tuple(budgets),
+                        base_tokens=tuple(bases),
+                    )
+                )
+                optimized_edges[pending.session_id] = frozen_edges
+                sticky_edges[pending.session_id] = tuple(
+                    edge for edge in frozen_edges if not edge.voluntary_migration
+                )
+
+            sticky_problem = (
+                BatchProblem(engines, sticky_edges)
+                if engines and sticky_edges
+                else None
+            )
+            optimized_problem = (
+                BatchProblem(engines, optimized_edges)
+                if engines and optimized_edges
+                else None
+            )
+            decision_engines = list(engines)
+            for url in sorted(
+                {
+                    step.fixed_target
+                    for step in frozen_steps
+                    if step.fixed_target is not None
+                }
+                - baselines.keys()
+            ):
+                cached = self.loads[url]
+                live_requests, live_tokens, live_prefill = (
+                    self._live_reservation_totals(url)
+                )
+                decision_engines.append(
+                    EngineBaseline(
+                        url=url,
+                        base_requests=max(cached.running, live_requests),
+                        base_tokens=max(cached.active_tokens, live_tokens),
+                        base_prefill=max(
+                            cached.waiting_uncached_tokens,
+                            live_prefill,
+                        ),
+                        request_capacity=cached.request_capacity,
+                        token_capacity=cached.token_capacity,
+                        token_usage=cached.token_usage,
+                        queue_pressure=cached.queued
+                        / max(
+                            1,
+                            cached.request_capacity,
+                            max_successful_queued,
+                        ),
+                    )
+                )
+            return _FrozenBatch(
+                reservation_revision=self._reservation_revision,
+                topology_signature=self._batch_topology_signature(),
+                engines=tuple(engines),
+                decision_engines=tuple(decision_engines),
+                engine_traces=tuple(engine_traces),
+                steps=tuple(frozen_steps),
+                sticky_problem=sticky_problem,
+                optimized_problem=optimized_problem,
+            )
+
+    def _solve_frozen_batch(self, frozen: _FrozenBatch) -> _SolvedBatch:
+        started = time.monotonic()
+        if frozen.sticky_problem is None:
+            return _SolvedBatch(
+                assignment=(),
+                sticky_greedy=None,
+                sticky=None,
+                optimized=None,
+                adopted="fixed",
+                improvement_ratio=None,
+                fallback_reason=None,
+                elapsed_seconds=time.monotonic() - started,
+            )
+        sticky_greedy = solve_batch_greedy(frozen.sticky_problem)
+        try:
+            sticky = solve_batch_milp(
+                frozen.sticky_problem,
+                deadline_seconds=max(1e-9, 1.0 - (time.monotonic() - started)),
+            )
+            if sticky.status is not SolverStatus.OPTIMAL:
+                raise RuntimeError("sticky batch solution was not optimal")
+        except Exception:
+            return _SolvedBatch(
+                assignment=tuple(sticky_greedy.assignment.items()),
+                sticky_greedy=sticky_greedy,
+                sticky=sticky_greedy,
+                optimized=None,
+                adopted="sticky_greedy",
+                improvement_ratio=None,
+                fallback_reason="sticky_solver_failure",
+                elapsed_seconds=time.monotonic() - started,
+            )
+
+        has_voluntary_edge = any(
+            edge.voluntary_migration
+            for edges in frozen.optimized_problem.edges_by_session.values()
+            for edge in edges
+        )
+        if not has_voluntary_edge:
+            return _SolvedBatch(
+                assignment=tuple(sticky.assignment.items()),
+                sticky_greedy=sticky_greedy,
+                sticky=sticky,
+                optimized=sticky,
+                adopted="sticky",
+                improvement_ratio=0.0,
+                fallback_reason=None,
+                elapsed_seconds=time.monotonic() - started,
+            )
+        try:
+            remaining = 1.0 - (time.monotonic() - started)
+            if remaining <= 0:
+                raise TimeoutError("shared batch solve deadline expired")
+            optimized = solve_batch_milp(
+                frozen.optimized_problem,
+                deadline_seconds=remaining,
+            )
+            if optimized.status is not SolverStatus.OPTIMAL:
+                raise RuntimeError("optimized batch solution was not optimal")
+        except Exception:
+            return _SolvedBatch(
+                assignment=tuple(sticky.assignment.items()),
+                sticky_greedy=sticky_greedy,
+                sticky=sticky,
+                optimized=None,
+                adopted="sticky",
+                improvement_ratio=None,
+                fallback_reason="optimized_solver_failure",
+                elapsed_seconds=time.monotonic() - started,
+            )
+        improvement = (
+            0.0
+            if sticky.maximum_load <= 1e-9
+            else (sticky.maximum_load - optimized.maximum_load)
+            / max(sticky.maximum_load, 1e-9)
+        )
+        adopt_optimized = (
+            improvement + 1e-9 >= self.config.min_load_improvement_ratio
+        )
+        selected = optimized if adopt_optimized else sticky
+        return _SolvedBatch(
+            assignment=tuple(selected.assignment.items()),
+            sticky_greedy=sticky_greedy,
+            sticky=sticky,
+            optimized=optimized,
+            adopted="optimized" if adopt_optimized else "sticky",
+            improvement_ratio=improvement,
+            fallback_reason=None,
+            elapsed_seconds=time.monotonic() - started,
+        )
+
+    async def _run_batch(self, batch: _OpenBatch) -> None:
+        wait_started = time.monotonic()
+        fetch_results: tuple[_BatchFetchResult, ...] = ()
+        frozen: _FrozenBatch | None = None
+        try:
+            async with self._batch_run_lock:
+                fetch_started = time.monotonic()
+                wait_previous = fetch_started - wait_started
+                async with self._lock:
+                    urls = tuple(
+                        sorted(
+                            url
+                            for url, deployment in self.deployments.items()
+                            if deployment.worker_url == url
+                            and self.loads.get(url) is not None
+                            and self.loads[url].healthy
+                        )
+                    )
+                fetch_results = tuple(
+                    await asyncio.gather(
+                        *(self._fetch_batch_load(url) for url in urls)
+                    )
+                )
+                fetch_finished = time.monotonic()
+                async with self._batch_lock:
+                    batch.sealed = True
+                    if self._open_batch is batch:
+                        self._open_batch = None
+                frozen = await self._freeze_batch(batch, fetch_results)
+                solved = await asyncio.to_thread(self._solve_frozen_batch, frozen)
+                await self._commit_batch(
+                    batch,
+                    fetch_results,
+                    frozen=frozen,
+                    solved=solved,
+                    wait_previous_seconds=wait_previous,
+                    fetch_seconds=fetch_finished - fetch_started,
+                )
+        except asyncio.CancelledError:
+            await self._fail_batch(
+                batch,
+                RuntimeError("engine rebalancer is closed"),
+                fetch_results=fetch_results,
+                frozen=frozen,
+            )
+            raise
+        except Exception as exc:
+            await self._fail_batch(
+                batch,
+                exc,
+                fetch_results=fetch_results,
+                frozen=frozen,
+            )
+
+    async def _commit_batch(
+        self,
+        batch: _OpenBatch,
+        fetch_results: tuple[_BatchFetchResult, ...],
+        *,
+        frozen: _FrozenBatch,
+        solved: _SolvedBatch,
+        wait_previous_seconds: float,
+        fetch_seconds: float,
+    ) -> None:
+        leases: list[tuple[_PendingBatchStep, RoutingLease]] = []
+        failures: list[tuple[_PendingBatchStep, Exception]] = []
+        committed_at = time.monotonic()
+        async with self._batch_lock:
+            async with self._lock:
+                frozen_state_changed = (
+                    self._reservation_revision != frozen.reservation_revision
+                    or self._batch_topology_signature()
+                    != frozen.topology_signature
+                    or any(
+                        self._batch_session_signature(
+                            self.sessions.get(step.pending.session_id)
+                        )
+                        != step.session_signature
+                        or self._pending_acquires.get(step.pending.session_id)
+                        is not step.pending
+                        for step in frozen.steps
+                        if not step.pending.cancelled
+                    )
+                )
+                if frozen_state_changed and solved.sticky_greedy is not None:
+                    solved = replace(
+                        solved,
+                        assignment=tuple(
+                            solved.sticky_greedy.assignment.items()
+                        ),
+                        sticky=solved.sticky_greedy,
+                        optimized=None,
+                        adopted="sticky_greedy",
+                        improvement_ratio=None,
+                        fallback_reason="frozen_state_changed",
+                    )
+                sessions_before = deepcopy(self.sessions)
+                reservations_before = deepcopy(self._reservations)
+                loads_before = deepcopy(self.loads)
+                next_reservation_before = self._next_reservation_id
+                revision_before = self._reservation_revision
+                decisions_before = deque(
+                    self._decisions,
+                    maxlen=self._decisions.maxlen,
+                )
+                try:
+                    assignment = dict(solved.assignment)
+                    increments = {
+                        engine.url: [0.0, 0.0, 0.0]
+                        for engine in frozen.decision_engines
+                    }
+                    for frozen_step in frozen.steps:
+                        if frozen_step.pending.cancelled or frozen_step.failure:
+                            continue
+                        target = frozen_step.fixed_target or assignment.get(
+                            frozen_step.pending.session_id
+                        )
+                        edge = next(
+                            (
+                                item
+                                for item in frozen_step.edges
+                                if item.engine_url == target
+                            ),
+                            None,
+                        )
+                        if edge is None and frozen_step.fixed_target == target:
+                            budget = dict(frozen_step.budgets)[target]
+                            edge = FeasibleEdge(
+                                session_id=frozen_step.pending.session_id,
+                                engine_url=target,
+                                request_increment=1,
+                                token_increment=(
+                                    len(frozen_step.pending.input_ids)
+                                    + (budget.estimated_step_output_tokens or 0)
+                                ),
+                                prefill_increment=max(
+                                    0,
+                                    len(frozen_step.pending.input_ids)
+                                    - dict(frozen_step.base_tokens)[target],
+                                ),
+                                voluntary_migration=False,
+                            )
+                        if edge is not None:
+                            totals = increments[edge.engine_url]
+                            totals[0] += edge.request_increment
+                            totals[1] += edge.token_increment
+                            totals[2] += edge.prefill_increment
+                    base_scores: dict[str, LoadScore] = {}
+                    projected_scores: dict[str, LoadScore] = {}
+                    for engine in frozen.decision_engines:
+                        request_increment, token_increment, prefill_increment = (
+                            increments[engine.url]
+                        )
+                        base_scores[engine.url] = self._batch_load_score(engine)
+                        projected_scores[engine.url] = self._batch_load_score(
+                            engine,
+                            request_increment=request_increment,
+                            token_increment=token_increment,
+                            prefill_increment=prefill_increment,
+                        )
+                    for frozen_step in frozen.steps:
+                        step = frozen_step.pending
+                        if step.cancelled:
+                            continue
+                        if frozen_step.failure is not None:
+                            failures.append(
+                                (step, RuntimeError(frozen_step.failure))
+                            )
+                            continue
+                        target = frozen_step.fixed_target or assignment.get(
+                            step.session_id
+                        )
+                        if target is None:
+                            failures.append(
+                                (step, RuntimeError("batch assignment is missing"))
+                            )
+                            continue
+                        session = self.sessions.get(step.session_id)
+                        if session is None:
+                            session = SessionRoutingState()
+                            self.sessions[step.session_id] = session
+                        source = frozen_step.source
+                        budget = dict(frozen_step.budgets)[target]
+                        base_tokens = dict(frozen_step.base_tokens)[target]
+                        moved = source is not None and target != source
+                        optimized_migration = (
+                            moved
+                            and solved.adopted == "optimized"
+                            and any(
+                                edge.engine_url == target
+                                and edge.voluntary_migration
+                                for edge in frozen_step.edges
+                            )
+                        )
+                        has_voluntary_edge = any(
+                            edge.voluntary_migration
+                            for edge in frozen_step.edges
+                        )
+                        fingerprint = self.deployments[target].cache_fingerprint
+                        decision = RoutingDecision(
+                            session_id=step.session_id,
+                            source_worker_url=source,
+                            target_worker_url=target,
+                            cache_fingerprint=fingerprint,
+                            state=self.pools[fingerprint].state,
+                            reason=(
+                                "batch_new_session"
+                                if source is None
+                                else (
+                                    "batch_fixed_owner"
+                                    if frozen_step.fixed_target is not None
+                                    else (
+                                        "batch_optimized_migration"
+                                        if optimized_migration
+                                        else (
+                                            "batch_owner_failover"
+                                            if moved
+                                            else "batch_sticky"
+                                        )
+                                    )
+                                )
+                            ),
+                            load_improvement_ratio=(
+                                solved.improvement_ratio
+                                if has_voluntary_edge
+                                else None
+                            ),
+                            required_load_improvement_ratio=(
+                                self.config.min_load_improvement_ratio
+                                if has_voluntary_edge
+                                else None
+                            ),
+                            source_base_load=base_scores.get(source),
+                            target_base_load=base_scores.get(target),
+                            source_projected_load=projected_scores.get(source),
+                            target_projected_load=projected_scores.get(target),
+                            moved=moved,
+                            **budget.snapshot(),
+                        )
+                        if target != source:
+                            session.pending_owner_worker_url = target
+                        if source is None:
+                            session.fingerprint = fingerprint
+                        lease = self._reserve(
+                            decision,
+                            input_ids=list(step.input_ids),
+                            base_tokens=base_tokens,
+                            budget=budget,
+                            batch_id=batch.id,
+                        )
+                        step.lease = lease
+                        leases.append((step, lease))
+                    trace = self._batch_trace(
+                        batch,
+                        fetch_results,
+                        frozen=frozen,
+                        leases=leases,
+                        failures=failures,
+                        wait_previous_seconds=wait_previous_seconds,
+                        fetch_seconds=fetch_seconds,
+                        completed_at=committed_at,
+                        solved=solved,
+                    )
+                    self._load_batch_history.record(LoadBatchTrace(trace))
+                except BaseException:
+                    self.sessions = sessions_before
+                    self._reservations = reservations_before
+                    self.loads = loads_before
+                    self._next_reservation_id = next_reservation_before
+                    self._reservation_revision = revision_before
+                    self._decisions = decisions_before
+                    for step, _ in leases:
+                        step.lease = None
+                    raise
+        for step, lease in leases:
+            if not step.future.done():
+                step.future.set_result(lease)
+        for step, exc in failures:
+            if not step.future.done():
+                step.future.set_exception(exc)
+
+    @staticmethod
+    def _batch_load_score(
+        engine: EngineBaseline,
+        *,
+        request_increment: float = 0.0,
+        token_increment: float = 0.0,
+        prefill_increment: float = 0.0,
+    ) -> LoadScore:
+        request_pressure = (
+            engine.base_requests + request_increment
+        ) / engine.request_capacity
+        token_pressure = max(
+            (engine.base_tokens + token_increment) / engine.token_capacity,
+            engine.token_usage,
+        )
+        prefill_pressure = (
+            engine.base_prefill + prefill_increment
+        ) / engine.token_capacity
+        return LoadScore(
+            request_pressure=request_pressure,
+            token_pressure=token_pressure,
+            queue_pressure=engine.queue_pressure,
+            prefill_pressure=prefill_pressure,
+            total=(
+                request_pressure
+                + token_pressure
+                + engine.queue_pressure
+                + prefill_pressure
+            ),
+        )
+
+    def _batch_trace(
+        self,
+        batch: _OpenBatch,
+        fetch_results: tuple[_BatchFetchResult, ...],
+        *,
+        leases: list[tuple[_PendingBatchStep, RoutingLease]],
+        failures: list[tuple[_PendingBatchStep, Exception]],
+        wait_previous_seconds: float,
+        fetch_seconds: float,
+        completed_at: float,
+        fallback_reason: str | None = None,
+        frozen: _FrozenBatch | None = None,
+        solved: _SolvedBatch | None = None,
+    ) -> dict[str, Any]:
+        lease_by_arrival = {step.arrival_id: lease for step, lease in leases}
+        failed_arrivals = {step.arrival_id for step, _ in failures}
+        return {
+            "batch": {
+                "id": batch.id,
+                "completed_at": time.time(),
+                "registered_count": len(batch.steps),
+                "solved_count": len(leases),
+                "committed_count": len(leases),
+                "failed_count": len(failures),
+                "cancelled_count": sum(step.cancelled for step in batch.steps),
+                "wait_for_previous_seconds": wait_previous_seconds,
+                "collect_seconds": max(
+                    0.0, completed_at - batch.started_monotonic - fetch_seconds
+                ),
+                "fetch_seconds": fetch_seconds,
+                "solve_seconds": 0.0 if solved is None else solved.elapsed_seconds,
+                "total_seconds": max(0.0, completed_at - batch.started_monotonic),
+            },
+            "steps": [
+                {
+                    "arrival_id": step.arrival_id,
+                    "session_id": step.session_id,
+                    "source": (
+                        None
+                        if step.arrival_id not in lease_by_arrival
+                        else lease_by_arrival[step.arrival_id].decision.source_worker_url
+                    ),
+                    "prompt_token_count": len(step.input_ids),
+                    "estimated_output": (
+                        None
+                        if step.arrival_id not in lease_by_arrival
+                        else lease_by_arrival[
+                            step.arrival_id
+                        ].expected_output_tokens
+                    ),
+                    "candidate_urls": [
+                        result.url for result in fetch_results if result.status == "ok"
+                    ],
+                    "status": (
+                        "cancelled"
+                        if step.cancelled
+                        else (
+                            "failed"
+                            if step.arrival_id in failed_arrivals
+                            else "committed"
+                        )
+                    ),
+                    "target": (
+                        None
+                        if step.arrival_id not in lease_by_arrival
+                        else lease_by_arrival[step.arrival_id].worker_url
+                    ),
+                    "moved": (
+                        False
+                        if step.arrival_id not in lease_by_arrival
+                        else lease_by_arrival[step.arrival_id].decision.moved
+                    ),
+                    "request_increment": (
+                        0 if step.arrival_id not in lease_by_arrival else 1
+                    ),
+                    "token_increment": (
+                        0
+                        if step.arrival_id not in lease_by_arrival
+                        else lease_by_arrival[step.arrival_id].reserved_tokens
+                    ),
+                    "prefill_increment": (
+                        0
+                        if step.arrival_id not in lease_by_arrival
+                        else lease_by_arrival[
+                            step.arrival_id
+                        ].reserved_prefill_tokens
+                    ),
+                }
+                for step in sorted(batch.steps, key=lambda item: item.arrival_id)
+            ],
+            "engines": [
+                asdict(engine)
+                for engine in (
+                    frozen.engine_traces
+                    if frozen is not None
+                    else tuple(
+                        _FrozenBatchEngineTrace(
+                            url=result.url,
+                            fetch_status=result.status,
+                            fetch_duration_seconds=result.duration_seconds,
+                            health=False,
+                            version=None,
+                            fingerprint=None,
+                            row_count=result.row_count,
+                            running=None,
+                            active_tokens=None,
+                            request_capacity=None,
+                            token_capacity=None,
+                            token_usage=None,
+                            queued=None,
+                            queue_pressure=None,
+                            waiting_uncached_tokens=None,
+                            live_ledger_requests=0,
+                            live_ledger_tokens=0,
+                            live_ledger_prefill=0,
+                            base_requests=None,
+                            base_tokens=None,
+                            base_prefill=None,
+                        )
+                        for result in fetch_results
+                    )
+                )
+            ],
+            "sticky": (
+                None
+                if solved is None or solved.sticky is None
+                else {
+                    "status": solved.sticky.status.value,
+                    "maximum_load": solved.sticky.maximum_load,
+                    "migrations": solved.sticky.voluntary_migrations,
+                    "elapsed_seconds": solved.sticky.elapsed_seconds,
+                }
+            ),
+            "optimized": (
+                None
+                if solved is None or solved.optimized is None
+                else {
+                    "status": solved.optimized.status.value,
+                    "maximum_load": solved.optimized.maximum_load,
+                    "migrations": solved.optimized.voluntary_migrations,
+                    "elapsed_seconds": solved.optimized.elapsed_seconds,
+                }
+            ),
+            "improvement_ratio": (
+                None if solved is None else solved.improvement_ratio
+            ),
+            "required_ratio": self.config.min_load_improvement_ratio,
+            "adopted_plan": (
+                "failure" if solved is None else solved.adopted
+            ),
+            "fallback_reason": (
+                fallback_reason
+                if solved is None
+                else solved.fallback_reason or fallback_reason
+            ),
+        }
+
+    async def _fail_batch(
+        self,
+        batch: _OpenBatch,
+        exc: Exception,
+        *,
+        fetch_results: tuple[_BatchFetchResult, ...] = (),
+        frozen: _FrozenBatch | None = None,
+    ) -> None:
+        async with self._batch_lock:
+            batch.sealed = True
+            if self._open_batch is batch:
+                self._open_batch = None
+            failures = [
+                (step, exc) for step in batch.steps if not step.cancelled
+            ]
+            self._load_batch_history.record(
+                LoadBatchTrace(
+                    self._batch_trace(
+                        batch,
+                        fetch_results,
+                        leases=[],
+                        failures=failures,
+                        wait_previous_seconds=0.0,
+                        fetch_seconds=0.0,
+                        completed_at=time.monotonic(),
+                        fallback_reason="runner_failure",
+                        frozen=frozen,
+                    )
+                )
+            )
+        for step, _ in failures:
+            if not step.future.done():
+                step.future.set_exception(exc)
 
     def _select_step_engine(
         self,
@@ -2853,5 +4110,6 @@ class EngineRebalancer:
                 "calibration": self.calibration_snapshot(),
                 "recent_decisions": list(self._decisions),
                 "recent_context_observations": list(self._observations),
+                "recent_load_batches": self._load_batch_history.snapshot(),
                 "active_sessions": len(self.sessions),
             }

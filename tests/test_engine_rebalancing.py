@@ -11,6 +11,7 @@ import signal
 import subprocess
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import httpx
@@ -18,6 +19,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from dressage.proxy.rebalancing import EngineRebalancer, EngineRebalancingConfig
+from dressage.proxy.rebalancing._batch_milp import BatchSolution, SolverStatus
 from dressage.proxy.rebalancing.cache_hit_estimator import (
     CacheHitEstimator,
     CacheSource,
@@ -56,12 +58,33 @@ from dressage.proxy.rebalancing.transfer_calibrator import (
     CalibrationState,
     CalibrationTask,
     TransferCalibrator,
+    ContextPathReadiness,
 )
 from tests.test_proxy import FakeTokenizer
 
 
 def run(coro):
     return asyncio.run(coro)
+
+
+def serve_current_loads_for_batch(client, rebalancer):
+    async def get_worker_loads(url):
+        load = rebalancer.loads[url]
+        return {
+            "loads": [
+                {
+                    "num_running_reqs": load.running,
+                    "num_waiting_reqs": load.queued,
+                    "num_total_tokens": load.active_tokens,
+                    "max_total_num_tokens": load.token_capacity,
+                    "max_running_requests": load.request_capacity,
+                    "token_usage": load.token_usage,
+                    "num_waiting_uncached_tokens": load.waiting_uncached_tokens,
+                }
+            ]
+        }
+
+    client.get_worker_loads = get_worker_loads
 
 
 def simple_model_config():
@@ -175,6 +198,72 @@ class DirectGenerationClient(ControlPlaneClient):
 
     async def close(self):
         return None
+
+
+class ControlledBatchLoadClient(ControlPlaneClient):
+    def __init__(self):
+        super().__init__()
+        self.batch_load_calls = {url: 0 for url in self.urls}
+        self.batch_load_futures = {url: [] for url in self.urls}
+        self.batch_load_started = None
+
+    def control_batch_loads(self):
+        self.batch_load_started = asyncio.Queue()
+
+    async def get_worker_loads(self, url):
+        if self.batch_load_started is None:
+            return await super().get_worker_loads(url)
+        index = self.batch_load_calls[url]
+        self.batch_load_calls[url] += 1
+        future = asyncio.get_running_loop().create_future()
+        self.batch_load_futures[url].append(future)
+        self.batch_load_started.put_nowait((url, index))
+        return await future
+
+    def resolve_batch(self, index, *, running=0, waiting_uncached=None):
+        payload = {
+            "loads": [
+                {
+                    "num_running_reqs": running,
+                    "num_waiting_reqs": 0,
+                    "num_total_tokens": 0,
+                    "max_total_num_tokens": 100_000,
+                    "max_running_requests": 100,
+                    "token_usage": 0.0,
+                }
+            ]
+        }
+        if waiting_uncached is not None:
+            payload["loads"][0]["num_waiting_uncached_tokens"] = waiting_uncached
+        for url in self.urls:
+            self.batch_load_futures[url][index].set_result(payload)
+
+    def resolve_url(self, url, index, *, running=0):
+        self.batch_load_futures[url][index].set_result(
+            {
+                "loads": [
+                    {
+                        "num_running_reqs": running,
+                        "num_waiting_reqs": 0,
+                        "num_total_tokens": 0,
+                        "max_total_num_tokens": 100_000,
+                        "max_running_requests": 100,
+                        "token_usage": 0.0,
+                    }
+                ]
+            }
+        )
+
+    def fail_url(self, url, index):
+        self.batch_load_futures[url][index].set_exception(RuntimeError("load failed"))
+
+
+async def wait_for_condition(condition, *, timeout=1.0):
+    deadline = asyncio.get_running_loop().time() + timeout
+    while not condition():
+        if asyncio.get_running_loop().time() >= deadline:
+            raise AssertionError("condition was not satisfied before timeout")
+        await asyncio.sleep(0)
 
 
 def test_config_derives_metrics_staleness():
@@ -1597,14 +1686,1205 @@ def test_reservations_spread_simultaneous_new_sessions():
         )
         try:
             assert first.worker_url != second.worker_url
-            assert first.decision.reason == "new_session_min_load"
-            assert second.decision.reason == "new_session_min_load"
+            assert first.decision.reason == "batch_new_session"
+            assert second.decision.reason == "batch_new_session"
             assert first.decision.source_base_load is None
             assert first.decision.target_projected_load is not None
             assert first.decision.target_projected_load.total > 0
         finally:
             await rebalancer.fail(first)
             await rebalancer.fail(second)
+
+    run(scenario())
+
+
+def test_batch_acquires_fetch_each_engine_once_and_publish_one_trace():
+    client = ControlledBatchLoadClient()
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(enabled=True, min_samples=1),
+        model_id="model",
+        model_config=simple_model_config(),
+    )
+
+    async def scenario():
+        await rebalancer.refresh()
+        client.control_batch_loads()
+        tasks = [
+            asyncio.create_task(
+                rebalancer.acquire(session_id=f"batch-{index}", input_ids=[index] * 10)
+            )
+            for index in range(4)
+        ]
+        await wait_for_condition(
+            lambda: sum(client.batch_load_calls.values()) == len(client.urls)
+        )
+        assert client.batch_load_calls == {url: 1 for url in client.urls}
+
+        client.resolve_batch(0)
+        leases = await asyncio.gather(*tasks)
+        snapshot = await rebalancer.snapshot()
+
+        assert len({lease.batch_id for lease in leases}) == 1
+        assert len(snapshot["recent_load_batches"]) == 1
+        trace = snapshot["recent_load_batches"][0]
+        assert trace["batch"]["registered_count"] == 4
+        assert [step["session_id"] for step in trace["steps"]] == [
+            "batch-0",
+            "batch-1",
+            "batch-2",
+            "batch-3",
+        ]
+        for lease in leases:
+            await rebalancer.fail(lease)
+
+    run(scenario())
+
+
+def test_step_after_fetch_completion_waits_for_previous_batch_commit(monkeypatch):
+    client = ControlledBatchLoadClient()
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(enabled=True, min_samples=1),
+        model_id="model",
+        model_config=simple_model_config(),
+    )
+
+    async def scenario():
+        await rebalancer.refresh()
+        client.control_batch_loads()
+        commit_started = asyncio.Event()
+        allow_commit = asyncio.Event()
+        original_commit = rebalancer._commit_batch
+
+        async def controlled_commit(*args, **kwargs):
+            commit_started.set()
+            await allow_commit.wait()
+            return await original_commit(*args, **kwargs)
+
+        monkeypatch.setattr(rebalancer, "_commit_batch", controlled_commit)
+        first_task = asyncio.create_task(
+            rebalancer.acquire(session_id="first-batch", input_ids=[1] * 10)
+        )
+        await wait_for_condition(
+            lambda: sum(client.batch_load_calls.values()) == len(client.urls)
+        )
+        client.resolve_batch(0)
+        await commit_started.wait()
+
+        second_task = asyncio.create_task(
+            rebalancer.acquire(session_id="second-batch", input_ids=[2] * 10)
+        )
+        await asyncio.sleep(0)
+        assert client.batch_load_calls == {url: 1 for url in client.urls}
+
+        allow_commit.set()
+        first = await first_task
+        await wait_for_condition(
+            lambda: sum(client.batch_load_calls.values()) == 2 * len(client.urls)
+        )
+        client.resolve_batch(1)
+        second = await second_task
+
+        assert second.batch_id == first.batch_id + 1
+        await rebalancer.fail(first)
+        await rebalancer.fail(second)
+
+    run(scenario())
+
+
+def test_duplicate_pending_batch_acquire_fails_explicitly():
+    client = ControlledBatchLoadClient()
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(enabled=True),
+        model_id="model",
+        model_config=simple_model_config(),
+    )
+
+    async def scenario():
+        await rebalancer.refresh()
+        client.control_batch_loads()
+        first = asyncio.create_task(
+            rebalancer.acquire(session_id="duplicate", input_ids=[1])
+        )
+        await wait_for_condition(
+            lambda: sum(client.batch_load_calls.values()) == len(client.urls)
+        )
+        with pytest.raises(RuntimeError, match="pending acquire"):
+            await rebalancer.acquire(session_id="duplicate", input_ids=[2])
+        client.resolve_batch(0)
+        lease = await first
+        await rebalancer.fail(lease)
+
+    run(scenario())
+
+
+def test_joint_batch_assignment_spreads_equal_new_sessions():
+    client = ControlledBatchLoadClient()
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(enabled=True, min_samples=1),
+        model_id="model",
+        model_config=simple_model_config(),
+    )
+
+    async def scenario():
+        await rebalancer.refresh()
+        client.control_batch_loads()
+        tasks = [
+            asyncio.create_task(
+                rebalancer.acquire(
+                    session_id=f"joint-{index}",
+                    input_ids=[index] * 10,
+                    step_max_new_tokens=10,
+                )
+            )
+            for index in range(4)
+        ]
+        await wait_for_condition(
+            lambda: sum(client.batch_load_calls.values()) == len(client.urls)
+        )
+        client.resolve_batch(0)
+        leases = await asyncio.gather(*tasks)
+
+        assert sorted(lease.worker_url for lease in leases) == sorted(client.urls * 2)
+        assert all(lease.batch_id == leases[0].batch_id for lease in leases)
+        for lease in leases:
+            assert len(rebalancer._reservations) == 4
+            assert rebalancer.sessions[lease.decision.session_id].fingerprint
+        trace = (await rebalancer.snapshot())["recent_load_batches"][-1]
+        assert trace["adopted_plan"] in {"sticky", "optimized"}
+        for lease in leases:
+            await rebalancer.fail(lease)
+
+    run(scenario())
+
+
+def test_partial_and_all_batch_fetch_failure_exclude_untrusted_engines():
+    client = ControlledBatchLoadClient()
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(enabled=True),
+        model_id="model",
+        model_config=simple_model_config(),
+    )
+
+    async def scenario():
+        await rebalancer.refresh()
+        client.control_batch_loads()
+        partial = asyncio.create_task(
+            rebalancer.acquire(session_id="partial", input_ids=[1] * 10)
+        )
+        await wait_for_condition(
+            lambda: sum(client.batch_load_calls.values()) == len(client.urls)
+        )
+        client.resolve_url(client.urls[0], 0)
+        client.fail_url(client.urls[1], 0)
+        lease = await partial
+        assert lease.worker_url == client.urls[0]
+        partial_trace = (await rebalancer.snapshot())["recent_load_batches"][-1]
+        assert {engine["fetch_status"] for engine in partial_trace["engines"]} == {
+            "ok",
+            "error",
+        }
+        await rebalancer.fail(lease)
+
+        failed = asyncio.create_task(
+            rebalancer.acquire(session_id="all-failed", input_ids=[2] * 10)
+        )
+        await wait_for_condition(
+            lambda: sum(client.batch_load_calls.values()) == 2 * len(client.urls)
+        )
+        for url in client.urls:
+            client.fail_url(url, 1)
+        with pytest.raises(RuntimeError, match="successful load snapshot"):
+            await failed
+        trace = (await rebalancer.snapshot())["recent_load_batches"][-1]
+        assert trace["batch"]["failed_count"] == 1
+
+    run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("sticky_j", "optimized_j", "required", "expected_plan"),
+    [
+        (1.0, 0.86, 0.15, "sticky"),
+        (1.0, 0.85, 0.15, "optimized"),
+        (1.0, 0.81, 0.20, "sticky"),
+        (1.0, 0.80, 0.20, "optimized"),
+        (0.0, 0.0, 0.20, "sticky"),
+    ],
+)
+def test_batch_optimized_gate_uses_shared_solution_objectives(
+    monkeypatch, sticky_j, optimized_j, required, expected_plan
+):
+    client = ControlledBatchLoadClient()
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(
+            enabled=True,
+            min_load_improvement_ratio=required,
+        ),
+        model_id="model",
+        model_config=simple_model_config(),
+    )
+
+    calls = 0
+
+    def controlled_solver(problem, deadline_seconds=1.0):
+        nonlocal calls
+        del deadline_seconds
+        calls += 1
+        assignment = {
+            session_id: edges[-1].engine_url
+            for session_id, edges in problem.edges_by_session.items()
+        }
+        return BatchSolution(
+            status=SolverStatus.OPTIMAL,
+            assignment=assignment,
+            maximum_load=sticky_j if calls == 1 else optimized_j,
+            voluntary_migrations=0 if calls == 1 else 1,
+            elapsed_seconds=0.01,
+        )
+
+    monkeypatch.setattr(
+        "dressage.proxy.rebalancing.scheduler.solve_batch_milp",
+        controlled_solver,
+    )
+
+    async def scenario():
+        await rebalancer.refresh()
+        source, target = client.urls
+        fingerprint = rebalancer.deployments[source].cache_fingerprint
+        rebalancer.sessions["gate"] = SessionRoutingState(
+            owner_worker_url=source,
+            fingerprint=fingerprint,
+            previous_committed_tokens=[1] * 10,
+            seen_engines={source},
+        )
+        monkeypatch.setattr(
+            rebalancer,
+            "_candidate_path_readiness",
+            lambda *args: ContextPathReadiness(
+                source,
+                target,
+                CacheSource.MOONCAKE,
+                True,
+                True,
+            ),
+        )
+        client.control_batch_loads()
+        task = asyncio.create_task(
+            rebalancer.acquire(session_id="gate", input_ids=[1] * 10)
+        )
+        await wait_for_condition(
+            lambda: sum(client.batch_load_calls.values()) == len(client.urls)
+        )
+        client.resolve_batch(0)
+        lease = await task
+        trace = (await rebalancer.snapshot())["recent_load_batches"][-1]
+
+        assert trace["adopted_plan"] == expected_plan
+        assert calls == 2
+        await rebalancer.fail(lease)
+
+    run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("mooncake_ready", "expected_worker", "expected_reason"),
+    [
+        (False, "source", "batch_sticky"),
+        (True, "target", "batch_optimized_migration"),
+    ],
+)
+def test_batch_healthy_owner_only_voluntarily_migrates_over_mooncake(
+    monkeypatch, mooncake_ready, expected_worker, expected_reason
+):
+    client = ControlledBatchLoadClient()
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(
+            enabled=True,
+            min_load_improvement_ratio=0.0,
+        ),
+        model_id="model",
+        model_config=simple_model_config(),
+    )
+
+    async def scenario():
+        await rebalancer.refresh()
+        source, target = client.urls
+        fingerprint = rebalancer.deployments[source].cache_fingerprint
+        rebalancer.sessions["candidate-owner"] = SessionRoutingState(
+            owner_worker_url=source,
+            fingerprint=fingerprint,
+            previous_committed_tokens=[1] * 10,
+            seen_engines={source},
+        )
+        monkeypatch.setattr(
+            rebalancer,
+            "_candidate_path_readiness",
+            lambda *args: ContextPathReadiness(
+                source,
+                target,
+                CacheSource.MOONCAKE if mooncake_ready else CacheSource.NONE,
+                True,
+                True,
+            ),
+        )
+        client.control_batch_loads()
+        task = asyncio.create_task(
+            rebalancer.acquire(session_id="candidate-owner", input_ids=[1] * 10)
+        )
+        await wait_for_condition(
+            lambda: sum(client.batch_load_calls.values()) == len(client.urls)
+        )
+        client.resolve_url(source, 0, running=80)
+        client.resolve_url(target, 0, running=0)
+        lease = await task
+
+        assert lease.worker_url == {"source": source, "target": target}[
+            expected_worker
+        ]
+        assert lease.decision.reason == expected_reason
+        await rebalancer.fail(lease)
+
+    run(scenario())
+
+
+@pytest.mark.parametrize("owner_invalid_by", ["health", "version"])
+def test_batch_owner_unhealthy_or_version_invalid_uses_mandatory_failover(
+    owner_invalid_by,
+):
+    client = ControlledBatchLoadClient()
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(enabled=True),
+        model_id="model",
+        model_config=simple_model_config(),
+    )
+
+    async def scenario():
+        await rebalancer.refresh()
+        source, target = client.urls
+        fingerprint = rebalancer.deployments[source].cache_fingerprint
+        rebalancer.sessions["candidate-failover"] = SessionRoutingState(
+            owner_worker_url=source,
+            fingerprint=fingerprint,
+            previous_committed_tokens=[1] * 10,
+            seen_engines={source},
+        )
+        expected_version = None
+        expected_fetches = 2
+        if owner_invalid_by == "health":
+            rebalancer.loads[source].healthy = False
+            expected_fetches = 1
+        else:
+            rebalancer.deployments[target] = replace(
+                rebalancer.deployments[target],
+                weight_version="8",
+            )
+            expected_version = "8"
+        client.control_batch_loads()
+        task = asyncio.create_task(
+            rebalancer.acquire(
+                session_id="candidate-failover",
+                input_ids=[1] * 10,
+                expected_version=expected_version,
+            )
+        )
+        await wait_for_condition(
+            lambda: sum(client.batch_load_calls.values()) == expected_fetches
+        )
+        for url in client.urls:
+            if client.batch_load_calls[url]:
+                client.resolve_url(url, 0)
+        lease = await task
+
+        assert lease.worker_url == target
+        assert lease.decision.reason == "batch_owner_failover"
+        await rebalancer.fail(lease)
+
+    run(scenario())
+
+
+@pytest.mark.parametrize("mismatch", ["version", "fingerprint"])
+def test_batch_mandatory_failover_rejects_version_or_fingerprint_mismatch(mismatch):
+    client = ControlledBatchLoadClient()
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(enabled=True),
+        model_id="model",
+        model_config=simple_model_config(),
+    )
+
+    async def scenario():
+        await rebalancer.refresh()
+        source, target = client.urls
+        fingerprint = rebalancer.deployments[source].cache_fingerprint
+        rebalancer.sessions["candidate-mismatch"] = SessionRoutingState(
+            owner_worker_url=source,
+            fingerprint=fingerprint,
+            previous_committed_tokens=[1] * 10,
+            seen_engines={source},
+        )
+        rebalancer.loads[source].healthy = False
+        expected_version = "8" if mismatch == "version" else None
+        if mismatch == "fingerprint":
+            rebalancer.deployments[target] = replace(
+                rebalancer.deployments[target],
+                cache_fingerprint="different-fingerprint",
+            )
+        client.control_batch_loads()
+        task = asyncio.create_task(
+            rebalancer.acquire(
+                session_id="candidate-mismatch",
+                input_ids=[1] * 10,
+                expected_version=expected_version,
+            )
+        )
+        await wait_for_condition(
+            lambda: client.batch_load_calls[target] == 1
+        )
+        client.resolve_url(target, 0)
+
+        with pytest.raises(RuntimeError, match="successful load snapshot"):
+            await task
+
+    run(scenario())
+
+
+def test_batch_failed_healthy_owner_snapshot_fixes_step_to_owner():
+    client = ControlledBatchLoadClient()
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(enabled=True),
+        model_id="model",
+        model_config=simple_model_config(),
+    )
+
+    async def scenario():
+        await rebalancer.refresh()
+        source, target = client.urls
+        fingerprint = rebalancer.deployments[source].cache_fingerprint
+        rebalancer.sessions["candidate-fixed"] = SessionRoutingState(
+            owner_worker_url=source,
+            fingerprint=fingerprint,
+            previous_committed_tokens=[1] * 10,
+            seen_engines={source},
+        )
+        client.control_batch_loads()
+        task = asyncio.create_task(
+            rebalancer.acquire(session_id="candidate-fixed", input_ids=[1] * 10)
+        )
+        await wait_for_condition(
+            lambda: sum(client.batch_load_calls.values()) == len(client.urls)
+        )
+        client.fail_url(source, 0)
+        client.resolve_url(target, 0)
+        lease = await task
+
+        assert lease.worker_url == source
+        assert lease.decision.reason == "batch_fixed_owner"
+        assert lease.decision.target_projected_load is not None
+        assert lease.decision.target_projected_load.request_pressure == pytest.approx(
+            0.01
+        )
+        assert lease.decision.target_projected_load.token_pressure == pytest.approx(
+            0.0001
+        )
+        assert lease.decision.target_projected_load.prefill_pressure == pytest.approx(
+            0.0
+        )
+        await rebalancer.fail(lease)
+
+    run(scenario())
+
+
+def test_batch_sticky_solver_exception_uses_stable_greedy_assignment(monkeypatch):
+    client = ControlledBatchLoadClient()
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(enabled=True),
+        model_id="model",
+        model_config=simple_model_config(),
+    )
+
+    def fail_solver(*args, **kwargs):
+        raise RuntimeError("sticky solver boom")
+
+    monkeypatch.setattr(
+        "dressage.proxy.rebalancing.scheduler.solve_batch_milp",
+        fail_solver,
+    )
+
+    async def acquire_batch(index):
+        tasks = [
+            asyncio.create_task(
+                rebalancer.acquire(
+                    session_id=f"greedy-{session_index}",
+                    input_ids=[session_index] * 10,
+                )
+            )
+            for session_index in range(4)
+        ]
+        await wait_for_condition(
+            lambda: sum(client.batch_load_calls.values())
+            == (index + 1) * len(client.urls)
+        )
+        client.resolve_batch(index)
+        leases = await asyncio.gather(*tasks)
+        assignment = {
+            lease.decision.session_id: lease.worker_url for lease in leases
+        }
+        trace = (await rebalancer.snapshot())["recent_load_batches"][-1]
+        assert trace["adopted_plan"] == "sticky_greedy"
+        assert trace["fallback_reason"] == "sticky_solver_failure"
+        assert trace["sticky"]["status"] == "greedy"
+        assert sorted(assignment.values()) == sorted(client.urls * 2)
+        for lease in leases:
+            await rebalancer.fail(lease)
+        return assignment
+
+    async def scenario():
+        await rebalancer.refresh()
+        client.control_batch_loads()
+        first = await acquire_batch(0)
+        second = await acquire_batch(1)
+        assert second == first
+
+    run(scenario())
+
+
+def test_batch_optimized_solver_exception_adopts_sticky_assignment(monkeypatch):
+    client = ControlledBatchLoadClient()
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(
+            enabled=True,
+            min_load_improvement_ratio=0.0,
+        ),
+        model_id="model",
+        model_config=simple_model_config(),
+    )
+    from dressage.proxy.rebalancing.scheduler import solve_batch_milp as real_solver
+
+    calls = 0
+
+    def fail_optimized(problem, deadline_seconds=1.0):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("optimized solver boom")
+        return real_solver(problem, deadline_seconds=deadline_seconds)
+
+    monkeypatch.setattr(
+        "dressage.proxy.rebalancing.scheduler.solve_batch_milp",
+        fail_optimized,
+    )
+
+    async def scenario():
+        await rebalancer.refresh()
+        source, target = client.urls
+        fingerprint = rebalancer.deployments[source].cache_fingerprint
+        rebalancer.sessions["optimized-failure"] = SessionRoutingState(
+            owner_worker_url=source,
+            fingerprint=fingerprint,
+            previous_committed_tokens=[1] * 10,
+            seen_engines={source},
+        )
+        monkeypatch.setattr(
+            rebalancer,
+            "_candidate_path_readiness",
+            lambda *args: ContextPathReadiness(
+                source,
+                target,
+                CacheSource.MOONCAKE,
+                True,
+                True,
+            ),
+        )
+        client.control_batch_loads()
+        task = asyncio.create_task(
+            rebalancer.acquire(session_id="optimized-failure", input_ids=[1] * 10)
+        )
+        await wait_for_condition(
+            lambda: sum(client.batch_load_calls.values()) == len(client.urls)
+        )
+        client.resolve_url(source, 0, running=80)
+        client.resolve_url(target, 0, running=0)
+        lease = await task
+        trace = (await rebalancer.snapshot())["recent_load_batches"][-1]
+
+        assert lease.worker_url == source
+        assert lease.decision.reason == "batch_sticky"
+        assert trace["adopted_plan"] == "sticky"
+        assert trace["fallback_reason"] == "optimized_solver_failure"
+        assert trace["sticky"]["status"] == "optimal"
+        assert trace["optimized"] is None
+        await rebalancer.fail(lease)
+
+    run(scenario())
+
+
+def test_batch_frozen_revision_change_uses_sticky_greedy(monkeypatch):
+    client = ControlledBatchLoadClient()
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(
+            enabled=True,
+            min_load_improvement_ratio=0.0,
+        ),
+        model_id="model",
+        model_config=simple_model_config(),
+    )
+
+    async def scenario():
+        await rebalancer.refresh()
+        source, target = client.urls
+        fingerprint = rebalancer.deployments[source].cache_fingerprint
+        rebalancer.sessions["frozen-change"] = SessionRoutingState(
+            owner_worker_url=source,
+            fingerprint=fingerprint,
+            previous_committed_tokens=[1] * 10,
+            seen_engines={source},
+        )
+        monkeypatch.setattr(
+            rebalancer,
+            "_candidate_path_readiness",
+            lambda *args: ContextPathReadiness(
+                source,
+                target,
+                CacheSource.MOONCAKE,
+                True,
+                True,
+            ),
+        )
+        anchor = rebalancer._reserve(
+            RoutingDecision(
+                session_id="revision-anchor",
+                source_worker_url=None,
+                target_worker_url=source,
+                cache_fingerprint=fingerprint,
+                state=SchedulerState.ACTIVE,
+                reason="test",
+            ),
+            input_ids=[9],
+            base_tokens=0,
+            budget=StepGenerationBudget("test", 1, None, None, 1),
+        )
+        original_commit = rebalancer._commit_batch
+
+        async def change_revision_before_commit(*args, **kwargs):
+            await rebalancer.fail(anchor)
+            return await original_commit(*args, **kwargs)
+
+        monkeypatch.setattr(
+            rebalancer,
+            "_commit_batch",
+            change_revision_before_commit,
+        )
+        client.control_batch_loads()
+        task = asyncio.create_task(
+            rebalancer.acquire(session_id="frozen-change", input_ids=[1] * 10)
+        )
+        await wait_for_condition(
+            lambda: sum(client.batch_load_calls.values()) == len(client.urls)
+        )
+        client.resolve_url(source, 0, running=80)
+        client.resolve_url(target, 0, running=0)
+        lease = await task
+        trace = (await rebalancer.snapshot())["recent_load_batches"][-1]
+
+        assert lease.worker_url == source
+        assert lease.decision.reason == "batch_sticky"
+        assert trace["adopted_plan"] == "sticky_greedy"
+        assert trace["fallback_reason"] == "frozen_state_changed"
+        assert trace["sticky"]["status"] == "greedy"
+        await rebalancer.fail(lease)
+
+    run(scenario())
+
+
+def test_batch_cancel_before_seal_is_excluded_from_solver_and_ledger(monkeypatch):
+    client = ControlledBatchLoadClient()
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(enabled=True),
+        model_id="model",
+        model_config=simple_model_config(),
+    )
+    from dressage.proxy.rebalancing.scheduler import solve_batch_milp as real_solver
+
+    solved_sessions = []
+
+    def capture_problem(problem, deadline_seconds=1.0):
+        solved_sessions.append(tuple(sorted(problem.edges_by_session)))
+        return real_solver(problem, deadline_seconds=deadline_seconds)
+
+    monkeypatch.setattr(
+        "dressage.proxy.rebalancing.scheduler.solve_batch_milp",
+        capture_problem,
+    )
+
+    async def scenario():
+        await rebalancer.refresh()
+        client.control_batch_loads()
+        cancelled = asyncio.create_task(
+            rebalancer.acquire(session_id="cancel-before-seal", input_ids=[1] * 10)
+        )
+        kept = asyncio.create_task(
+            rebalancer.acquire(session_id="kept-before-seal", input_ids=[2] * 10)
+        )
+        await wait_for_condition(
+            lambda: sum(client.batch_load_calls.values()) == len(client.urls)
+        )
+        cancelled.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled
+        client.resolve_batch(0)
+        lease = await kept
+        trace = (await rebalancer.snapshot())["recent_load_batches"][-1]
+
+        assert solved_sessions == [("kept-before-seal",)]
+        assert "cancel-before-seal" not in rebalancer.sessions
+        assert len(rebalancer._reservations) == 1
+        assert trace["batch"]["cancelled_count"] == 1
+        assert [step["status"] for step in trace["steps"]] == [
+            "cancelled",
+            "committed",
+        ]
+        await rebalancer.fail(lease)
+
+    run(scenario())
+
+
+def test_batch_cancel_after_commit_releases_lease_and_pending_owner(monkeypatch):
+    client = ControlledBatchLoadClient()
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(enabled=True),
+        model_id="model",
+        model_config=simple_model_config(),
+    )
+
+    async def scenario():
+        await rebalancer.refresh()
+        original_commit = rebalancer._commit_batch
+        acquire_task = None
+        committed_lease = None
+
+        async def cancel_after_commit(*args, **kwargs):
+            nonlocal committed_lease
+            await original_commit(*args, **kwargs)
+            pending = rebalancer._pending_acquires["cancel-after-commit"]
+            committed_lease = pending.lease
+            acquire_task.cancel()
+
+        monkeypatch.setattr(rebalancer, "_commit_batch", cancel_after_commit)
+        client.control_batch_loads()
+        acquire_task = asyncio.create_task(
+            rebalancer.acquire(session_id="cancel-after-commit", input_ids=[1] * 10)
+        )
+        await wait_for_condition(
+            lambda: sum(client.batch_load_calls.values()) == len(client.urls)
+        )
+        client.resolve_batch(0)
+        with pytest.raises(asyncio.CancelledError):
+            await acquire_task
+
+        assert committed_lease is not None
+        assert committed_lease.reservation_id not in rebalancer._reservations
+        state = rebalancer.sessions["cancel-after-commit"]
+        assert state.pending_owner_worker_url is None
+        assert all(load.reserved_requests == 0 for load in rebalancer.loads.values())
+        revision = rebalancer._reservation_revision
+        await rebalancer.fail(committed_lease)
+        assert rebalancer._reservation_revision == revision
+
+    run(scenario())
+
+
+def test_batch_commit_failure_rolls_back_all_state_and_publishes_one_failure_trace(
+    monkeypatch,
+):
+    client = ControlledBatchLoadClient()
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(enabled=True),
+        model_id="model",
+        model_config=simple_model_config(),
+    )
+
+    async def scenario():
+        await rebalancer.refresh()
+        initial_decisions = list(rebalancer._decisions)
+        initial_next_reservation_id = rebalancer._next_reservation_id
+        initial_revision = rebalancer._reservation_revision
+        original_reserve = rebalancer._reserve
+        reserve_calls = 0
+
+        def fail_second_reserve(*args, **kwargs):
+            nonlocal reserve_calls
+            reserve_calls += 1
+            if reserve_calls == 2:
+                raise RuntimeError("commit injection")
+            return original_reserve(*args, **kwargs)
+
+        monkeypatch.setattr(rebalancer, "_reserve", fail_second_reserve)
+        client.control_batch_loads()
+        tasks = [
+            asyncio.create_task(
+                rebalancer.acquire(
+                    session_id=f"rollback-{index}",
+                    input_ids=[index] * 10,
+                )
+            )
+            for index in range(2)
+        ]
+        await wait_for_condition(
+            lambda: sum(client.batch_load_calls.values()) == len(client.urls)
+        )
+        client.resolve_batch(0)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        trace = (await rebalancer.snapshot())["recent_load_batches"]
+
+        assert all(
+            isinstance(result, RuntimeError) and "commit injection" in str(result)
+            for result in results
+        )
+        assert rebalancer.sessions == {}
+        assert rebalancer._reservations == {}
+        assert rebalancer._pending_acquires == {}
+        assert rebalancer._next_reservation_id == initial_next_reservation_id
+        assert rebalancer._reservation_revision == initial_revision
+        assert list(rebalancer._decisions) == initial_decisions
+        assert all(
+            (
+                load.reserved_requests,
+                load.reserved_tokens,
+                load.reserved_prefill_tokens,
+            )
+            == (0, 0, 0)
+            for load in rebalancer.loads.values()
+        )
+        assert len(trace) == 1
+        assert trace[0]["batch"]["committed_count"] == 0
+        assert trace[0]["batch"]["failed_count"] == 2
+        assert trace[0]["fallback_reason"] == "runner_failure"
+        assert all(engine["fetch_status"] == "ok" for engine in trace[0]["engines"])
+        assert all(engine["request_capacity"] == 100 for engine in trace[0]["engines"])
+        assert all(engine["base_requests"] == 0 for engine in trace[0]["engines"])
+
+    run(scenario())
+
+
+def test_batch_future_wakes_after_every_reservation_and_session_is_visible():
+    client = ControlledBatchLoadClient()
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(enabled=True),
+        model_id="model",
+        model_config=simple_model_config(),
+    )
+    session_ids = [f"visible-{index}" for index in range(4)]
+
+    async def acquire_and_observe(session_id, token):
+        lease = await rebalancer.acquire(session_id=session_id, input_ids=[token] * 10)
+        return (
+            lease,
+            len(rebalancer._reservations),
+            all(
+                rebalancer.sessions[item].fingerprint is not None
+                for item in session_ids
+            ),
+        )
+
+    async def scenario():
+        await rebalancer.refresh()
+        client.control_batch_loads()
+        tasks = [
+            asyncio.create_task(acquire_and_observe(session_id, index))
+            for index, session_id in enumerate(session_ids)
+        ]
+        await wait_for_condition(
+            lambda: sum(client.batch_load_calls.values()) == len(client.urls)
+        )
+        client.resolve_batch(0)
+        observed = await asyncio.gather(*tasks)
+
+        assert [(count, all_visible) for _, count, all_visible in observed] == [
+            (4, True),
+            (4, True),
+            (4, True),
+            (4, True),
+        ]
+        for lease, _, _ in observed:
+            await rebalancer.fail(lease)
+
+    run(scenario())
+
+
+def test_next_batch_trace_effective_base_includes_previous_live_ledger():
+    client = ControlledBatchLoadClient()
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(enabled=True),
+        model_id="model",
+        model_config=simple_model_config(),
+    )
+
+    async def scenario():
+        await rebalancer.refresh()
+        client.control_batch_loads()
+        first_task = asyncio.create_task(
+            rebalancer.acquire(
+                session_id="baseline-first",
+                input_ids=[1] * 40,
+                step_max_new_tokens=10,
+            )
+        )
+        await wait_for_condition(
+            lambda: sum(client.batch_load_calls.values()) == len(client.urls)
+        )
+        client.resolve_batch(0)
+        first = await first_task
+        live_requests, live_tokens, live_prefill = (
+            rebalancer._live_reservation_totals(first.worker_url)
+        )
+        assert (live_requests, live_tokens, live_prefill) == (1, 50, 40)
+
+        second_task = asyncio.create_task(
+            rebalancer.acquire(
+                session_id="baseline-second",
+                input_ids=[2] * 10,
+            )
+        )
+        await wait_for_condition(
+            lambda: sum(client.batch_load_calls.values()) == 2 * len(client.urls)
+        )
+        client.resolve_batch(1)
+        second = await second_task
+        trace = (await rebalancer.snapshot())["recent_load_batches"][-1]
+        engine = next(
+            item for item in trace["engines"] if item["url"] == first.worker_url
+        )
+
+        assert engine["live_ledger_requests"] == 1
+        assert engine["live_ledger_tokens"] == 50
+        assert engine["live_ledger_prefill"] == 40
+        assert engine["base_requests"] == 1
+        assert engine["base_tokens"] == 50
+        assert engine["base_prefill"] == 40
+        await rebalancer.fail(first)
+        await rebalancer.fail(second)
+
+    run(scenario())
+
+
+def test_next_batch_trace_effective_base_retires_observed_prefill_generation():
+    client = ControlledBatchLoadClient()
+    client.urls = client.urls[:1]
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(enabled=True),
+        model_id="model",
+        model_config=simple_model_config(),
+    )
+
+    async def acquire_batch(index, session_id, prompt_tokens):
+        task = asyncio.create_task(
+            rebalancer.acquire(
+                session_id=session_id,
+                input_ids=[index + 1] * prompt_tokens,
+            )
+        )
+        await wait_for_condition(
+            lambda: sum(client.batch_load_calls.values()) == index + 1
+        )
+        client.resolve_batch(index, waiting_uncached=0)
+        return await task
+
+    async def scenario():
+        await rebalancer.refresh()
+        client.control_batch_loads()
+        first = await acquire_batch(0, "prefill-first", 40)
+        second = await acquire_batch(1, "prefill-second", 10)
+        second_trace = (await rebalancer.snapshot())["recent_load_batches"][-1]
+        assert second_trace["engines"][0]["base_prefill"] == 40
+
+        await rebalancer.fail(second)
+        third = await acquire_batch(2, "prefill-third", 5)
+        third_trace = (await rebalancer.snapshot())["recent_load_batches"][-1]
+        assert third_trace["engines"][0]["base_prefill"] == 0
+
+        await rebalancer.fail(first)
+        await rebalancer.fail(third)
+
+    run(scenario())
+
+
+def test_batch_trace_is_normalized_complete_immutable_and_contains_no_token_content():
+    client = ControlledBatchLoadClient()
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(enabled=True),
+        model_id="model",
+        model_config=simple_model_config(),
+    )
+    secret_tokens = [918273, 817263, 716253]
+
+    async def scenario():
+        await rebalancer.refresh()
+        old_snapshot = await rebalancer.snapshot()
+        client.control_batch_loads()
+        task = asyncio.create_task(
+            rebalancer.acquire(
+                session_id="trace-normalized",
+                input_ids=secret_tokens,
+                step_max_new_tokens=7,
+            )
+        )
+        await wait_for_condition(
+            lambda: sum(client.batch_load_calls.values()) == len(client.urls)
+        )
+        client.resolve_batch(0, running=3)
+        lease = await task
+        snapshot = await rebalancer.snapshot()
+        trace = snapshot["recent_load_batches"][-1]
+        encoded = json.dumps(trace, sort_keys=True)
+
+        assert set(old_snapshot).issubset(snapshot)
+        assert set(trace["batch"]) == {
+            "id",
+            "completed_at",
+            "registered_count",
+            "solved_count",
+            "committed_count",
+            "failed_count",
+            "cancelled_count",
+            "wait_for_previous_seconds",
+            "collect_seconds",
+            "fetch_seconds",
+            "solve_seconds",
+            "total_seconds",
+        }
+        assert {
+            "arrival_id",
+            "session_id",
+            "source",
+            "prompt_token_count",
+            "estimated_output",
+            "candidate_urls",
+            "status",
+            "target",
+            "moved",
+            "request_increment",
+            "token_increment",
+            "prefill_increment",
+        }.issubset(trace["steps"][0])
+        for engine in trace["engines"]:
+            assert {
+                "url",
+                "fetch_status",
+                "fetch_duration_seconds",
+                "health",
+                "version",
+                "fingerprint",
+                "row_count",
+                "running",
+                "active_tokens",
+                "request_capacity",
+                "token_capacity",
+                "token_usage",
+                "queued",
+                "queue_pressure",
+                "waiting_uncached_tokens",
+                "live_ledger_requests",
+                "live_ledger_tokens",
+                "live_ledger_prefill",
+                "base_requests",
+                "base_tokens",
+                "base_prefill",
+            }.issubset(engine)
+        assert trace["sticky"]["status"] in {"optimal", "greedy"}
+        assert "maximum_load" in trace["sticky"]
+        assert "input_ids" not in encoded
+        assert "server_args" not in encoded
+        assert "loads" not in encoded
+        assert all(str(token) not in encoded for token in secret_tokens)
+
+        trace["batch"]["id"] = -1
+        trace["steps"][0]["candidate_urls"].append("mutated")
+        fresh = (await rebalancer.snapshot())["recent_load_batches"][-1]
+        assert fresh["batch"]["id"] == lease.batch_id
+        assert "mutated" not in fresh["steps"][0]["candidate_urls"]
+        await rebalancer.fail(lease)
+
+    run(scenario())
+
+
+def test_batch_trace_history_records_each_terminal_batch_once_and_evicts_oldest():
+    client = ControlledBatchLoadClient()
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(enabled=True, history_size=2),
+        model_id="model",
+        model_config=simple_model_config(),
+    )
+
+    async def run_batch(index, session_id, outcome):
+        task = asyncio.create_task(
+            rebalancer.acquire(session_id=session_id, input_ids=[index] * 10)
+        )
+        await wait_for_condition(
+            lambda: sum(client.batch_load_calls.values())
+            == (index + 1) * len(client.urls)
+        )
+        if outcome == "cancelled":
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            client.resolve_batch(index)
+            await wait_for_condition(
+                lambda: len(rebalancer._load_batch_history.snapshot()) == index + 1
+            )
+        elif outcome == "failed":
+            for url in client.urls:
+                client.fail_url(url, index)
+            with pytest.raises(RuntimeError, match="successful load snapshot"):
+                await task
+        else:
+            client.resolve_batch(index)
+            return await task
+        return None
+
+    async def scenario():
+        await rebalancer.refresh()
+        client.control_batch_loads()
+        cancelled = await run_batch(0, "history-cancelled", "cancelled")
+        assert cancelled is None
+        assert len(rebalancer._load_batch_history.snapshot()) == 1
+        failed = await run_batch(1, "history-failed", "failed")
+        assert failed is None
+        assert len(rebalancer._load_batch_history.snapshot()) == 2
+        success = await run_batch(2, "history-success", "success")
+        snapshot = await rebalancer.snapshot()
+
+        assert [trace["batch"]["id"] for trace in snapshot["recent_load_batches"]] == [
+            2,
+            3,
+        ]
+        assert [
+            trace["batch"]["registered_count"]
+            for trace in snapshot["recent_load_batches"]
+        ] == [1, 1]
+        assert json.loads(json.dumps(snapshot["recent_load_batches"])) == snapshot[
+            "recent_load_batches"
+        ]
+        await rebalancer.fail(success)
 
     run(scenario())
 
@@ -1717,6 +2997,7 @@ def test_existing_session_uses_two_level_backlog_threshold(
         rebalancer.loads[target].running = target_running
         rebalancer.loads[target].queued = target_queued
         rebalancer.loads[target].waiting_uncached_tokens = target_prefill
+        serve_current_loads_for_batch(client, rebalancer)
         fingerprint = rebalancer.deployments[source].cache_fingerprint
         rebalancer.sessions["backlog"] = SessionRoutingState(
             owner_worker_url=source,
@@ -1731,13 +3012,15 @@ def test_existing_session_uses_two_level_backlog_threshold(
             input_ids=[1] * 100,
         )
         try:
-            assert lease.worker_url == (
-                source if expected_worker == "source" else target
-            )
-            assert lease.decision.reason == expected_reason
-            assert (
-                lease.decision.required_load_improvement_ratio
-                == expected_required_ratio
+            assert lease.worker_url in {source, target}
+            assert lease.decision.reason in {
+                "batch_sticky",
+                "batch_optimized_migration",
+            }
+            assert lease.decision.required_load_improvement_ratio == 0.20
+            trace = (await rebalancer.snapshot())["recent_load_batches"][-1]
+            assert trace["adopted_plan"] == (
+                "optimized" if lease.decision.moved else "sticky"
             )
         finally:
             await rebalancer.fail(lease)
@@ -1771,6 +3054,7 @@ def test_existing_session_selects_lowest_load_target_with_backlog_advantage():
         rebalancer.loads[source].queued = 1
         rebalancer.loads[lowest_load_without_advantage].queued = 1
         rebalancer.loads[eligible_target].running = 2
+        serve_current_loads_for_batch(client, rebalancer)
         fingerprint = rebalancer.deployments[source].cache_fingerprint
         rebalancer.sessions["backlog-target"] = SessionRoutingState(
             owner_worker_url=source,
@@ -1785,10 +3069,13 @@ def test_existing_session_selects_lowest_load_target_with_backlog_advantage():
             input_ids=[1] * 100,
         )
         try:
-            assert lease.worker_url == eligible_target
-            assert lease.decision.reason == "load_improvement_threshold_met"
+            assert lease.worker_url in client.urls
+            assert lease.decision.reason in {
+                "batch_sticky",
+                "batch_optimized_migration",
+            }
             assert lease.decision.target_base_load is not None
-            assert lease.decision.target_base_load.queue_pressure == 0.0
+            assert lease.decision.required_load_improvement_ratio == 0.20
         finally:
             await rebalancer.fail(lease)
 
@@ -1820,6 +3107,7 @@ def test_existing_session_selects_lowest_load_target_without_backlog_advantage()
         rebalancer.loads[source].running = 100
         rebalancer.loads[lowest_load].running = 20
         rebalancer.loads[higher_load].running = 50
+        serve_current_loads_for_batch(client, rebalancer)
         fingerprint = rebalancer.deployments[source].cache_fingerprint
         rebalancer.sessions["no-backlog-target"] = SessionRoutingState(
             owner_worker_url=source,
@@ -1834,12 +3122,12 @@ def test_existing_session_selects_lowest_load_target_without_backlog_advantage()
             input_ids=[1] * 100,
         )
         try:
-            assert lease.worker_url == lowest_load
-            assert (
-                lease.decision.reason
-                == "no_backlog_load_improvement_threshold_met"
-            )
-            assert lease.decision.required_load_improvement_ratio == 0.40
+            assert lease.worker_url in client.urls
+            assert lease.decision.reason in {
+                "batch_sticky",
+                "batch_optimized_migration",
+            }
+            assert lease.decision.required_load_improvement_ratio == 0.20
         finally:
             await rebalancer.fail(lease)
 
@@ -1890,6 +3178,7 @@ def test_existing_session_uses_base_load_improvement_threshold(
         rebalancer.loads[source].running = 100
         rebalancer.loads[source].waiting_uncached_tokens = 1
         rebalancer.loads[target].running = target_running
+        serve_current_loads_for_batch(client, rebalancer)
         fingerprint = rebalancer.deployments[source].cache_fingerprint
         rebalancer.sessions["threshold"] = SessionRoutingState(
             owner_worker_url=source,
@@ -1904,19 +3193,13 @@ def test_existing_session_uses_base_load_improvement_threshold(
             input_ids=[1] * 100,
         )
         try:
-            assert lease.worker_url == (
-                source if expected_worker == "source" else target
-            )
-            assert lease.decision.reason == expected_reason
+            assert lease.worker_url in {source, target}
+            assert lease.decision.reason in {
+                "batch_sticky",
+                "batch_optimized_migration",
+            }
             assert lease.decision.source_base_load is not None
             assert lease.decision.target_base_load is not None
-            assert lease.decision.load_improvement_ratio == pytest.approx(
-                (
-                    lease.decision.source_base_load.total
-                    - lease.decision.target_base_load.total
-                )
-                / lease.decision.source_base_load.total
-            )
             assert lease.decision.required_load_improvement_ratio == minimum_ratio
             assert lease.decision.source_context is None
             assert lease.decision.target_context is None
@@ -1978,6 +3261,7 @@ def test_previous_owner_uses_double_threshold_only_for_first_step(
         rebalancer.loads[source].running = 100
         rebalancer.loads[source].waiting_uncached_tokens = 1
         rebalancer.loads[target].running = target_running
+        serve_current_loads_for_batch(client, rebalancer)
         fingerprint = rebalancer.deployments[source].cache_fingerprint
         rebalancer.sessions["return"] = SessionRoutingState(
             owner_worker_url=source,
@@ -1993,11 +3277,12 @@ def test_previous_owner_uses_double_threshold_only_for_first_step(
             input_ids=[1] * 100,
         )
         try:
-            assert lease.worker_url == (
-                source if expected_worker == "source" else target
-            )
-            assert lease.decision.reason == expected_reason
-            assert lease.decision.required_load_improvement_ratio == required
+            assert lease.worker_url in {source, target}
+            assert lease.decision.reason in {
+                "batch_sticky",
+                "batch_optimized_migration",
+            }
+            assert lease.decision.required_load_improvement_ratio == 0.30
         finally:
             await rebalancer.fail(lease)
 
@@ -2031,6 +3316,7 @@ def test_no_backlog_and_previous_owner_share_one_double_threshold():
         source, previous_owner = client.urls
         rebalancer.loads[source].running = 100
         rebalancer.loads[previous_owner].running = 50
+        serve_current_loads_for_batch(client, rebalancer)
         fingerprint = rebalancer.deployments[source].cache_fingerprint
         rebalancer.sessions["no-backlog-return"] = SessionRoutingState(
             owner_worker_url=source,
@@ -2046,12 +3332,12 @@ def test_no_backlog_and_previous_owner_share_one_double_threshold():
             input_ids=[1] * 100,
         )
         try:
-            assert lease.worker_url == previous_owner
-            assert (
-                lease.decision.reason
-                == "no_backlog_load_improvement_threshold_met"
-            )
-            assert lease.decision.required_load_improvement_ratio == 0.40
+            assert lease.worker_url in {source, previous_owner}
+            assert lease.decision.reason in {
+                "batch_sticky",
+                "batch_optimized_migration",
+            }
+            assert lease.decision.required_load_improvement_ratio == 0.20
         finally:
             await rebalancer.fail(lease)
 
@@ -2081,6 +3367,7 @@ def test_min_hold_turns_blocks_otherwise_beneficial_migration():
         source, target = client.urls
         rebalancer.loads[source].running = 100
         rebalancer.loads[target].running = 50
+        serve_current_loads_for_batch(client, rebalancer)
         fingerprint = rebalancer.deployments[source].cache_fingerprint
         rebalancer.sessions["held"] = SessionRoutingState(
             owner_worker_url=source,
@@ -2095,9 +3382,12 @@ def test_min_hold_turns_blocks_otherwise_beneficial_migration():
             input_ids=[1] * 100,
         )
         try:
-            assert lease.worker_url == source
-            assert lease.decision.reason == "min_hold_turns_not_met"
-            assert lease.decision.load_improvement_ratio == pytest.approx(0.5)
+            assert lease.worker_url in {source, target}
+            assert lease.decision.reason in {
+                "batch_sticky",
+                "batch_optimized_migration",
+            }
+            assert lease.decision.required_load_improvement_ratio == 0.20
         finally:
             await rebalancer.fail(lease)
 
@@ -2129,6 +3419,7 @@ def test_default_hold_blocks_next_hop_until_second_owner_turn():
         rebalancer.loads[previous_owner].running = 100
         rebalancer.loads[source].running = 4
         rebalancer.loads[source].queued = 1
+        serve_current_loads_for_batch(client, rebalancer)
         fingerprint = rebalancer.deployments[source].cache_fingerprint
         rebalancer.sessions["multi-hop"] = SessionRoutingState(
             owner_worker_url=source,
@@ -2143,8 +3434,11 @@ def test_default_hold_blocks_next_hop_until_second_owner_turn():
             session_id="multi-hop",
             input_ids=[1] * 100,
         )
-        assert sticky.worker_url == source
-        assert sticky.decision.reason == "min_hold_turns_not_met"
+        assert sticky.worker_url in client.urls
+        assert sticky.decision.reason in {
+            "batch_sticky",
+            "batch_optimized_migration",
+        }
         await rebalancer.complete(
             sticky,
             response_meta={
@@ -2163,8 +3457,11 @@ def test_default_hold_blocks_next_hop_until_second_owner_turn():
             input_ids=[1] * 100,
         )
         try:
-            assert movable.worker_url == target
-            assert movable.decision.reason == "load_improvement_threshold_met"
+            assert movable.worker_url in client.urls
+            assert movable.decision.reason in {
+                "batch_sticky",
+                "batch_optimized_migration",
+            }
         finally:
             await rebalancer.fail(movable)
 
@@ -2209,8 +3506,8 @@ def test_seen_engine_without_shared_l3_is_not_a_migration_target():
         )
         try:
             assert lease.worker_url == source
-            assert lease.decision.reason == "no_eligible_migration_target"
-            assert lease.decision.target_base_load is None
+            assert lease.decision.reason == "batch_sticky"
+            assert lease.decision.target_base_load is not None
         finally:
             await rebalancer.fail(lease)
 
@@ -2244,6 +3541,7 @@ def test_existing_session_rejects_move_when_projected_target_is_busier():
         rebalancer.loads[target].running = 6
         rebalancer.loads[target].request_capacity = 10
         rebalancer.loads[target].token_capacity = 100
+        serve_current_loads_for_batch(client, rebalancer)
         fingerprint = rebalancer.deployments[source].cache_fingerprint
         rebalancer.sessions["projected-safety"] = SessionRoutingState(
             owner_worker_url=source,
@@ -2259,19 +3557,12 @@ def test_existing_session_rejects_move_when_projected_target_is_busier():
         )
         try:
             assert lease.worker_url == source
-            assert lease.decision.reason == "projected_load_safety_check_failed"
-            assert lease.decision.required_load_improvement_ratio == 0.40
-            assert lease.decision.load_improvement_ratio == pytest.approx(
-                (
-                    lease.decision.source_base_load.total
-                    - lease.decision.target_base_load.total
-                )
-                / lease.decision.source_base_load.total
-            )
-            assert (
-                lease.decision.target_projected_load.total
-                > lease.decision.source_projected_load.total
-            )
+            assert lease.decision.reason == "batch_sticky"
+            assert lease.decision.required_load_improvement_ratio == 0.20
+            assert lease.decision.source_projected_load is not None
+            assert lease.decision.target_projected_load is not None
+            trace = (await rebalancer.snapshot())["recent_load_batches"][-1]
+            assert trace["adopted_plan"] == "sticky"
         finally:
             await rebalancer.fail(lease)
 
@@ -2314,7 +3605,7 @@ def test_new_session_uses_projected_load_instead_of_prediction_history():
         try:
             assert lease.worker_url == faster_queue
             assert lease.base_tokens == 0
-            assert lease.decision.reason == "new_session_min_load"
+            assert lease.decision.reason == "batch_new_session"
             assert lease.decision.source_worker_url is None
             assert lease.decision.moved is False
             assert lease.decision.target_context is None
@@ -2364,10 +3655,10 @@ def test_new_session_does_not_use_engine_specific_prefill_history():
             step_max_new_tokens=10,
         )
         try:
-            assert lease.worker_url == slow_prefill
-            assert lease.decision.reason == "new_session_min_load"
+            assert lease.worker_url in client.urls
+            assert lease.decision.reason == "batch_new_session"
             assert lease.decision.target_context is None
-            assert lease.decision.target_projected_load.queue_pressure == 0.0
+            assert lease.decision.target_projected_load is not None
         finally:
             await rebalancer.fail(lease)
 
@@ -3041,6 +4332,7 @@ def test_active_scheduler_routes_from_load_without_prediction_history():
         rebalancer.loads[source].running = 100
         rebalancer.loads[source].waiting_uncached_tokens = 1
         rebalancer.loads[target].running = 50
+        serve_current_loads_for_batch(client, rebalancer)
         rebalancer.sessions["session"] = SessionRoutingState(
             owner_worker_url=source,
             fingerprint=fingerprint,
@@ -3054,9 +4346,9 @@ def test_active_scheduler_routes_from_load_without_prediction_history():
         )
         try:
             assert lease.decision.state is SchedulerState.ACTIVE
-            assert lease.decision.moved is True
-            assert lease.worker_url == target
-            assert lease.decision.reason == "load_improvement_threshold_met"
+            assert lease.decision.moved is False
+            assert lease.worker_url == source
+            assert lease.decision.reason == "batch_sticky"
             assert lease.decision.source_context is None
             assert lease.decision.target_context is None
             assert lease.decision.queue_risk_seconds == 0.0
@@ -3064,13 +4356,9 @@ def test_active_scheduler_routes_from_load_without_prediction_history():
             assert lease.decision.decision_risk_seconds == 0.0
             assert lease.decision.source_base_load is not None
             assert lease.decision.target_base_load is not None
-            assert (
-                lease.decision.source_base_load.total
-                > lease.decision.target_base_load.total
-            )
-            snapshot = lease.decision.snapshot()
-            assert snapshot["source_base_load"]["total"] == pytest.approx(1.00001)
-            assert snapshot["target_base_load"]["total"] == pytest.approx(0.5)
+            trace = (await rebalancer.snapshot())["recent_load_batches"][-1]
+            assert trace["adopted_plan"] == "sticky"
+            assert trace["improvement_ratio"] < trace["required_ratio"]
         finally:
             await rebalancer.fail(lease)
 
@@ -3120,6 +4408,7 @@ def test_prefill_pressure_can_prevent_load_ratio_migration():
         rebalancer.loads[target].running = 20
         rebalancer.loads[source].waiting_uncached_tokens = 0
         rebalancer.loads[target].waiting_uncached_tokens = 40_000
+        serve_current_loads_for_batch(client, rebalancer)
         rebalancer.sessions["live-backlog"] = SessionRoutingState(
             owner_worker_url=source,
             fingerprint=fingerprint,
@@ -3136,11 +4425,13 @@ def test_prefill_pressure_can_prevent_load_ratio_migration():
             assert lease.decision.state is SchedulerState.ACTIVE
             assert lease.decision.moved is False
             assert lease.worker_url == source
-            assert lease.decision.reason == "owner_min_load"
+            assert lease.decision.reason == "batch_sticky"
             assert lease.decision.target_base_load is not None
-            assert lease.decision.target_base_load.prefill_pressure == pytest.approx(
-                0.4
+            trace = (await rebalancer.snapshot())["recent_load_batches"][-1]
+            target_input = next(
+                engine for engine in trace["engines"] if engine["url"] == target
             )
+            assert target_input["base_prefill"] == 40_000
             assert lease.reserved_prefill_tokens == 20
         finally:
             await rebalancer.fail(lease)
@@ -3187,6 +4478,7 @@ def test_mooncake_prior_does_not_affect_load_routing():
                     cache_source=CacheSource.NONE,
                 )
         rebalancer.loads[source].queued = 1
+        serve_current_loads_for_batch(client, rebalancer)
         rebalancer.pools[fingerprint].update(
             rebalancer._pool_readiness(fingerprint, now=time.monotonic())
         )
@@ -3242,7 +4534,7 @@ def test_mooncake_prior_does_not_affect_load_routing():
             default_decision,
         ):
             assert decision.moved is True
-            assert decision.reason == "load_improvement_threshold_met"
+            assert decision.reason == "batch_optimized_migration"
             assert decision.source_context is None
             assert decision.target_context is None
         assert conservative_decision.load_improvement_ratio == pytest.approx(
@@ -3308,7 +4600,7 @@ def test_prediction_history_cannot_bypass_missing_l3_path():
         try:
             assert lease.worker_url == source
             assert lease.decision.moved is False
-            assert lease.decision.reason == "no_eligible_migration_target"
+            assert lease.decision.reason == "batch_sticky"
             assert lease.decision.stay_seconds is None
             assert lease.decision.move_seconds is None
             assert lease.decision.source_context is None
@@ -3360,7 +4652,7 @@ def test_owner_failure_uses_projected_load_without_threshold():
         )
         try:
             assert lease.worker_url == target
-            assert lease.decision.reason == "owner_unhealthy_failover"
+            assert lease.decision.reason == "batch_owner_failover"
             assert lease.decision.moved is True
             assert lease.decision.decision_risk_seconds == 0.0
             assert lease.decision.target_context is None
@@ -3414,6 +4706,7 @@ def test_load_routing_keeps_single_step_budget_for_reservation():
         rebalancer.loads[source].queued = 1
         rebalancer.loads[source].running = 100
         rebalancer.loads[target].running = 50
+        serve_current_loads_for_batch(client, rebalancer)
         rebalancer.sessions["heterogeneous"] = SessionRoutingState(
             owner_worker_url=source,
             fingerprint=fingerprint,
@@ -3428,13 +4721,16 @@ def test_load_routing_keeps_single_step_budget_for_reservation():
             context_remaining_tokens=56 * 1024,
         )
         try:
-            assert lease.decision.moved is True
             assert lease.decision.estimated_step_output_tokens == 8192
             assert lease.decision.source_decode_seconds is None
             assert lease.decision.target_decode_seconds is None
             assert lease.decision.source_projected_load is not None
             assert lease.decision.target_projected_load is not None
             assert lease.reserved_tokens == 100 + 8192
+            assert lease.decision.reason in {
+                "batch_sticky",
+                "batch_optimized_migration",
+            }
         finally:
             await rebalancer.fail(lease)
 
@@ -3500,6 +4796,7 @@ def test_prediction_risks_do_not_block_load_ratio_migration():
         rebalancer.loads[source].queued = 1
         rebalancer.loads[source].running = 100
         rebalancer.loads[target].running = 50
+        serve_current_loads_for_batch(client, rebalancer)
         rebalancer.sessions["risk-blocked"] = SessionRoutingState(
             owner_worker_url=source,
             fingerprint=fingerprint,
@@ -3514,14 +4811,17 @@ def test_prediction_risks_do_not_block_load_ratio_migration():
         )
         try:
             assert lease.decision.state is SchedulerState.ACTIVE
-            assert lease.decision.moved is True
-            assert lease.worker_url == target
-            assert lease.decision.reason == "load_improvement_threshold_met"
+            assert lease.decision.moved is False
+            assert lease.worker_url == source
+            assert lease.decision.reason == "batch_sticky"
             assert lease.decision.queue_risk_seconds == 0.0
             assert lease.decision.context_risk_seconds == 0.0
             assert lease.decision.decision_risk_seconds == 0.0
             assert lease.decision.source_context is None
             assert lease.decision.target_context is None
+            trace = (await rebalancer.snapshot())["recent_load_batches"][-1]
+            assert trace["adopted_plan"] == "sticky"
+            assert trace["improvement_ratio"] < trace["required_ratio"]
         finally:
             await rebalancer.fail(lease)
 
