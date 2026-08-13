@@ -2658,6 +2658,236 @@ def test_live_queue_seconds_uses_prefill_p25_and_falls_back_when_unavailable():
     )
 
 
+def test_live_reservation_ledger_uses_distinct_ids_and_aggregates_engine_load():
+    client = ControlPlaneClient()
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(enabled=True),
+        model_id="model",
+    )
+
+    async def scenario():
+        await rebalancer.refresh()
+        target = client.urls[0]
+        fingerprint = rebalancer.deployments[target].cache_fingerprint
+        estimate = ContextRecoveryEstimate(
+            cache_source=CacheSource.MOONCAKE,
+            expected_cached_tokens=20,
+            expected_prefill_tokens=80,
+            estimated_seconds=1.0,
+            hit_probability=0.2,
+        )
+        budget = StepGenerationBudget("test", 10, None, None, 10)
+        leases = [
+            rebalancer._reserve(
+                RoutingDecision(
+                    session_id=f"ledger-{index}",
+                    source_worker_url=None,
+                    target_worker_url=target,
+                    cache_fingerprint=fingerprint,
+                    state=SchedulerState.ACTIVE,
+                    reason="test",
+                    target_context=estimate,
+                ),
+                input_ids=[1] * 100,
+                base_tokens=0,
+                budget=budget,
+                batch_id=7,
+            )
+            for index in range(2)
+        ]
+
+        assert leases[0].reservation_id is not None
+        assert leases[0].reservation_id != leases[1].reservation_id
+        assert leases[0].batch_id == 7
+        assert rebalancer._reservations[leases[0].reservation_id].batch_id == 7
+        assert set(rebalancer._reservations) == {
+            leases[0].reservation_id,
+            leases[1].reservation_id,
+        }
+        assert rebalancer._live_reservation_totals(target) == (2, 220, 160)
+        load = rebalancer.loads[target]
+        assert (
+            load.reserved_requests,
+            load.reserved_tokens,
+            load.reserved_prefill_tokens,
+        ) == rebalancer._live_reservation_totals(target)
+
+    run(scenario())
+
+
+@pytest.mark.parametrize("settle_method", ["complete", "fail"])
+def test_reservation_settle_releases_exact_entry_once(settle_method):
+    client = ControlPlaneClient()
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(enabled=True),
+        model_id="model",
+    )
+
+    async def scenario():
+        await rebalancer.refresh()
+        target = client.urls[0]
+        decision = RoutingDecision(
+            session_id="exact-release",
+            source_worker_url=None,
+            target_worker_url=target,
+            cache_fingerprint=rebalancer.deployments[target].cache_fingerprint,
+            state=SchedulerState.ACTIVE,
+            reason="test",
+        )
+        budget = StepGenerationBudget("unavailable", None, None, None, None)
+        first = rebalancer._reserve(
+            decision,
+            input_ids=[1] * 100,
+            base_tokens=0,
+            budget=budget,
+        )
+        second = rebalancer._reserve(
+            decision,
+            input_ids=[1] * 100,
+            base_tokens=0,
+            budget=budget,
+        )
+
+        async def settle():
+            if settle_method == "complete":
+                await rebalancer.complete(
+                    first,
+                    response_meta={},
+                    output_tokens=0,
+                    committed_tokens=[],
+                )
+            else:
+                await rebalancer.fail(first)
+
+        await settle()
+        assert set(rebalancer._reservations) == {second.reservation_id}
+        assert rebalancer._live_reservation_totals(target) == (1, 100, 100)
+        await settle()
+        assert set(rebalancer._reservations) == {second.reservation_id}
+        assert rebalancer._live_reservation_totals(target) == (1, 100, 100)
+        load = rebalancer.loads[target]
+        assert (
+            load.reserved_requests,
+            load.reserved_tokens,
+            load.reserved_prefill_tokens,
+        ) == (1, 100, 100)
+
+    run(scenario())
+
+
+def test_stale_and_legacy_settle_cannot_release_equal_newer_reservation():
+    client = ControlPlaneClient()
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(enabled=True),
+        model_id="model",
+    )
+
+    async def scenario():
+        await rebalancer.refresh()
+        target = client.urls[0]
+        decision = RoutingDecision(
+            session_id="stale-release",
+            source_worker_url=None,
+            target_worker_url=target,
+            cache_fingerprint=rebalancer.deployments[target].cache_fingerprint,
+            state=SchedulerState.ACTIVE,
+            reason="test",
+        )
+        budget = StepGenerationBudget("unavailable", None, None, None, None)
+        stale = rebalancer._reserve(
+            decision,
+            input_ids=[1] * 100,
+            base_tokens=0,
+            budget=budget,
+        )
+        await rebalancer.fail(stale)
+        newer = rebalancer._reserve(
+            decision,
+            input_ids=[1] * 100,
+            base_tokens=0,
+            budget=budget,
+        )
+        legacy = RoutingLease(
+            decision=decision,
+            worker_url=target,
+            reserved_tokens=100,
+            base_tokens=0,
+            started_monotonic=time.monotonic(),
+            reserved_prefill_tokens=100,
+        )
+
+        await rebalancer.fail(stale)
+        await rebalancer.fail(legacy)
+
+        assert set(rebalancer._reservations) == {newer.reservation_id}
+        assert rebalancer._live_reservation_totals(target) == (1, 100, 100)
+        load = rebalancer.loads[target]
+        assert (
+            load.reserved_requests,
+            load.reserved_tokens,
+            load.reserved_prefill_tokens,
+        ) == (1, 100, 100)
+
+    run(scenario())
+
+
+def test_prefill_retirement_keeps_request_and_token_reservation_until_settle():
+    client = ControlPlaneClient()
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(enabled=True),
+        model_id="model",
+    )
+
+    async def scenario():
+        await rebalancer.refresh()
+        target = client.urls[0]
+        decision = RoutingDecision(
+            session_id="prefill-retirement",
+            source_worker_url=None,
+            target_worker_url=target,
+            cache_fingerprint=rebalancer.deployments[target].cache_fingerprint,
+            state=SchedulerState.ACTIVE,
+            reason="test",
+        )
+        budget = StepGenerationBudget("unavailable", None, None, None, None)
+        lease = rebalancer._reserve(
+            decision,
+            input_ids=[1] * 100,
+            base_tokens=0,
+            budget=budget,
+        )
+        revision = rebalancer._reservation_revision
+
+        rebalancer._advance_prefill_reservation_generation(target)
+        assert rebalancer._live_reservation_totals(target) == (1, 100, 100)
+        assert rebalancer._reservation_revision == revision
+        rebalancer._advance_prefill_reservation_generation(target)
+
+        assert rebalancer._live_reservation_totals(target) == (1, 100, 0)
+        assert rebalancer._reservation_revision == revision + 1
+        assert rebalancer._reservations[lease.reservation_id].prefill_active is False
+        load = rebalancer.loads[target]
+        assert (
+            load.reserved_requests,
+            load.reserved_tokens,
+            load.reserved_prefill_tokens,
+        ) == (1, 100, 0)
+
+        await rebalancer.fail(lease)
+        assert rebalancer._live_reservation_totals(target) == (0, 0, 0)
+        assert (
+            load.reserved_requests,
+            load.reserved_tokens,
+            load.reserved_prefill_tokens,
+        ) == (0, 0, 0)
+
+    run(scenario())
+
+
 def test_prefill_reservations_expire_by_load_generation_and_release_on_failure():
     client = ControlPlaneClient()
     rebalancer = EngineRebalancer(
@@ -3794,6 +4024,7 @@ def test_late_lease_settle_releases_reservation_without_recreating_discarded_ses
             input_ids=[1] * 100,
         )
         load = rebalancer.loads[lease.worker_url]
+        assert lease.reservation_id in rebalancer._reservations
         assert load.reserved_requests == 1
         assert load.reserved_tokens > 0
         assert load.reserved_prefill_tokens > 0
@@ -3816,6 +4047,7 @@ def test_late_lease_settle_releases_reservation_without_recreating_discarded_ses
 
         assert "discard-before-settle" not in rebalancer.sessions
         assert (await rebalancer.snapshot())["active_sessions"] == 0
+        assert lease.reservation_id not in rebalancer._reservations
         assert load.reserved_requests == 0
         assert load.reserved_tokens == 0
         assert load.reserved_prefill_tokens == 0
