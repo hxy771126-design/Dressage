@@ -128,7 +128,6 @@ class _Model:
     constraints: tuple[LinearConstraint, ...]
     bounds: Bounds
     integrality: np.ndarray
-    token_offset: int
     maximum_load_index: int
 
 
@@ -208,7 +207,6 @@ def _build_model(problem: BatchProblem) -> _Model:
         integrality=np.concatenate(
             (np.ones(edge_count, dtype=int), np.zeros(engine_count + 1, dtype=int))
         ),
-        token_offset=token_offset,
         maximum_load_index=maximum_load_index,
     )
 

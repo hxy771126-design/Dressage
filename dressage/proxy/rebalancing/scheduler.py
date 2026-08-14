@@ -279,8 +279,6 @@ class SessionRoutingState:
     fingerprint: str | None = None
     previous_committed_tokens: list[int] = field(default_factory=list)
     seen_engines: set[str] = field(default_factory=set)
-    owner_turns: int = 0
-    previous_owner_worker_url: str | None = None
     group_id: int | str | None = None
     group_size: int = 1
     task_key: str | None = None
@@ -377,8 +375,6 @@ class RoutingLease:
 
 @dataclass
 class _ReservationEntry:
-    reservation_id: int
-    batch_id: int | None
     engine_url: str
     request_increment: int
     token_increment: int
@@ -406,7 +402,6 @@ class _OpenBatch:
     id: int
     started_monotonic: float
     steps: list[_PendingBatchStep] = field(default_factory=list)
-    sealed: bool = False
     sealed_monotonic: float | None = None
     terminal_published: bool = False
 
@@ -423,7 +418,6 @@ class _BatchFetchResult:
 @dataclass(frozen=True)
 class _FrozenBatchStep:
     pending: _PendingBatchStep
-    session: SessionRoutingState
     session_signature: tuple[Any, ...]
     source: str | None
     fingerprint: str | None
@@ -484,7 +478,6 @@ class _SolvedBatch:
 
 class GroupLengthEstimator:
     def __init__(self, *, history_size: int, min_task_samples: int = 32) -> None:
-        self.history_size = history_size
         self.min_task_samples = min_task_samples
         self._group: dict[int | str, Deque[int]] = defaultdict(
             lambda: deque(maxlen=history_size)
@@ -528,7 +521,6 @@ class StepLengthEstimator:
     """
 
     def __init__(self, *, history_size: int, min_samples: int) -> None:
-        self.history_size = history_size
         self.min_samples = min_samples
         self._task: dict[tuple[str, str, str], Deque[int]] = defaultdict(
             lambda: deque(maxlen=history_size)
@@ -1782,8 +1774,6 @@ class EngineRebalancer:
             session.fingerprint,
             tuple(session.previous_committed_tokens),
             tuple(sorted(session.seen_engines)),
-            session.owner_turns,
-            session.previous_owner_worker_url,
             session.group_id,
             session.group_size,
             session.task_key,
@@ -1936,7 +1926,6 @@ class EngineRebalancer:
                     frozen_steps.append(
                         _FrozenBatchStep(
                             pending=pending,
-                            session=deepcopy(existing or SessionRoutingState()),
                             session_signature=signature,
                             source=(
                                 None if existing is None else existing.owner_worker_url
@@ -1954,7 +1943,6 @@ class EngineRebalancer:
                     frozen_steps.append(
                         _FrozenBatchStep(
                             pending=pending,
-                            session=SessionRoutingState(),
                             session_signature=signature,
                             source=None,
                             fingerprint=None,
@@ -2008,7 +1996,6 @@ class EngineRebalancer:
                     frozen_steps.append(
                         _FrozenBatchStep(
                             pending=pending,
-                            session=session,
                             session_signature=signature,
                             source=source,
                             fingerprint=fingerprint,
@@ -2091,7 +2078,6 @@ class EngineRebalancer:
                     frozen_steps.append(
                         _FrozenBatchStep(
                             pending=pending,
-                            session=session,
                             session_signature=signature,
                             source=source,
                             fingerprint=fingerprint,
@@ -2109,7 +2095,6 @@ class EngineRebalancer:
                 frozen_steps.append(
                     _FrozenBatchStep(
                         pending=pending,
-                        session=session,
                         session_signature=signature,
                         source=source,
                         fingerprint=fingerprint,
@@ -2292,7 +2277,6 @@ class EngineRebalancer:
                 )
                 fetch_finished = time.monotonic()
                 async with self._batch_lock:
-                    batch.sealed = True
                     batch.sealed_monotonic = time.monotonic()
                     if self._open_batch is batch:
                         self._open_batch = None
@@ -2745,8 +2729,7 @@ class EngineRebalancer:
                 "collect_seconds": max(
                     0.0,
                     (batch.sealed_monotonic or completed_at)
-                    - batch.started_monotonic
-                    - fetch_seconds,
+                    - batch.started_monotonic,
                 ),
                 "fetch_seconds": fetch_seconds,
                 "solve_seconds": 0.0 if solved is None else solved.elapsed_seconds,
@@ -2884,7 +2867,6 @@ class EngineRebalancer:
     ) -> None:
         async with self._batch_lock:
             async with self._lock:
-                batch.sealed = True
                 if batch.sealed_monotonic is None:
                     batch.sealed_monotonic = time.monotonic()
                 if self._open_batch is batch:
@@ -3042,8 +3024,6 @@ class EngineRebalancer:
             reservation_id = self._next_reservation_id
             self._next_reservation_id += 1
             self._reservations[reservation_id] = _ReservationEntry(
-                reservation_id=reservation_id,
-                batch_id=batch_id,
                 engine_url=target,
                 request_increment=1,
                 token_increment=reserved_tokens,
@@ -3099,11 +3079,6 @@ class EngineRebalancer:
             old_owner = session.owner_worker_url
             new_owner = lease.worker_url
             target_seen_before = new_owner in session.seen_engines
-            if old_owner != new_owner:
-                session.previous_owner_worker_url = old_owner
-                session.owner_turns = 1
-            else:
-                session.owner_turns += 1
             session.owner_worker_url = new_owner
             session.pending_owner_worker_url = None
             deployment = self.deployments[new_owner]

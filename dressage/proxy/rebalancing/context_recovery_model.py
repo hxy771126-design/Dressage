@@ -7,7 +7,7 @@ from collections import defaultdict, deque
 from dataclasses import dataclass
 from typing import Any, Deque
 
-from .cache_hit_estimator import CacheSource, ContextRecoveryEstimate, context_bucket
+from .cache_hit_estimator import CacheSource, context_bucket
 
 
 def percentile(values: list[float], fraction: float) -> float:
@@ -62,9 +62,6 @@ class PerformanceHistory:
             lambda: deque(maxlen=history_size)
         )
         self._queue_error: dict[tuple[str, str, str], Deque[float]] = defaultdict(
-            lambda: deque(maxlen=history_size)
-        )
-        self._queue_error_pool: dict[tuple[str, str], Deque[float]] = defaultdict(
             lambda: deque(maxlen=history_size)
         )
         self._prefill: dict[tuple[str, str, str], Deque[float]] = defaultdict(
@@ -123,9 +120,6 @@ class PerformanceHistory:
                     self._queue_error[(fingerprint, engine_url, bucket)].append(
                         queue_prediction_error
                     )
-                    self._queue_error_pool[(fingerprint, bucket)].append(
-                        queue_prediction_error
-                    )
 
         actual_cached = max(0, min(int(context_tokens), int(cached_tokens)))
         prefill_tokens = max(0, int(context_tokens) - actual_cached)
@@ -174,48 +168,6 @@ class PerformanceHistory:
             tpot_seconds=tpot,
         )
 
-    def queue_seconds(
-        self,
-        *,
-        fingerprint: str,
-        engine_url: str,
-        projected_running: int,
-        projected_load_score: float | None = None,
-    ) -> float | None:
-        buckets = []
-        if projected_load_score is not None:
-            buckets.append(projected_load_bucket(projected_load_score))
-        buckets.append(load_bucket(projected_running))
-        for bucket in dict.fromkeys(buckets):
-            samples = list(self._queue[(fingerprint, engine_url, bucket)])
-            if len(samples) < self.min_samples:
-                samples = list(self._queue_pool[(fingerprint, bucket)])
-            if len(samples) >= self.min_samples:
-                return percentile(samples, 0.75)
-        return None
-
-    def queue_risk_seconds(
-        self,
-        *,
-        fingerprint: str,
-        engine_url: str,
-        projected_running: int,
-        projected_load_score: float | None = None,
-    ) -> float:
-        """Return P90 absolute queue-time prediction error for a candidate."""
-
-        buckets = []
-        if projected_load_score is not None:
-            buckets.append(projected_load_bucket(projected_load_score))
-        buckets.append(load_bucket(projected_running))
-        for bucket in dict.fromkeys(buckets):
-            samples = list(self._queue_error[(fingerprint, engine_url, bucket)])
-            if len(samples) < self.min_samples:
-                samples = list(self._queue_error_pool[(fingerprint, bucket)])
-            if len(samples) >= self.min_samples:
-                return percentile(samples, 0.90)
-        return 0.0
-
     def prefill_throughput(
         self,
         *,
@@ -230,46 +182,6 @@ class PerformanceHistory:
         if len(samples) < self.min_samples:
             return None
         return max(1e-6, percentile(samples, 0.25))
-
-    def tpot_seconds(
-        self,
-        *,
-        fingerprint: str,
-        engine_url: str,
-        projected_running: int,
-        projected_load_score: float | None = None,
-    ) -> float | None:
-        buckets = []
-        if projected_load_score is not None:
-            buckets.append(projected_load_bucket(projected_load_score))
-        buckets.append(load_bucket(projected_running))
-        for bucket in dict.fromkeys(buckets):
-            samples = list(self._tpot[(fingerprint, engine_url, bucket)])
-            if len(samples) < self.min_samples:
-                samples = [
-                    item
-                    for (pool_fingerprint, _, pool_bucket), values in self._tpot.items()
-                    if pool_fingerprint == fingerprint and pool_bucket == bucket
-                    for item in values
-                ]
-            if len(samples) >= self.min_samples:
-                return percentile(samples, 0.75)
-        return None
-
-    def risk_seconds(
-        self,
-        *,
-        fingerprint: str,
-        source: CacheSource,
-        context_tokens: int,
-        minimum_seconds: float,
-    ) -> float:
-        samples = list(
-            self._context_error[(fingerprint, source, context_bucket(context_tokens))]
-        )
-        if len(samples) < self.min_samples:
-            return minimum_seconds
-        return max(minimum_seconds, percentile(samples, 0.90))
 
     def queue_ready(self, fingerprint: str) -> bool:
         return any(
@@ -296,56 +208,3 @@ class PerformanceHistory:
             ),
             "min_samples": self.min_samples,
         }
-
-
-class ContextRecoveryModel:
-    def __init__(self, performance: PerformanceHistory) -> None:
-        self.performance = performance
-
-    def estimate(
-        self,
-        *,
-        fingerprint: str,
-        engine_url: str,
-        cache_source: CacheSource,
-        context_tokens: int,
-        base_tokens: int,
-        hit_probability: float,
-        restore_seconds: float | None,
-        restore_sample_source: str = "none",
-    ) -> ContextRecoveryEstimate | None:
-        throughput = self.performance.prefill_throughput(
-            fingerprint=fingerprint,
-            engine_url=engine_url,
-            context_tokens=context_tokens,
-        )
-        if throughput is None:
-            return None
-        total_tokens = max(0, int(context_tokens))
-        reusable = max(0, min(total_tokens, int(base_tokens)))
-        probability = max(0.0, min(1.0, float(hit_probability)))
-        if cache_source is CacheSource.NONE or reusable == 0:
-            probability = 0.0
-            source = CacheSource.NONE
-            estimated = total_tokens / throughput
-        else:
-            source = cache_source
-            if restore_seconds is None:
-                return None
-            hit_seconds = (
-                max(0.0, restore_seconds) + (total_tokens - reusable) / throughput
-            )
-            miss_seconds = total_tokens / throughput
-            estimated = probability * hit_seconds + (1.0 - probability) * miss_seconds
-        expected_cached = int(math.floor(probability * reusable))
-        return ContextRecoveryEstimate(
-            cache_source=source,
-            expected_cached_tokens=expected_cached,
-            expected_prefill_tokens=max(0, total_tokens - expected_cached),
-            estimated_seconds=max(0.0, estimated),
-            hit_probability=probability,
-            restore_seconds=(
-                0.0 if restore_seconds is None else max(0.0, restore_seconds)
-            ),
-            restore_sample_source=restore_sample_source,
-        )

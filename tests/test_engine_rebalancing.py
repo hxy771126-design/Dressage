@@ -21,16 +21,12 @@ from fastapi.testclient import TestClient
 from dressage.proxy.rebalancing import EngineRebalancer, EngineRebalancingConfig
 from dressage.proxy.rebalancing._batch_milp import BatchSolution, SolverStatus
 from dressage.proxy.rebalancing.cache_hit_estimator import (
-    CacheHitEstimator,
     CacheSource,
     ContextRecoveryEstimate,
     context_bucket,
     longest_common_prefix_length,
 )
-from dressage.proxy.rebalancing.context_recovery_model import (
-    ContextRecoveryModel,
-    PerformanceHistory,
-)
+from dressage.proxy.rebalancing.context_recovery_model import PerformanceHistory
 from dressage.proxy.rebalancing.model_cache_profile import ModelCacheProfile
 from dressage.proxy.rebalancing.scheduler import (
     EngineDeploymentInfo,
@@ -491,78 +487,8 @@ def test_qwen35_cache_profile_regression_uses_one_tail_state_slot():
     assert profile.estimate_bytes(56 * 1024) == 1_930_559_488
 
 
-def test_cache_hit_estimator_uses_lcp_and_cold_start():
-    estimator = CacheHitEstimator(min_samples=2, cold_start_probability=0.1)
+def test_longest_common_prefix_length():
     assert longest_common_prefix_length([1, 2, 3], [1, 2, 9]) == 2
-    assert (
-        estimator.estimate_probability(
-            fingerprint="fp",
-            engine_url="worker",
-            cache_source=CacheSource.MOONCAKE,
-            context_tokens=100,
-        )
-        == 0.1
-    )
-    assert (
-        estimator.estimate_probability(
-            fingerprint="fp",
-            engine_url="worker",
-            cache_source=CacheSource.NONE,
-            context_tokens=100,
-        )
-        == 0.0
-    )
-    assert (
-        estimator.estimate_probability(
-            fingerprint="fp",
-            engine_url="worker",
-            cache_source=CacheSource.LOCAL,
-            context_tokens=100,
-        )
-        == 1.0
-    )
-
-
-def test_default_mooncake_prior_switches_to_observed_p25_at_16_samples():
-    config = EngineRebalancingConfig()
-    estimator = CacheHitEstimator(
-        history_size=config.history_size,
-        min_samples=config.min_samples,
-        cold_start_probability=config.cold_start_hit_probability,
-    )
-
-    def probability(source: CacheSource) -> float:
-        return estimator.estimate_probability(
-            fingerprint="fp",
-            engine_url="worker",
-            cache_source=source,
-            context_tokens=100,
-        )
-
-    assert probability(CacheSource.NONE) == 0.0
-    assert probability(CacheSource.LOCAL) == 1.0
-    assert probability(CacheSource.MOONCAKE) == 1.0
-
-    for _ in range(15):
-        estimator.observe(
-            fingerprint="fp",
-            engine_url="worker",
-            cache_source=CacheSource.MOONCAKE,
-            estimated_base_tokens=100,
-            actual_cached_tokens=50,
-            context_tokens=100,
-        )
-    assert probability(CacheSource.MOONCAKE) == 1.0
-
-    estimator.observe(
-        fingerprint="fp",
-        engine_url="worker",
-        cache_source=CacheSource.MOONCAKE,
-        estimated_base_tokens=100,
-        actual_cached_tokens=50,
-        context_tokens=100,
-    )
-    assert probability(CacheSource.MOONCAKE) == 0.5
 
 
 def test_group_remaining_length_uses_group_then_task_history():
@@ -625,66 +551,6 @@ def test_old_sglang_versions_are_not_rebalancing_compatible():
     assert sglang_rebalancing_supported("0.5.16")
 
 
-def test_context_model_none_is_full_prefill():
-    performance = PerformanceHistory(min_samples=1)
-    performance.observe(
-        fingerprint="fp",
-        engine_url="worker",
-        running=1,
-        context_tokens=100,
-        queue_seconds=0,
-        context_seconds=2,
-        cached_tokens=0,
-        output_tokens=1,
-        decode_throughput=10,
-    )
-    estimate = ContextRecoveryModel(performance).estimate(
-        fingerprint="fp",
-        engine_url="worker",
-        cache_source=CacheSource.NONE,
-        context_tokens=100,
-        base_tokens=80,
-        hit_probability=0.9,
-        restore_seconds=None,
-    )
-    assert estimate is not None
-    assert estimate.cache_source is CacheSource.NONE
-    assert estimate.expected_cached_tokens == 0
-    assert estimate.expected_prefill_tokens == 100
-    assert estimate.estimated_seconds == 2.0
-
-
-def test_context_model_mooncake_is_expected_restore_plus_prefill():
-    performance = PerformanceHistory(min_samples=1)
-    performance.observe(
-        fingerprint="fp",
-        engine_url="worker",
-        running=1,
-        context_tokens=100,
-        queue_seconds=0,
-        context_seconds=2,
-        cached_tokens=0,
-        output_tokens=1,
-        decode_throughput=10,
-        cache_source=CacheSource.NONE,
-    )
-    estimate = ContextRecoveryModel(performance).estimate(
-        fingerprint="fp",
-        engine_url="worker",
-        cache_source=CacheSource.MOONCAKE,
-        context_tokens=100,
-        base_tokens=80,
-        hit_probability=0.5,
-        restore_seconds=1.0,
-    )
-    assert estimate is not None
-    assert estimate.cache_source is CacheSource.MOONCAKE
-    assert estimate.expected_cached_tokens == 40
-    assert estimate.expected_prefill_tokens == 60
-    # hit: 1.0 restore + 20 / 50 prefill; miss: 100 / 50 prefill.
-    assert estimate.estimated_seconds == 1.7
-
-
 def test_missing_sglang_queue_timing_does_not_make_models_ready():
     performance = PerformanceHistory(min_samples=1)
     performance.observe(
@@ -729,14 +595,6 @@ def test_default_queue_and_prefill_models_become_ready_at_16_samples():
     assert not performance.queue_ready("fp")
     assert not performance.prefill_ready("fp")
     assert (
-        performance.queue_seconds(
-            fingerprint="fp",
-            engine_url="worker",
-            projected_running=1,
-        )
-        is None
-    )
-    assert (
         performance.prefill_throughput(
             fingerprint="fp",
             engine_url="worker",
@@ -749,156 +607,12 @@ def test_default_queue_and_prefill_models_become_ready_at_16_samples():
     assert performance.queue_ready("fp")
     assert performance.prefill_ready("fp")
     assert (
-        performance.queue_seconds(
-            fingerprint="fp",
-            engine_url="worker",
-            projected_running=1,
-        )
-        == 0.5
-    )
-    assert (
         performance.prefill_throughput(
             fingerprint="fp",
             engine_url="worker",
             context_tokens=100,
         )
         == 100.0
-    )
-
-
-def test_queue_prediction_error_uses_p90_and_homogeneous_pool_fallback():
-    history = PerformanceHistory(history_size=8, min_samples=2)
-    for actual, predicted in ((1.0, 0.0), (5.0, 1.0)):
-        history.observe(
-            fingerprint="fp",
-            engine_url="engine-a",
-            running=3,
-            projected_load_score=0.6,
-            context_tokens=100,
-            queue_seconds=actual,
-            predicted_queue_seconds=predicted,
-            context_seconds=1.0,
-            cached_tokens=0,
-            output_tokens=1,
-            decode_throughput=10,
-        )
-
-    # P90 of the two absolute errors (1s and 4s) is 4s. Engine B has no
-    # samples of its own, so it uses the compatible-pool history.
-    assert (
-        history.queue_risk_seconds(
-            fingerprint="fp",
-            engine_url="engine-a",
-            projected_running=3,
-            projected_load_score=0.6,
-        )
-        == 4.0
-    )
-    assert (
-        history.queue_risk_seconds(
-            fingerprint="fp",
-            engine_url="engine-b",
-            projected_running=3,
-            projected_load_score=0.6,
-        )
-        == 4.0
-    )
-
-    samples_before = history.snapshot()["queue_error_samples"]
-    history.observe(
-        fingerprint="fp",
-        engine_url="engine-a",
-        running=3,
-        projected_load_score=0.6,
-        context_tokens=100,
-        queue_seconds=2.0,
-        predicted_queue_seconds=None,
-        context_seconds=1.0,
-        cached_tokens=0,
-        output_tokens=1,
-        decode_throughput=10,
-    )
-    assert history.snapshot()["queue_error_samples"] == samples_before
-
-
-def test_context_prediction_risk_waits_for_minimum_samples():
-    history = PerformanceHistory(history_size=8, min_samples=2)
-    history.observe(
-        fingerprint="fp",
-        engine_url="engine-a",
-        running=1,
-        context_tokens=100,
-        queue_seconds=0.0,
-        context_seconds=1.0,
-        cached_tokens=0,
-        output_tokens=1,
-        decode_throughput=10,
-        estimated_context_seconds=3.0,
-        cache_source=CacheSource.NONE,
-    )
-    assert (
-        history.risk_seconds(
-            fingerprint="fp",
-            source=CacheSource.NONE,
-            context_tokens=100,
-            minimum_seconds=0.0,
-        )
-        == 0.0
-    )
-
-    history.observe(
-        fingerprint="fp",
-        engine_url="engine-a",
-        running=1,
-        context_tokens=100,
-        queue_seconds=0.0,
-        context_seconds=1.0,
-        cached_tokens=0,
-        output_tokens=1,
-        decode_throughput=10,
-        estimated_context_seconds=4.0,
-        cache_source=CacheSource.NONE,
-    )
-    assert (
-        history.risk_seconds(
-            fingerprint="fp",
-            source=CacheSource.NONE,
-            context_tokens=100,
-            minimum_seconds=0.0,
-        )
-        == 3.0
-    )
-
-
-def test_tpot_history_is_partitioned_by_engine_load_bucket():
-    history = PerformanceHistory(history_size=8, min_samples=1)
-    for engine, running, throughput in (("a", 1, 10.0), ("b", 8, 5.0)):
-        history.observe(
-            fingerprint="fp",
-            engine_url=engine,
-            running=running,
-            context_tokens=100,
-            queue_seconds=0.0,
-            context_seconds=1.0,
-            cached_tokens=0,
-            output_tokens=10,
-            decode_throughput=throughput,
-        )
-    assert (
-        history.tpot_seconds(
-            fingerprint="fp",
-            engine_url="a",
-            projected_running=1,
-        )
-        == 0.1
-    )
-    assert (
-        history.tpot_seconds(
-            fingerprint="fp",
-            engine_url="b",
-            projected_running=8,
-        )
-        == 0.2
     )
 
 
@@ -973,39 +687,6 @@ def test_calibration_plan_matches_host_tcp_rdma_and_gpudirect_paths():
     )
     assert {task.link_type for task in gpudirect_plan.tasks} == {"mooncake_gpudirect"}
     assert gpudirect_plan.skipped_links["h2d"] == "GPUDirect restore path"
-
-
-def test_transfer_estimate_uses_complete_p75_without_bandwidth_double_count():
-    calibrator = TransferCalibrator()
-    for payload, elapsed in ((100, 1.0), (200, 3.0)):
-        calibrator.observe(
-            source_node="a",
-            target_node="b",
-            link_type="mooncake_tcp",
-            payload_bytes=payload,
-            elapsed_seconds_p75=elapsed,
-            bandwidth_bytes_per_second_p25=1.0,
-        )
-    # 150 bytes uses the 200-byte upper bucket. A nearest lower bucket plus
-    # bytes/BW would produce a much larger and incorrect value.
-    assert (
-        calibrator.estimate(
-            source_node="a",
-            target_node="b",
-            required_links=("mooncake_tcp",),
-            payload_bytes=150,
-        )
-        == 3.0
-    )
-    assert (
-        calibrator.estimate(
-            source_node="a",
-            target_node="b",
-            required_links=("mooncake_tcp",),
-            payload_bytes=400,
-        )
-        == 6.0
-    )
 
 
 def test_calibration_releases_task_buffers_after_sample_failures():
@@ -1744,8 +1425,17 @@ def test_step_after_fetch_completion_waits_for_previous_batch_commit(monkeypatch
         )
         client.resolve_batch(1)
         second = await second_task
+        traces = (await rebalancer.snapshot())["recent_load_batches"]
+        second_trace = next(
+            trace for trace in traces if trace["batch"]["id"] == second.batch_id
+        )
 
         assert second.batch_id == first.batch_id + 1
+        assert second_trace["batch"]["collect_seconds"] >= (
+            second_trace["batch"]["wait_for_previous_seconds"]
+            + second_trace["batch"]["fetch_seconds"]
+            - 1e-6
+        )
         await rebalancer.fail(first)
         await rebalancer.fail(second)
 
@@ -2244,6 +1934,7 @@ def test_batch_collect_time_stops_at_atomic_seal(monkeypatch):
         lease = await task
         trace = (await rebalancer.snapshot())["recent_load_batches"][-1]
 
+        assert trace["batch"]["collect_seconds"] >= trace["batch"]["fetch_seconds"]
         assert trace["batch"]["collect_seconds"] < 0.04
         assert trace["batch"]["total_seconds"] >= 0.09
         await rebalancer.fail(lease)
@@ -3397,7 +3088,6 @@ def test_existing_session_uses_two_level_backlog_threshold(
             fingerprint=fingerprint,
             previous_committed_tokens=[1] * 100,
             seen_engines={source},
-            owner_turns=2,
         )
 
         lease = await rebalancer.acquire(
@@ -3454,7 +3144,6 @@ def test_existing_session_selects_lowest_load_target_with_backlog_advantage():
             fingerprint=fingerprint,
             previous_committed_tokens=[1] * 100,
             seen_engines={source},
-            owner_turns=2,
         )
 
         lease = await rebalancer.acquire(
@@ -3507,7 +3196,6 @@ def test_existing_session_selects_lowest_load_target_without_backlog_advantage()
             fingerprint=fingerprint,
             previous_committed_tokens=[1] * 100,
             seen_engines={source},
-            owner_turns=2,
         )
 
         lease = await rebalancer.acquire(
@@ -3578,7 +3266,6 @@ def test_existing_session_uses_base_load_improvement_threshold(
             fingerprint=fingerprint,
             previous_committed_tokens=[1] * 100,
             seen_engines={source, target},
-            owner_turns=2,
         )
 
         lease = await rebalancer.acquire(
@@ -3603,29 +3290,17 @@ def test_existing_session_uses_base_load_improvement_threshold(
 
 
 @pytest.mark.parametrize(
-    (
-        "min_hold_turns",
-        "target_running",
-        "owner_turns",
-        "expected_worker",
-        "expected_reason",
-        "required",
-    ),
+    ("min_hold_turns", "target_running"),
     [
-        (1, 50, 1, "source", "return_hysteresis_below_threshold", 0.60),
-        (1, 40, 1, "target", "load_improvement_threshold_met", 0.60),
-        (2, 50, 2, "source", "return_hysteresis_below_threshold", 0.60),
-        (2, 40, 2, "target", "load_improvement_threshold_met", 0.60),
-        (2, 50, 3, "target", "load_improvement_threshold_met", 0.30),
+        (1, 50),
+        (1, 40),
+        (2, 50),
+        (2, 40),
+        (3, 50),
     ],
 )
-def test_previous_owner_uses_double_threshold_only_for_first_step(
-    min_hold_turns,
-    target_running,
-    owner_turns,
-    expected_worker,
-    expected_reason,
-    required,
+def test_batch_gate_ignores_legacy_hold_configuration(
+    min_hold_turns, target_running
 ):
     client = ControlPlaneClient(shared_l3=True)
 
@@ -3658,11 +3333,9 @@ def test_previous_owner_uses_double_threshold_only_for_first_step(
         fingerprint = rebalancer.deployments[source].cache_fingerprint
         rebalancer.sessions["return"] = SessionRoutingState(
             owner_worker_url=source,
-            previous_owner_worker_url=target,
             fingerprint=fingerprint,
             previous_committed_tokens=[1] * 100,
             seen_engines={source, target},
-            owner_turns=owner_turns,
         )
 
         lease = await rebalancer.acquire(
@@ -3682,7 +3355,7 @@ def test_previous_owner_uses_double_threshold_only_for_first_step(
     run(scenario())
 
 
-def test_no_backlog_and_previous_owner_share_one_double_threshold():
+def test_batch_gate_uses_configured_ratio_without_previous_owner_state():
     client = ControlPlaneClient(shared_l3=True)
 
     async def benchmark(task, payload):
@@ -3713,11 +3386,9 @@ def test_no_backlog_and_previous_owner_share_one_double_threshold():
         fingerprint = rebalancer.deployments[source].cache_fingerprint
         rebalancer.sessions["no-backlog-return"] = SessionRoutingState(
             owner_worker_url=source,
-            previous_owner_worker_url=previous_owner,
             fingerprint=fingerprint,
             previous_committed_tokens=[1] * 100,
             seen_engines={source, previous_owner},
-            owner_turns=2,
         )
 
         lease = await rebalancer.acquire(
@@ -3737,7 +3408,7 @@ def test_no_backlog_and_previous_owner_share_one_double_threshold():
     run(scenario())
 
 
-def test_min_hold_turns_blocks_otherwise_beneficial_migration():
+def test_min_hold_turns_does_not_restrict_batch_migration_edges():
     client = ControlPlaneClient(shared_l3=True)
 
     async def benchmark(task, payload):
@@ -3767,7 +3438,6 @@ def test_min_hold_turns_blocks_otherwise_beneficial_migration():
             fingerprint=fingerprint,
             previous_committed_tokens=[1] * 100,
             seen_engines={source},
-            owner_turns=1,
         )
 
         lease = await rebalancer.acquire(
@@ -3787,7 +3457,7 @@ def test_min_hold_turns_blocks_otherwise_beneficial_migration():
     run(scenario())
 
 
-def test_default_hold_blocks_next_hop_until_second_owner_turn():
+def test_consecutive_batch_steps_keep_session_state_consistent():
     client = ControlPlaneClient(shared_l3=True)
     client.urls.append("http://node-c:30000")
 
@@ -3816,11 +3486,9 @@ def test_default_hold_blocks_next_hop_until_second_owner_turn():
         fingerprint = rebalancer.deployments[source].cache_fingerprint
         rebalancer.sessions["multi-hop"] = SessionRoutingState(
             owner_worker_url=source,
-            previous_owner_worker_url=previous_owner,
             fingerprint=fingerprint,
             previous_committed_tokens=[1] * 100,
             seen_engines={previous_owner, source},
-            owner_turns=1,
         )
 
         sticky = await rebalancer.acquire(
@@ -3843,7 +3511,10 @@ def test_default_hold_blocks_next_hop_until_second_owner_turn():
             output_tokens=1,
             committed_tokens=[1] * 100,
         )
-        assert rebalancer.sessions["multi-hop"].owner_turns == 2
+        state = rebalancer.sessions["multi-hop"]
+        assert state.owner_worker_url == sticky.worker_url
+        assert state.pending_owner_worker_url is None
+        assert state.previous_committed_tokens == [1] * 100
 
         movable = await rebalancer.acquire(
             session_id="multi-hop",
@@ -3881,7 +3552,6 @@ def test_seen_engine_without_shared_l3_is_not_a_migration_target():
             fingerprint=fingerprint,
             previous_committed_tokens=[1] * 100,
             seen_engines={source, target},
-            owner_turns=2,
         )
         session = rebalancer.sessions["seen-no-l3"]
         assert (
@@ -3941,7 +3611,6 @@ def test_existing_session_rejects_move_when_projected_target_is_busier():
             fingerprint=fingerprint,
             previous_committed_tokens=[1] * 150,
             seen_engines={source},
-            owner_turns=2,
         )
 
         lease = await rebalancer.acquire(
@@ -4293,7 +3962,6 @@ def test_live_reservation_ledger_uses_distinct_ids_and_aggregates_engine_load():
         assert leases[0].reservation_id is not None
         assert leases[0].reservation_id != leases[1].reservation_id
         assert leases[0].batch_id == 7
-        assert rebalancer._reservations[leases[0].reservation_id].batch_id == 7
         assert set(rebalancer._reservations) == {
             leases[0].reservation_id,
             leases[1].reservation_id,
@@ -4640,7 +4308,6 @@ def test_active_scheduler_routes_from_load_without_prediction_history():
             fingerprint=fingerprint,
             previous_committed_tokens=[1] * 80,
             seen_engines={source},
-            owner_turns=2,
         )
         lease = await rebalancer.acquire(
             session_id="session",
@@ -4716,7 +4383,6 @@ def test_prefill_pressure_can_prevent_load_ratio_migration():
             fingerprint=fingerprint,
             previous_committed_tokens=[1] * 80,
             seen_engines={source},
-            owner_turns=2,
         )
 
         lease = await rebalancer.acquire(
@@ -4790,7 +4456,6 @@ def test_mooncake_prior_does_not_affect_load_routing():
         rebalancer: EngineRebalancer,
         *,
         session_id: str,
-        owner_turns: int,
     ) -> RoutingDecision:
         source = rebalancer.client.urls[0]
         fingerprint = rebalancer.deployments[source].cache_fingerprint
@@ -4799,7 +4464,6 @@ def test_mooncake_prior_does_not_affect_load_routing():
             fingerprint=fingerprint,
             previous_committed_tokens=[1] * 80,
             seen_engines={source},
-            owner_turns=owner_turns,
         )
         lease = await rebalancer.acquire(
             session_id=session_id,
@@ -4817,22 +4481,14 @@ def test_mooncake_prior_does_not_affect_load_routing():
         conservative_decision = await decide(
             conservative,
             session_id="conservative",
-            owner_turns=2,
-        )
-        held_decision = await decide(
-            default,
-            session_id="held",
-            owner_turns=1,
         )
         default_decision = await decide(
             default,
             session_id="default",
-            owner_turns=2,
         )
 
         for decision in (
             conservative_decision,
-            held_decision,
             default_decision,
         ):
             assert decision.moved is True
@@ -4891,7 +4547,6 @@ def test_prediction_history_cannot_bypass_missing_l3_path():
             fingerprint=fingerprint,
             previous_committed_tokens=[],
             seen_engines={source},
-            owner_turns=2,
         )
 
         lease = await rebalancer.acquire(
@@ -4944,7 +4599,6 @@ def test_owner_failure_uses_projected_load_without_threshold():
             fingerprint=fingerprint,
             previous_committed_tokens=[1] * 80,
             seen_engines={source},
-            owner_turns=2,
         )
 
         lease = await rebalancer.acquire(
@@ -5014,7 +4668,6 @@ def test_load_routing_keeps_single_step_budget_for_reservation():
             fingerprint=fingerprint,
             previous_committed_tokens=[1] * 80,
             seen_engines={source},
-            owner_turns=2,
         )
         lease = await rebalancer.acquire(
             session_id="heterogeneous",
@@ -5104,7 +4757,6 @@ def test_prediction_risks_do_not_block_load_ratio_migration():
             fingerprint=fingerprint,
             previous_committed_tokens=[1] * 80,
             seen_engines={source},
-            owner_turns=2,
         )
 
         lease = await rebalancer.acquire(

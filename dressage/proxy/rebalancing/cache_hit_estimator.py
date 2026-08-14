@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from enum import Enum
@@ -31,12 +30,6 @@ class CacheObservation:
     estimated_base_tokens: int
     actual_cached_tokens: int
     context_tokens: int
-
-    @property
-    def hit_ratio(self) -> float:
-        if self.estimated_base_tokens <= 0:
-            return 0.0
-        return min(1.0, self.actual_cached_tokens / self.estimated_base_tokens)
 
 
 def longest_common_prefix_length(left: list[int], right: list[int]) -> int:
@@ -77,37 +70,6 @@ class CacheHitEstimator:
         self._pool_history: dict[
             tuple[str, CacheSource, str], Deque[CacheObservation]
         ] = defaultdict(lambda: deque(maxlen=self.history_size))
-
-    def estimate_probability(
-        self,
-        *,
-        fingerprint: str,
-        engine_url: str,
-        cache_source: CacheSource,
-        context_tokens: int,
-    ) -> float:
-        if cache_source is CacheSource.NONE:
-            return 0.0
-        bucket = context_bucket(context_tokens)
-        samples = list(self._history[(fingerprint, engine_url, cache_source, bucket)])
-        if len(samples) < self.min_samples:
-            samples = list(self._pool_history[(fingerprint, cache_source, bucket)])
-        if len(samples) < self.min_samples:
-            # A sticky owner is expected to retain its just-committed prefix.
-            # The configured cold-start probability is specifically for an
-            # unobserved shared-L3 restore path.
-            return (
-                1.0
-                if cache_source is CacheSource.LOCAL
-                else self.cold_start_probability
-            )
-
-        # Use a conservative lower quartile of observed reusable-prefix ratios.
-        # This naturally represents both complete and shorter native SGLang hits
-        # without the Proxy assigning semantic meaning to either case.
-        ratios = sorted(sample.hit_ratio for sample in samples)
-        index = max(0, math.ceil(0.25 * len(ratios)) - 1)
-        return max(0.0, min(1.0, ratios[index]))
 
     def observe(
         self,

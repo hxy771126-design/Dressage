@@ -326,6 +326,10 @@ in-memory trace containing batch membership, normalized Engine inputs, solver
 outcomes, the adopted plan, and per-step reservation deltas. The trace excludes
 token IDs, prompt text, raw `/v1/loads` responses, server-info payloads, and
 exception tracebacks; it is observation-only and never feeds routing decisions.
+`collect_seconds` measures the full wall-clock interval from batch creation to
+its atomic seal. `wait_for_previous_seconds` and `fetch_seconds` are overlapping
+subintervals of that open window, so these values must not be added together or
+summed with `total_seconds`.
 
 An advanced deployment JSON can be supplied through
 `DRESSAGE_ENGINE_REBALANCING_DEPLOYMENT_CONFIG`; it is not a CLI switch. The
