@@ -2756,8 +2756,8 @@ def parse_args() -> argparse.Namespace:
         type=_unit_interval_float,
         default=0.10,
         help=(
-            "Minimum relative base-load improvement required for a voluntary "
-            "cross-Engine session migration."
+            "Required relative maximum-load reduction imposed on voluntary "
+            "cross-Engine batch optimization."
         ),
     )
     parser.add_argument(

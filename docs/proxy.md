@@ -305,14 +305,19 @@ deadline:
    jointly placing new sessions and mandatory failovers.
 2. An optimized model additionally opens compatible voluntary migration edges.
 
-Both models first minimize the maximum normalized Engine pressure, then use a
-stable hash to break ties within the optimum.
-The optimized plan is adopted only when its maximum-pressure improvement reaches
-`--engine-rebalancing-min-load-improvement-ratio`; otherwise the sticky plan is
-committed. Solver failure or a stale frozen state falls back to a deterministic
-sticky greedy assignment. Fingerprint, weight-version, Mooncake readiness, and
-step capability checks still define migration eligibility. Mandatory failover
-does not depend on Mooncake readiness or the voluntary-migration gate.
+The sticky model minimizes the maximum normalized Engine pressure, then uses a
+stable hash to break ties. Its optimum defines the optimized model's required
+maximum pressure as `sticky * (1 - min-load-improvement-ratio)`. Within that
+hard target the optimized model first minimizes the total logical KV tokens on
+voluntary migration edges, then minimizes maximum pressure and finally uses the
+stable hash. The per-edge KV cost is the longest common prefix between the last
+committed tokens and the current input; it estimates reusable logical KV, not
+physical transfer bytes. New sessions, owner stays, and mandatory failovers have
+zero optimization cost. An infeasible target, solver deadline, solver failure,
+or stale frozen state falls back to the sticky assignment. Fingerprint,
+weight-version, Mooncake readiness, and step capability checks still define
+migration eligibility. Mandatory failover is never blocked by the voluntary
+migration target or cost.
 
 Every committed lease owns a uniquely identified live reservation. Completion,
 failure, and cancellation release it idempotently; a later complete load
@@ -323,9 +328,12 @@ and lets SGLang restore or prefill.
 `GET /v1/engines/load` retains its existing fields and adds
 `recent_load_batches`. Each terminal batch contributes exactly one bounded,
 in-memory trace containing batch membership, normalized Engine inputs, solver
-outcomes, the adopted plan, and per-step reservation deltas. The trace excludes
+outcomes, the target maximum pressure, candidate and committed migration costs,
+the adopted plan, and per-step reservation deltas. Solver outcomes also expose
+the minimum pressure and load range recomputed from the selected assignment;
+these are observation-only and do not affect optimization. The trace excludes
 token IDs, prompt text, raw `/v1/loads` responses, server-info payloads, and
-exception tracebacks; it is observation-only and never feeds routing decisions.
+exception tracebacks; it never feeds routing decisions.
 `collect_seconds` measures the full wall-clock interval from batch creation to
 its atomic seal. `wait_for_previous_seconds` and `fetch_seconds` are overlapping
 subintervals of that open window, so these values must not be added together or

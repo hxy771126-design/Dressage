@@ -19,7 +19,11 @@ import pytest
 from fastapi.testclient import TestClient
 
 from dressage.proxy.rebalancing import EngineRebalancer, EngineRebalancingConfig
-from dressage.proxy.rebalancing._batch_milp import BatchSolution, SolverStatus
+from dressage.proxy.rebalancing._batch_milp import (
+    BatchSolution,
+    BatchSolverError,
+    SolverStatus,
+)
 from dressage.proxy.rebalancing.cache_hit_estimator import (
     CacheSource,
     ContextRecoveryEstimate,
@@ -1817,7 +1821,7 @@ def test_batch_commit_revalidation_rejects_lost_mooncake_migration_only(
         client,
         config=EngineRebalancingConfig(
             enabled=True,
-            min_load_improvement_ratio=0.0,
+            min_load_improvement_ratio=0.10,
         ),
         model_id="model",
         model_config=simple_model_config(),
@@ -1855,7 +1859,14 @@ def test_batch_commit_revalidation_rejects_lost_mooncake_migration_only(
             nonlocal mooncake_ready
             solved = original_solve(frozen)
             mooncake_ready = False
-            return solved
+            return replace(
+                solved,
+                assignment=(
+                    ("readiness-lost", target),
+                    ("readiness-safe", target),
+                ),
+                adopted="optimized",
+            )
 
         monkeypatch.setattr(
             rebalancer,
@@ -1878,7 +1889,7 @@ def test_batch_commit_revalidation_rejects_lost_mooncake_migration_only(
         await wait_for_condition(
             lambda: sum(client.batch_load_calls.values()) == len(client.urls)
         )
-        client.resolve_url(source, 0, running=80)
+        client.resolve_url(source, 0, running=1)
         client.resolve_url(target, 0, running=0)
         migration_result, safe_result = await asyncio.gather(
             migration,
@@ -1990,61 +2001,81 @@ def test_batch_success_trace_is_not_republished_by_late_runner_failure(
     run(scenario())
 
 
-@pytest.mark.parametrize(
-    ("sticky_j", "optimized_j", "required", "expected_plan"),
-    [
-        (1.0, 0.86, 0.15, "sticky"),
-        (1.0, 0.85, 0.15, "optimized"),
-        (1.0, 0.81, 0.20, "sticky"),
-        (1.0, 0.80, 0.20, "optimized"),
-        (0.0, 0.0, 0.20, "sticky"),
-    ],
-)
-def test_batch_optimized_gate_uses_shared_solution_objectives(
-    monkeypatch, sticky_j, optimized_j, required, expected_plan
-):
+def test_batch_target_solver_receives_hard_limit_and_lcp_cost(monkeypatch):
     client = ControlledBatchLoadClient()
     rebalancer = EngineRebalancer(
         client,
         config=EngineRebalancingConfig(
             enabled=True,
-            min_load_improvement_ratio=required,
+            min_load_improvement_ratio=0.20,
         ),
         model_id="model",
         model_config=simple_model_config(),
     )
+    captured = {}
 
-    calls = 0
-
-    def controlled_solver(problem, deadline_seconds=1.0):
-        nonlocal calls
+    def sticky_solver(problem, deadline_seconds=1.0):
         del deadline_seconds
-        calls += 1
-        assignment = {
-            session_id: edges[-1].engine_url
-            for session_id, edges in problem.edges_by_session.items()
-        }
         return BatchSolution(
             status=SolverStatus.OPTIMAL,
-            assignment=assignment,
-            maximum_load=sticky_j if calls == 1 else optimized_j,
-            voluntary_migrations=0 if calls == 1 else 1,
+            assignment={
+                session_id: edges[0].engine_url
+                for session_id, edges in problem.edges_by_session.items()
+            },
+            maximum_load=1.0,
+            minimum_load=0.2,
+            load_range=0.8,
+            total_migration_cost_tokens=0,
+            voluntary_migrations=0,
             elapsed_seconds=0.01,
         )
 
+    def target_solver(
+        problem,
+        *,
+        maximum_load_limit,
+        deadline_seconds,
+    ):
+        del deadline_seconds
+        captured["limit"] = maximum_load_limit
+        captured["costs"] = {
+            edge.engine_url: edge.migration_cost_tokens
+            for edge in problem.edges_by_session["target"]
+        }
+        source, target = client.urls
+        return BatchSolution(
+            status=SolverStatus.OPTIMAL,
+            assignment={"target": target},
+            maximum_load=0.8,
+            minimum_load=0.4,
+            load_range=0.4,
+            total_migration_cost_tokens=7,
+            voluntary_migrations=1,
+            elapsed_seconds=0.01,
+        )
+
+    import dressage.proxy.rebalancing.scheduler as scheduler_module
+
     monkeypatch.setattr(
-        "dressage.proxy.rebalancing.scheduler.solve_batch_milp",
-        controlled_solver,
+        scheduler_module,
+        "solve_batch_milp",
+        sticky_solver,
+    )
+    monkeypatch.setattr(
+        scheduler_module,
+        "solve_batch_for_target_load",
+        target_solver,
+        raising=False,
     )
 
     async def scenario():
         await rebalancer.refresh()
         source, target = client.urls
         fingerprint = rebalancer.deployments[source].cache_fingerprint
-        rebalancer.sessions["gate"] = SessionRoutingState(
+        rebalancer.sessions["target"] = SessionRoutingState(
             owner_worker_url=source,
             fingerprint=fingerprint,
-            previous_committed_tokens=[1] * 10,
+            previous_committed_tokens=[1] * 7,
             seen_engines={source},
         )
         monkeypatch.setattr(
@@ -2060,7 +2091,10 @@ def test_batch_optimized_gate_uses_shared_solution_objectives(
         )
         client.control_batch_loads()
         task = asyncio.create_task(
-            rebalancer.acquire(session_id="gate", input_ids=[1] * 10)
+            rebalancer.acquire(
+                session_id="target",
+                input_ids=[1] * 7 + [2] * 3,
+            )
         )
         await wait_for_condition(
             lambda: sum(client.batch_load_calls.values()) == len(client.urls)
@@ -2069,8 +2103,37 @@ def test_batch_optimized_gate_uses_shared_solution_objectives(
         lease = await task
         trace = (await rebalancer.snapshot())["recent_load_batches"][-1]
 
-        assert trace["adopted_plan"] == expected_plan
-        assert calls == 2
+        assert lease.worker_url == target
+        assert captured == {
+            "limit": pytest.approx(0.8),
+            "costs": {source: 0, target: 7},
+        }
+        assert trace["adopted_plan"] == "optimized"
+        assert trace["improvement_ratio"] == pytest.approx(0.2)
+        assert trace["target_maximum_load"] == pytest.approx(0.8)
+        assert trace["sticky"] == {
+            "status": "optimal",
+            "maximum_load": 1.0,
+            "minimum_load": 0.2,
+            "load_range": 0.8,
+            "migration_cost_tokens": 0,
+            "migrations": 0,
+            "elapsed_seconds": 0.01,
+        }
+        assert trace["optimized"] == {
+            "status": "optimal",
+            "maximum_load": 0.8,
+            "minimum_load": 0.4,
+            "load_range": 0.4,
+            "migration_cost_tokens": 7,
+            "migrations": 1,
+            "elapsed_seconds": 0.01,
+        }
+        assert trace["steps"][0]["candidate_migration_cost_tokens"] == {
+            source: 0,
+            target: 7,
+        }
+        assert trace["steps"][0]["migration_cost_tokens"] == 7
         await rebalancer.fail(lease)
 
     run(scenario())
@@ -2091,7 +2154,7 @@ def test_batch_healthy_owner_only_voluntarily_migrates_over_mooncake(
         client,
         config=EngineRebalancingConfig(
             enabled=True,
-            min_load_improvement_ratio=0.0,
+            min_load_improvement_ratio=0.10,
         ),
         model_id="model",
         model_config=simple_model_config(),
@@ -2125,7 +2188,7 @@ def test_batch_healthy_owner_only_voluntarily_migrates_over_mooncake(
         await wait_for_condition(
             lambda: sum(client.batch_load_calls.values()) == len(client.urls)
         )
-        client.resolve_url(source, 0, running=80)
+        client.resolve_url(source, 0, running=1)
         client.resolve_url(target, 0, running=0)
         lease = await task
 
@@ -2133,6 +2196,63 @@ def test_batch_healthy_owner_only_voluntarily_migrates_over_mooncake(
             expected_worker
         ]
         assert lease.decision.reason == expected_reason
+        await rebalancer.fail(lease)
+
+    run(scenario())
+
+
+def test_batch_zero_lcp_migration_has_zero_kv_cost(monkeypatch):
+    client = ControlledBatchLoadClient()
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(
+            enabled=True,
+            min_load_improvement_ratio=0.10,
+        ),
+        model_id="model",
+        model_config=simple_model_config(),
+    )
+
+    async def scenario():
+        await rebalancer.refresh()
+        source, target = client.urls
+        fingerprint = rebalancer.deployments[source].cache_fingerprint
+        rebalancer.sessions["zero-lcp"] = SessionRoutingState(
+            owner_worker_url=source,
+            fingerprint=fingerprint,
+            previous_committed_tokens=[9] * 10,
+            seen_engines={source},
+        )
+        monkeypatch.setattr(
+            rebalancer,
+            "_candidate_path_readiness",
+            lambda *args: ContextPathReadiness(
+                source,
+                target,
+                CacheSource.MOONCAKE,
+                True,
+                True,
+            ),
+        )
+        client.control_batch_loads()
+        task = asyncio.create_task(
+            rebalancer.acquire(session_id="zero-lcp", input_ids=[1] * 10)
+        )
+        await wait_for_condition(
+            lambda: sum(client.batch_load_calls.values()) == len(client.urls)
+        )
+        client.resolve_url(source, 0, running=1)
+        client.resolve_url(target, 0, running=0)
+        lease = await task
+        trace = (await rebalancer.snapshot())["recent_load_batches"][-1]
+
+        assert lease.worker_url == target
+        assert trace["steps"][0]["candidate_migration_cost_tokens"] == {
+            source: 0,
+            target: 0,
+        }
+        assert trace["steps"][0]["migration_cost_tokens"] == 0
+        assert trace["optimized"]["migration_cost_tokens"] == 0
         await rebalancer.fail(lease)
 
     run(scenario())
@@ -2342,7 +2462,20 @@ def test_batch_sticky_solver_exception_uses_stable_greedy_assignment(monkeypatch
     run(scenario())
 
 
-def test_batch_optimized_solver_exception_adopts_sticky_assignment(monkeypatch):
+@pytest.mark.parametrize(
+    ("failure_kind", "expected_reason"),
+    [
+        ("runtime", "target_solver_failure"),
+        (2, "target_load_infeasible"),
+        (1, "target_solver_deadline"),
+        (None, "target_solver_deadline"),
+    ],
+)
+def test_batch_target_solver_failure_adopts_sticky_assignment(
+    monkeypatch,
+    failure_kind,
+    expected_reason,
+):
     client = ControlledBatchLoadClient()
     rebalancer = EngineRebalancer(
         client,
@@ -2353,20 +2486,19 @@ def test_batch_optimized_solver_exception_adopts_sticky_assignment(monkeypatch):
         model_id="model",
         model_config=simple_model_config(),
     )
-    from dressage.proxy.rebalancing.scheduler import solve_batch_milp as real_solver
-
-    calls = 0
-
-    def fail_optimized(problem, deadline_seconds=1.0):
-        nonlocal calls
-        calls += 1
-        if calls == 2:
-            raise RuntimeError("optimized solver boom")
-        return real_solver(problem, deadline_seconds=deadline_seconds)
+    def fail_target(*args, **kwargs):
+        if failure_kind == "runtime":
+            raise RuntimeError("target solver boom")
+        raise BatchSolverError(
+            phase=1,
+            status=failure_kind,
+            elapsed_seconds=0.01,
+            message="target solver boom",
+        )
 
     monkeypatch.setattr(
-        "dressage.proxy.rebalancing.scheduler.solve_batch_milp",
-        fail_optimized,
+        "dressage.proxy.rebalancing.scheduler.solve_batch_for_target_load",
+        fail_target,
     )
 
     async def scenario():
@@ -2405,12 +2537,87 @@ def test_batch_optimized_solver_exception_adopts_sticky_assignment(monkeypatch):
         assert lease.worker_url == source
         assert lease.decision.reason == "batch_sticky"
         assert trace["adopted_plan"] == "sticky"
-        assert trace["fallback_reason"] == "optimized_solver_failure"
+        assert trace["fallback_reason"] == expected_reason
         assert trace["sticky"]["status"] == "optimal"
         assert trace["optimized"] is None
         await rebalancer.fail(lease)
 
     run(scenario())
+
+
+def test_batch_shared_deadline_expires_before_target_solver(monkeypatch):
+    import dressage.proxy.rebalancing.scheduler as scheduler_module
+    from dressage.proxy.rebalancing._batch_milp import (
+        BatchProblem,
+        EngineBaseline,
+        FeasibleEdge,
+    )
+
+    engine = EngineBaseline("source", 0, 0, 0, 100, 100_000, 0, 0)
+    owner = FeasibleEdge("session", "source", 1, 1, 0, False)
+    migration = FeasibleEdge(
+        "session",
+        "target",
+        1,
+        1,
+        1,
+        True,
+        migration_cost_tokens=1,
+    )
+    target_engine = EngineBaseline("target", 0, 0, 0, 100, 100_000, 0, 0)
+    sticky_problem = BatchProblem((engine, target_engine), {"session": (owner,)})
+    optimized_problem = BatchProblem(
+        (engine, target_engine),
+        {"session": (owner, migration)},
+    )
+    sticky = BatchSolution(
+        status=SolverStatus.OPTIMAL,
+        assignment={"session": "source"},
+        maximum_load=1.0,
+        minimum_load=0.0,
+        load_range=1.0,
+        total_migration_cost_tokens=0,
+        voluntary_migrations=0,
+        elapsed_seconds=0.01,
+    )
+    times = iter((0.0, 0.0, 2.0, 2.0))
+    monkeypatch.setattr(
+        scheduler_module,
+        "time",
+        type(
+            "FakeTime",
+            (),
+            {
+                "monotonic": staticmethod(lambda: next(times)),
+                "time": staticmethod(time.time),
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        scheduler_module,
+        "solve_batch_milp",
+        lambda *args, **kwargs: sticky,
+    )
+    rebalancer = EngineRebalancer(
+        ControlledBatchLoadClient(),
+        config=EngineRebalancingConfig(enabled=True),
+        model_id="model",
+        model_config=simple_model_config(),
+    )
+    frozen = scheduler_module._FrozenBatch(
+        reservation_revision=0,
+        topology_signature=(),
+        decision_engines=(),
+        engine_traces=(),
+        steps=(),
+        sticky_problem=sticky_problem,
+        optimized_problem=optimized_problem,
+    )
+
+    solved = rebalancer._solve_frozen_batch(frozen)
+
+    assert solved.adopted == "sticky"
+    assert solved.fallback_reason == "target_solver_deadline"
 
 
 def test_batch_frozen_revision_change_uses_sticky_greedy(monkeypatch):
@@ -2540,6 +2747,8 @@ def test_batch_cancel_before_seal_is_excluded_from_solver_and_ledger(monkeypatch
             "cancelled",
             "committed",
         ]
+        assert trace["steps"][0]["candidate_migration_cost_tokens"] == {}
+        assert trace["steps"][0]["migration_cost_tokens"] == 0
         await rebalancer.fail(lease)
 
     run(scenario())
@@ -4327,7 +4536,9 @@ def test_active_scheduler_routes_from_load_without_prediction_history():
             assert lease.decision.target_base_load is not None
             trace = (await rebalancer.snapshot())["recent_load_batches"][-1]
             assert trace["adopted_plan"] == "sticky"
-            assert trace["improvement_ratio"] < trace["required_ratio"]
+            assert trace["optimized"] is None
+            assert trace["improvement_ratio"] is None
+            assert trace["fallback_reason"] == "target_load_infeasible"
         finally:
             await rebalancer.fail(lease)
 
@@ -4614,6 +4825,10 @@ def test_owner_failure_uses_projected_load_without_threshold():
             assert lease.decision.target_context is None
             assert lease.decision.target_projected_load is not None
             assert lease.decision.required_load_improvement_ratio is None
+            trace = (await rebalancer.snapshot())["recent_load_batches"][-1]
+            step = trace["steps"][0]
+            assert step["candidate_migration_cost_tokens"] == {target: 0}
+            assert step["migration_cost_tokens"] == 0
         finally:
             await rebalancer.fail(lease)
 
@@ -4775,7 +4990,9 @@ def test_prediction_risks_do_not_block_load_ratio_migration():
             assert lease.decision.target_context is None
             trace = (await rebalancer.snapshot())["recent_load_batches"][-1]
             assert trace["adopted_plan"] == "sticky"
-            assert trace["improvement_ratio"] < trace["required_ratio"]
+            assert trace["optimized"] is None
+            assert trace["improvement_ratio"] is None
+            assert trace["fallback_reason"] == "target_load_infeasible"
         finally:
             await rebalancer.fail(lease)
 

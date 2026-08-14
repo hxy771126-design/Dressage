@@ -43,6 +43,7 @@ def edge(
     tokens: float = 0.0,
     prefill: float = 0.0,
     migration: bool = False,
+    migration_cost_tokens: int = 0,
 ):
     return solver_module().FeasibleEdge(
         session_id=session_id,
@@ -51,6 +52,7 @@ def edge(
         token_increment=tokens,
         prefill_increment=prefill,
         voluntary_migration=migration,
+        migration_cost_tokens=migration_cost_tokens,
     )
 
 
@@ -93,6 +95,15 @@ def assignment_objectives(batch, selected_edges):
     )
 
 
+def target_assignment_objectives(batch, selected_edges):
+    maximum_load, tie = assignment_objectives(batch, selected_edges)
+    return (
+        sum(edge.migration_cost_tokens for edge in selected_edges),
+        maximum_load,
+        tie,
+    )
+
+
 def test_milp_balances_hand_derived_request_load():
     batch = problem(
         [engine("a"), engine("b")],
@@ -121,7 +132,8 @@ def test_milp_recomputes_load_with_token_usage_floor():
                 base_prefill=2,
                 token_usage=0.6,
                 queue_pressure=0.05,
-            )
+            ),
+            engine("b", base_requests=1),
         ],
         {
             "s": (
@@ -133,6 +145,8 @@ def test_milp_recomputes_load_with_token_usage_floor():
     result = solver_module().solve_batch_milp(batch)
 
     assert result.maximum_load == pytest.approx(1.15)
+    assert result.minimum_load == pytest.approx(0.1)
+    assert result.load_range == pytest.approx(1.05)
 
 
 def test_milp_does_not_impose_a_unit_load_limit():
@@ -184,6 +198,149 @@ def test_milp_uses_stable_sha256_tie_breaking():
     assert first.assignment == second.assignment == {"s": expected}
 
 
+def test_target_milp_minimizes_kv_cost_before_maximum_load():
+    batch = problem(
+        [engine("a", base_requests=6), engine("b")],
+        {
+            "large": (
+                edge("large", "a", requests=2),
+                edge(
+                    "large",
+                    "b",
+                    requests=2,
+                    migration=True,
+                    migration_cost_tokens=5,
+                ),
+            ),
+            "small": (
+                edge("small", "a", requests=1),
+                edge(
+                    "small",
+                    "b",
+                    requests=1,
+                    migration=True,
+                    migration_cost_tokens=1,
+                ),
+            ),
+        },
+    )
+
+    result = solver_module().solve_batch_for_target_load(
+        batch,
+        maximum_load_limit=0.8,
+        deadline_seconds=1.0,
+    )
+
+    assert result.assignment == {"large": "a", "small": "b"}
+    assert result.maximum_load == pytest.approx(0.8)
+    assert result.minimum_load == pytest.approx(0.1)
+    assert result.load_range == pytest.approx(0.7)
+    assert result.total_migration_cost_tokens == 1
+    assert result.voluntary_migrations == 1
+
+
+def test_target_milp_reports_an_infeasible_load_limit():
+    batch = problem(
+        [engine("a", base_requests=9)],
+        {"s": (edge("s", "a", requests=2),)},
+    )
+
+    with pytest.raises(solver_module().BatchSolverError) as raised:
+        solver_module().solve_batch_for_target_load(
+            batch,
+            maximum_load_limit=1.0,
+            deadline_seconds=1.0,
+        )
+
+    assert raised.value.status == 2
+
+
+def test_target_milp_keeps_zero_cost_owner_when_sticky_load_meets_target():
+    batch = problem(
+        [engine("a", base_requests=8), engine("b")],
+        {
+            "s": (
+                edge("s", "a", requests=1),
+                edge(
+                    "s",
+                    "b",
+                    requests=1,
+                    migration=True,
+                    migration_cost_tokens=5,
+                ),
+            )
+        },
+    )
+
+    result = solver_module().solve_batch_for_target_load(
+        batch,
+        maximum_load_limit=0.9,
+        deadline_seconds=1.0,
+    )
+
+    assert result.assignment == {"s": "a"}
+    assert result.total_migration_cost_tokens == 0
+    assert result.voluntary_migrations == 0
+
+
+def test_target_milp_matches_exhaustive_cost_load_and_hash_ordering():
+    batch = problem(
+        [engine("a", base_requests=4), engine("b")],
+        {
+            "s1": (
+                edge("s1", "a", requests=3),
+                edge(
+                    "s1",
+                    "b",
+                    requests=3,
+                    migration=True,
+                    migration_cost_tokens=5,
+                ),
+            ),
+            "s2": (
+                edge("s2", "a", requests=2),
+                edge(
+                    "s2",
+                    "b",
+                    requests=2,
+                    migration=True,
+                    migration_cost_tokens=2,
+                ),
+            ),
+            "new": (
+                edge("new", "a", requests=1),
+                edge("new", "b", requests=1),
+            ),
+        },
+    )
+    limit = 0.8
+    feasible = [
+        selected
+        for selected in itertools.product(*batch.edges_by_session.values())
+        if assignment_objectives(batch, selected)[0] <= limit + 1e-7
+    ]
+    expected_edges = min(
+        feasible,
+        key=lambda selected: target_assignment_objectives(batch, selected),
+    )
+
+    result = solver_module().solve_batch_for_target_load(
+        batch,
+        maximum_load_limit=limit,
+        deadline_seconds=1.0,
+    )
+
+    assert result.assignment == {
+        edge.session_id: edge.engine_url for edge in expected_edges
+    }
+    assert result.total_migration_cost_tokens == sum(
+        edge.migration_cost_tokens for edge in expected_edges
+    )
+    assert result.maximum_load == pytest.approx(
+        assignment_objectives(batch, expected_edges)[0]
+    )
+
+
 def test_problem_rejects_a_session_without_an_edge():
     with pytest.raises(ValueError, match="session 'missing' has no feasible edge"):
         problem([engine("a")], {"missing": ()})
@@ -200,6 +357,24 @@ def test_problem_rejects_an_edge_for_an_unknown_engine():
 def test_problem_rejects_non_positive_engine_capacity():
     with pytest.raises(ValueError, match="capacities must be positive"):
         problem([engine("a", request_capacity=0)], {})
+
+
+def test_problem_rejects_negative_migration_cost_tokens():
+    with pytest.raises(ValueError, match="migration cost tokens must be non-negative"):
+        problem(
+            [engine("a")],
+            {
+                "s": (
+                    edge(
+                        "s",
+                        "a",
+                        requests=1,
+                        migration=True,
+                        migration_cost_tokens=-1,
+                    ),
+                )
+            },
+        )
 
 
 def test_input_values_are_frozen_and_problem_copies_edge_mapping():

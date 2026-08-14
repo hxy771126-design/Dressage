@@ -19,9 +19,11 @@ from urllib.parse import urlsplit
 from ._batch_milp import (
     BatchProblem,
     BatchSolution,
+    BatchSolverError,
     EngineBaseline,
     FeasibleEdge,
     SolverStatus,
+    solve_batch_for_target_load,
     solve_batch_greedy,
     solve_batch_milp,
 )
@@ -471,6 +473,7 @@ class _SolvedBatch:
     sticky: BatchSolution | None
     optimized: BatchSolution | None
     adopted: str
+    target_maximum_load: float | None
     improvement_ratio: float | None
     fallback_reason: str | None
     elapsed_seconds: float
@@ -2069,6 +2072,7 @@ class EngineRebalancer:
                                 else prompt_tokens
                             ),
                             voluntary_migration=voluntary,
+                            migration_cost_tokens=lcp if voluntary else 0,
                         )
                     )
                     budgets.append((target, budget))
@@ -2170,6 +2174,7 @@ class EngineRebalancer:
                 sticky=None,
                 optimized=None,
                 adopted="fixed",
+                target_maximum_load=None,
                 improvement_ratio=None,
                 fallback_reason=None,
                 elapsed_seconds=time.monotonic() - started,
@@ -2189,23 +2194,28 @@ class EngineRebalancer:
                 sticky=sticky_greedy,
                 optimized=None,
                 adopted="sticky_greedy",
+                target_maximum_load=None,
                 improvement_ratio=None,
                 fallback_reason="sticky_solver_failure",
                 elapsed_seconds=time.monotonic() - started,
             )
 
+        target_maximum_load = sticky.maximum_load * (
+            1.0 - self.config.min_load_improvement_ratio
+        )
         has_voluntary_edge = any(
             edge.voluntary_migration
             for edges in frozen.optimized_problem.edges_by_session.values()
             for edge in edges
         )
-        if not has_voluntary_edge:
+        if sticky.maximum_load <= 1e-9 or not has_voluntary_edge:
             return _SolvedBatch(
                 assignment=tuple(sticky.assignment.items()),
                 sticky_greedy=sticky_greedy,
                 sticky=sticky,
                 optimized=sticky,
                 adopted="sticky",
+                target_maximum_load=target_maximum_load,
                 improvement_ratio=0.0,
                 fallback_reason=None,
                 elapsed_seconds=time.monotonic() - started,
@@ -2213,13 +2223,39 @@ class EngineRebalancer:
         try:
             remaining = 1.0 - (time.monotonic() - started)
             if remaining <= 0:
-                raise TimeoutError("shared batch solve deadline expired")
-            optimized = solve_batch_milp(
+                raise BatchSolverError(
+                    phase=1,
+                    status=None,
+                    elapsed_seconds=1.0 - remaining,
+                    message="shared batch solve deadline expired",
+                )
+            optimized = solve_batch_for_target_load(
                 frozen.optimized_problem,
+                maximum_load_limit=target_maximum_load,
                 deadline_seconds=remaining,
             )
             if optimized.status is not SolverStatus.OPTIMAL:
                 raise RuntimeError("optimized batch solution was not optimal")
+            if optimized.maximum_load > target_maximum_load + 1e-7:
+                raise RuntimeError("optimized batch solution exceeded its load target")
+        except BatchSolverError as exc:
+            if exc.status == 2:
+                fallback_reason = "target_load_infeasible"
+            elif exc.status in (None, 1):
+                fallback_reason = "target_solver_deadline"
+            else:
+                fallback_reason = "target_solver_failure"
+            return _SolvedBatch(
+                assignment=tuple(sticky.assignment.items()),
+                sticky_greedy=sticky_greedy,
+                sticky=sticky,
+                optimized=None,
+                adopted="sticky",
+                target_maximum_load=target_maximum_load,
+                improvement_ratio=None,
+                fallback_reason=fallback_reason,
+                elapsed_seconds=time.monotonic() - started,
+            )
         except Exception:
             return _SolvedBatch(
                 assignment=tuple(sticky.assignment.items()),
@@ -2227,8 +2263,9 @@ class EngineRebalancer:
                 sticky=sticky,
                 optimized=None,
                 adopted="sticky",
+                target_maximum_load=target_maximum_load,
                 improvement_ratio=None,
-                fallback_reason="optimized_solver_failure",
+                fallback_reason="target_solver_failure",
                 elapsed_seconds=time.monotonic() - started,
             )
         improvement = (
@@ -2237,16 +2274,13 @@ class EngineRebalancer:
             else (sticky.maximum_load - optimized.maximum_load)
             / max(sticky.maximum_load, 1e-9)
         )
-        adopt_optimized = (
-            improvement + 1e-9 >= self.config.min_load_improvement_ratio
-        )
-        selected = optimized if adopt_optimized else sticky
         return _SolvedBatch(
-            assignment=tuple(selected.assignment.items()),
+            assignment=tuple(optimized.assignment.items()),
             sticky_greedy=sticky_greedy,
             sticky=sticky,
             optimized=optimized,
-            adopted="optimized" if adopt_optimized else "sticky",
+            adopted="optimized",
+            target_maximum_load=target_maximum_load,
             improvement_ratio=improvement,
             fallback_reason=None,
             elapsed_seconds=time.monotonic() - started,
@@ -2673,7 +2707,7 @@ class EngineRebalancer:
 
         def frozen_trace_inputs(
             step: _PendingBatchStep,
-        ) -> tuple[str | None, int | None, list[str]]:
+        ) -> tuple[str | None, int | None, list[str], dict[str, int]]:
             frozen_step = frozen_by_arrival.get(step.arrival_id)
             if frozen_step is None:
                 return (
@@ -2684,11 +2718,20 @@ class EngineRebalancer:
                         for result in fetch_results
                         if result.status == "ok"
                     ],
+                    {},
                 )
             candidate_urls = (
                 [frozen_step.fixed_target]
                 if frozen_step.fixed_target is not None
                 else [edge.engine_url for edge in frozen_step.edges]
+            )
+            candidate_costs = (
+                {frozen_step.fixed_target: 0}
+                if frozen_step.fixed_target is not None
+                else {
+                    edge.engine_url: edge.migration_cost_tokens
+                    for edge in frozen_step.edges
+                }
             )
             target = frozen_step.fixed_target or solved_assignment.get(
                 step.session_id
@@ -2701,6 +2744,21 @@ class EngineRebalancer:
                 frozen_step.source,
                 None if budget is None else budget.estimated_step_output_tokens,
                 candidate_urls,
+                candidate_costs,
+            )
+
+        def committed_migration_cost(step: _PendingBatchStep) -> int:
+            lease = lease_by_arrival.get(step.arrival_id)
+            frozen_step = frozen_by_arrival.get(step.arrival_id)
+            if lease is None or frozen_step is None:
+                return 0
+            return next(
+                (
+                    edge.migration_cost_tokens
+                    for edge in frozen_step.edges
+                    if edge.engine_url == lease.worker_url
+                ),
+                0,
             )
 
         trace_inputs = {
@@ -2753,6 +2811,9 @@ class EngineRebalancer:
                         else lease_by_arrival[step.arrival_id].expected_output_tokens
                     ),
                     "candidate_urls": trace_inputs[step.arrival_id][2],
+                    "candidate_migration_cost_tokens": trace_inputs[
+                        step.arrival_id
+                    ][3],
                     "status": (
                         "cancelled"
                         if step.cancelled
@@ -2787,6 +2848,7 @@ class EngineRebalancer:
                             step.arrival_id
                         ].reserved_prefill_tokens
                     ),
+                    "migration_cost_tokens": committed_migration_cost(step),
                 }
                 for step in sorted(batch.steps, key=lambda item: item.arrival_id)
             ],
@@ -2829,6 +2891,11 @@ class EngineRebalancer:
                 else {
                     "status": solved.sticky.status.value,
                     "maximum_load": solved.sticky.maximum_load,
+                    "minimum_load": solved.sticky.minimum_load,
+                    "load_range": solved.sticky.load_range,
+                    "migration_cost_tokens": (
+                        solved.sticky.total_migration_cost_tokens
+                    ),
                     "migrations": solved.sticky.voluntary_migrations,
                     "elapsed_seconds": solved.sticky.elapsed_seconds,
                 }
@@ -2839,12 +2906,20 @@ class EngineRebalancer:
                 else {
                     "status": solved.optimized.status.value,
                     "maximum_load": solved.optimized.maximum_load,
+                    "minimum_load": solved.optimized.minimum_load,
+                    "load_range": solved.optimized.load_range,
+                    "migration_cost_tokens": (
+                        solved.optimized.total_migration_cost_tokens
+                    ),
                     "migrations": solved.optimized.voluntary_migrations,
                     "elapsed_seconds": solved.optimized.elapsed_seconds,
                 }
             ),
             "improvement_ratio": (
                 None if solved is None else solved.improvement_ratio
+            ),
+            "target_maximum_load": (
+                None if solved is None else solved.target_maximum_load
             ),
             "required_ratio": self.config.min_load_improvement_ratio,
             "adopted_plan": (

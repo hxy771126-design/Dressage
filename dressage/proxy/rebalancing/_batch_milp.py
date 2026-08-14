@@ -40,6 +40,7 @@ class FeasibleEdge:
     token_increment: float
     prefill_increment: float
     voluntary_migration: bool
+    migration_cost_tokens: int = 0
 
 
 @dataclass(frozen=True)
@@ -81,6 +82,8 @@ class BatchProblem:
                         f"session '{session_id}' has duplicate edge for Engine "
                         f"'{edge.engine_url}'"
                     )
+                if edge.migration_cost_tokens < 0:
+                    raise ValueError("migration cost tokens must be non-negative")
                 seen_engines.add(edge.engine_url)
         object.__setattr__(self, "engines", frozen_engines)
         object.__setattr__(
@@ -100,6 +103,9 @@ class BatchSolution:
     status: SolverStatus
     assignment: Mapping[str, str]
     maximum_load: float
+    minimum_load: float
+    load_range: float
+    total_migration_cost_tokens: int
     voluntary_migrations: int
     elapsed_seconds: float
 
@@ -260,10 +266,10 @@ def _selected_edges(model: _Model, values: np.ndarray) -> tuple[FeasibleEdge, ..
     return selected
 
 
-def _maximum_load(
+def _engine_loads(
     problem: BatchProblem,
     selected_edges: Sequence[FeasibleEdge],
-) -> float:
+) -> tuple[float, ...]:
     loads = []
     for engine in problem.engines:
         assigned = [edge for edge in selected_edges if edge.engine_url == engine.url]
@@ -284,7 +290,14 @@ def _maximum_load(
             + sum(edge.prefill_increment for edge in assigned)
         ) / engine.token_capacity
         loads.append(request + token + engine.queue_pressure + prefill)
-    return max(loads)
+    return tuple(loads)
+
+
+def _maximum_load(
+    problem: BatchProblem,
+    selected_edges: Sequence[FeasibleEdge],
+) -> float:
+    return max(_engine_loads(problem, selected_edges))
 
 
 def _solution(
@@ -293,10 +306,18 @@ def _solution(
     selected_edges: Sequence[FeasibleEdge],
     elapsed_seconds: float,
 ) -> BatchSolution:
+    loads = _engine_loads(problem, selected_edges)
+    maximum_load = max(loads)
+    minimum_load = min(loads)
     return BatchSolution(
         status=status,
         assignment={edge.session_id: edge.engine_url for edge in selected_edges},
-        maximum_load=_maximum_load(problem, selected_edges),
+        maximum_load=maximum_load,
+        minimum_load=minimum_load,
+        load_range=maximum_load - minimum_load,
+        total_migration_cost_tokens=sum(
+            edge.migration_cost_tokens for edge in selected_edges
+        ),
         voluntary_migrations=sum(
             edge.voluntary_migration for edge in selected_edges
         ),
@@ -345,6 +366,88 @@ def solve_batch_milp(
         deadline_seconds,
     )
     selected = _selected_edges(model, phase_two.x)
+    return _solution(
+        SolverStatus.OPTIMAL,
+        problem,
+        selected,
+        time.monotonic() - started_at,
+    )
+
+
+def solve_batch_for_target_load(
+    problem: BatchProblem,
+    *,
+    maximum_load_limit: float,
+    deadline_seconds: float,
+) -> BatchSolution:
+    """Meet a load target with minimum migration cost, then maximum pressure."""
+    if maximum_load_limit < 0:
+        raise ValueError("maximum_load_limit must be non-negative")
+    if deadline_seconds <= 0:
+        raise ValueError("deadline_seconds must be positive")
+    started_at = time.monotonic()
+    model = _build_model(problem)
+    variable_count = model.maximum_load_index + 1
+
+    load_objective = np.zeros(variable_count)
+    load_objective[model.maximum_load_index] = 1.0
+    target_constraint = LinearConstraint(
+        load_objective,
+        -np.inf,
+        maximum_load_limit + _OPTIMUM_TOLERANCE,
+    )
+
+    migration_objective = np.zeros(variable_count)
+    for edge_index, edge in enumerate(model.edges):
+        migration_objective[edge_index] = edge.migration_cost_tokens
+    phase_one = _solve_phase(
+        model,
+        migration_objective,
+        (*model.constraints, target_constraint),
+        1,
+        started_at,
+        deadline_seconds,
+    )
+    optimal_cost = int(round(phase_one.fun))
+    migration_constraint = LinearConstraint(
+        migration_objective,
+        optimal_cost,
+        optimal_cost,
+    )
+
+    phase_two = _solve_phase(
+        model,
+        load_objective,
+        (*model.constraints, target_constraint, migration_constraint),
+        2,
+        started_at,
+        deadline_seconds,
+    )
+    load_constraint = _fixed_objective_constraint(
+        load_objective,
+        phase_two.fun,
+    )
+
+    tie_objective = np.zeros(variable_count)
+    for edge_index, edge in enumerate(model.edges):
+        tie_objective[edge_index] = _stable_coefficient(
+            edge.session_id,
+            edge.engine_url,
+        )
+    phase_three = _solve_phase(
+        model,
+        tie_objective,
+        (
+            *model.constraints,
+            target_constraint,
+            migration_constraint,
+            load_constraint,
+        ),
+        3,
+        started_at,
+        deadline_seconds,
+    )
+    selected = _selected_edges(model, phase_three.x)
     return _solution(
         SolverStatus.OPTIMAL,
         problem,
