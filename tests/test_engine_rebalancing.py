@@ -1124,47 +1124,6 @@ def test_single_node_loopback_engine_maps_to_routable_calibration_node():
     assert rebalancer._calibration_node_for(deployment) == "10.0.0.7"
 
 
-def test_remote_context_risk_switches_from_transport_margin_to_path_error_p90():
-    rebalancer = EngineRebalancer(
-        ControlPlaneClient(),
-        config=EngineRebalancingConfig(enabled=True, min_samples=2),
-        model_id="model",
-        model_config=simple_model_config(),
-    )
-    estimate = ContextRecoveryEstimate(
-        cache_source=CacheSource.MOONCAKE,
-        expected_cached_tokens=100,
-        expected_prefill_tokens=0,
-        estimated_seconds=4.0,
-        hit_probability=1.0,
-        restore_seconds=4.0,
-        restore_sample_source="offline",
-    )
-    assert (
-        rebalancer._context_prediction_risk(
-            fingerprint="fp",
-            source_engine="a",
-            target_engine="b",
-            estimate=estimate,
-            context_tokens=100,
-        )
-        == 0.2
-    )
-    rebalancer._runtime_restore_errors[("fp", "a", "b", context_bucket(100))].extend(
-        [0.2, 0.3]
-    )
-    assert (
-        rebalancer._context_prediction_risk(
-            fingerprint="fp",
-            source_engine="a",
-            target_engine="b",
-            estimate=estimate,
-            context_tokens=100,
-        )
-        == 0.3
-    )
-
-
 def test_default_runtime_restore_model_becomes_ready_at_16_samples():
     rebalancer = EngineRebalancer(
         ControlPlaneClient(),
@@ -4292,97 +4251,6 @@ def test_load_snapshot_aggregates_live_queue_fields_across_dp_ranks():
     assert load.live_queue_metrics_available is True
 
 
-def test_live_queue_seconds_uses_prefill_p25_and_falls_back_when_unavailable():
-    rebalancer = EngineRebalancer(
-        ControlPlaneClient(),
-        config=EngineRebalancingConfig(enabled=True, min_samples=1),
-        model_id="model",
-    )
-    fingerprint = "fp"
-    engine = "worker"
-    rebalancer.performance.observe(
-        fingerprint=fingerprint,
-        engine_url=engine,
-        running=1,
-        context_tokens=8_000,
-        queue_seconds=0.1,
-        context_seconds=2.0,
-        cached_tokens=0,
-        output_tokens=1,
-        decode_throughput=10.0,
-        cache_source=CacheSource.NONE,
-    )
-    rebalancer.loads[engine] = EngineLoad(
-        worker_url=engine,
-        metrics_timestamp=10.0,
-        waiting_uncached_tokens=8_000,
-        live_queue_metrics_available=True,
-    )
-
-    assert (
-        rebalancer._live_queue_seconds(
-            fingerprint=fingerprint,
-            engine_url=engine,
-            context_tokens=8_000,
-            now=10.0,
-        )
-        == 2.0
-    )
-    rebalancer.loads[engine].reserved_prefill_tokens = 2_000
-    assert (
-        rebalancer._live_queue_seconds(
-            fingerprint=fingerprint,
-            engine_url=engine,
-            context_tokens=8_000,
-            now=10.0,
-        )
-        == 2.5
-    )
-
-    rebalancer.loads[engine].metrics_timestamp = 1.0
-    assert (
-        rebalancer._live_queue_seconds(
-            fingerprint=fingerprint,
-            engine_url=engine,
-            context_tokens=8_000,
-            now=10.0,
-        )
-        is None
-    )
-    rebalancer.loads[engine].metrics_timestamp = 10.0
-    rebalancer.loads[engine].live_queue_metrics_available = False
-    assert (
-        rebalancer._live_queue_seconds(
-            fingerprint=fingerprint,
-            engine_url=engine,
-            context_tokens=8_000,
-            now=10.0,
-        )
-        is None
-    )
-
-    empty_history = EngineRebalancer(
-        ControlPlaneClient(),
-        config=EngineRebalancingConfig(enabled=True, min_samples=1),
-        model_id="model",
-    )
-    empty_history.loads[engine] = EngineLoad(
-        worker_url=engine,
-        metrics_timestamp=10.0,
-        waiting_uncached_tokens=8_000,
-        live_queue_metrics_available=True,
-    )
-    assert (
-        empty_history._live_queue_seconds(
-            fingerprint=fingerprint,
-            engine_url=engine,
-            context_tokens=8_000,
-            now=10.0,
-        )
-        is None
-    )
-
-
 def test_live_reservation_ledger_uses_distinct_ids_and_aggregates_engine_load():
     client = ControlPlaneClient()
     rebalancer = EngineRebalancer(
@@ -4613,7 +4481,7 @@ def test_prefill_retirement_keeps_request_and_token_reservation_until_settle():
     run(scenario())
 
 
-def test_prefill_reservations_expire_by_load_generation_and_release_on_failure():
+def test_live_prefill_ledger_retires_by_load_generation_and_releases_on_failure():
     client = ControlPlaneClient()
     rebalancer = EngineRebalancer(
         client,
