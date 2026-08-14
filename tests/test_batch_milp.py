@@ -86,7 +86,6 @@ def assignment_objectives(batch, selected_edges):
         loads.append(request + token + baseline.queue_pressure + prefill)
     return (
         max(loads),
-        sum(edge.voluntary_migration for edge in selected_edges),
         sum(
             stable_coefficient(edge.session_id, edge.engine_url)
             for edge in selected_edges
@@ -148,21 +147,22 @@ def test_milp_does_not_impose_a_unit_load_limit():
     assert result.maximum_load == pytest.approx(2.0)
 
 
-def test_milp_minimizes_migration_after_load():
+def test_milp_uses_stable_hash_after_load_even_if_tie_migrates():
     batch = problem(
         [engine("a"), engine("b")],
         {
-            "s": (
-                edge("s", "a", requests=1),
-                edge("s", "b", requests=1, migration=True),
+            "session": (
+                edge("session", "a", requests=1),
+                edge("session", "b", requests=1, migration=True),
             )
         },
     )
 
     result = solver_module().solve_batch_milp(batch)
 
-    assert result.assignment == {"s": "a"}
-    assert result.voluntary_migrations == 0
+    assert result.assignment == {"session": "b"}
+    assert result.maximum_load == pytest.approx(0.1)
+    assert result.voluntary_migrations == 1
 
 
 def test_milp_uses_stable_sha256_tie_breaking():
@@ -265,7 +265,7 @@ def test_greedy_is_stable_across_session_and_edge_input_order():
     assert first.voluntary_migrations == second.voluntary_migrations == 2
 
 
-def test_milp_matches_exhaustive_load_migration_and_tie_ordering():
+def test_milp_matches_exhaustive_load_and_tie_ordering():
     batch = problem(
         [engine("a"), engine("b")],
         {
@@ -288,7 +288,10 @@ def test_milp_matches_exhaustive_load_migration_and_tie_ordering():
     expected_assignment = {
         candidate.session_id: candidate.engine_url for candidate in expected_edges
     }
-    expected_load, expected_migrations, _ = assignment_objectives(batch, expected_edges)
+    expected_load, _ = assignment_objectives(batch, expected_edges)
+    expected_migrations = sum(
+        candidate.voluntary_migration for candidate in expected_edges
+    )
 
     result = solver_module().solve_batch_milp(batch)
 

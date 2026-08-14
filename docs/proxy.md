@@ -305,8 +305,8 @@ deadline:
    jointly placing new sessions and mandatory failovers.
 2. An optimized model additionally opens compatible voluntary migration edges.
 
-Both models first minimize the maximum normalized Engine pressure, then the
-number of voluntary migrations, and finally use a stable hash to break ties.
+Both models first minimize the maximum normalized Engine pressure, then use a
+stable hash to break ties within the optimum.
 The optimized plan is adopted only when its maximum-pressure improvement reaches
 `--engine-rebalancing-min-load-improvement-ratio`; otherwise the sticky plan is
 committed. Solver failure or a stale frozen state falls back to a deterministic

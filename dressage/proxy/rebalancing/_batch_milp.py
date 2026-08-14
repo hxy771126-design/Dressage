@@ -310,7 +310,7 @@ def solve_batch_milp(
     problem: BatchProblem,
     deadline_seconds: float = 1.0,
 ) -> BatchSolution:
-    """Solve one batch lexicographically by load, migrations, then stable hash."""
+    """Solve one batch lexicographically by load, then stable hash."""
     if deadline_seconds <= 0:
         raise ValueError("deadline_seconds must be positive")
     started_at = time.monotonic()
@@ -332,37 +332,21 @@ def solve_batch_milp(
         phase_one.fun,
     )
 
-    migration_objective = np.zeros(variable_count)
-    for edge_index, edge in enumerate(model.edges):
-        migration_objective[edge_index] = float(edge.voluntary_migration)
-    phase_two = _solve_phase(
-        model,
-        migration_objective,
-        (*model.constraints, load_constraint),
-        2,
-        started_at,
-        deadline_seconds,
-    )
-    migration_constraint = _fixed_objective_constraint(
-        migration_objective,
-        phase_two.fun,
-    )
-
     tie_objective = np.zeros(variable_count)
     for edge_index, edge in enumerate(model.edges):
         tie_objective[edge_index] = _stable_coefficient(
             edge.session_id,
             edge.engine_url,
         )
-    phase_three = _solve_phase(
+    phase_two = _solve_phase(
         model,
         tie_objective,
-        (*model.constraints, load_constraint, migration_constraint),
-        3,
+        (*model.constraints, load_constraint),
+        2,
         started_at,
         deadline_seconds,
     )
-    selected = _selected_edges(model, phase_three.x)
+    selected = _selected_edges(model, phase_two.x)
     return _solution(
         SolverStatus.OPTIMAL,
         problem,
