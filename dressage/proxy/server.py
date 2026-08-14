@@ -2754,7 +2754,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--engine-rebalancing-min-load-improvement-ratio",
         type=_unit_interval_float,
-        default=0.20,
+        default=0.10,
         help=(
             "Minimum relative base-load improvement required for a voluntary "
             "cross-Engine session migration."

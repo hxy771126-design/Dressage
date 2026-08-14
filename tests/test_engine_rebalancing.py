@@ -274,12 +274,12 @@ def test_config_derives_metrics_staleness():
 def test_config_defaults_propagate_to_online_models():
     config = EngineRebalancingConfig(enabled=True)
     assert config.snapshot()["load_poll_interval_ms"] == 250
-    assert config.snapshot()["history_size"] == 256
+    assert config.snapshot()["history_size"] == 512
     assert config.snapshot()["min_samples"] == 16
     assert config.snapshot()["min_hold_turns"] == 2
     assert config.snapshot()["min_risk_ms"] == 10
     assert config.snapshot()["cold_start_hit_probability"] == 1.0
-    assert config.snapshot()["min_load_improvement_ratio"] == 0.20
+    assert config.snapshot()["min_load_improvement_ratio"] == 0.10
 
     rebalancer = EngineRebalancer(
         ControlPlaneClient(),
@@ -3410,7 +3410,7 @@ def test_existing_session_uses_two_level_backlog_threshold(
                 "batch_sticky",
                 "batch_optimized_migration",
             }
-            assert lease.decision.required_load_improvement_ratio == 0.20
+            assert lease.decision.required_load_improvement_ratio == 0.10
             trace = (await rebalancer.snapshot())["recent_load_batches"][-1]
             assert trace["adopted_plan"] == (
                 "optimized" if lease.decision.moved else "sticky"
@@ -3468,7 +3468,7 @@ def test_existing_session_selects_lowest_load_target_with_backlog_advantage():
                 "batch_optimized_migration",
             }
             assert lease.decision.target_base_load is not None
-            assert lease.decision.required_load_improvement_ratio == 0.20
+            assert lease.decision.required_load_improvement_ratio == 0.10
         finally:
             await rebalancer.fail(lease)
 
@@ -3520,7 +3520,7 @@ def test_existing_session_selects_lowest_load_target_without_backlog_advantage()
                 "batch_sticky",
                 "batch_optimized_migration",
             }
-            assert lease.decision.required_load_improvement_ratio == 0.20
+            assert lease.decision.required_load_improvement_ratio == 0.10
         finally:
             await rebalancer.fail(lease)
 
@@ -3780,7 +3780,7 @@ def test_min_hold_turns_blocks_otherwise_beneficial_migration():
                 "batch_sticky",
                 "batch_optimized_migration",
             }
-            assert lease.decision.required_load_improvement_ratio == 0.20
+            assert lease.decision.required_load_improvement_ratio == 0.10
         finally:
             await rebalancer.fail(lease)
 
@@ -3951,7 +3951,7 @@ def test_existing_session_rejects_move_when_projected_target_is_busier():
         try:
             assert lease.worker_url == source
             assert lease.decision.reason == "batch_sticky"
-            assert lease.decision.required_load_improvement_ratio == 0.20
+            assert lease.decision.required_load_improvement_ratio == 0.10
             assert lease.decision.source_projected_load is not None
             assert lease.decision.target_projected_load is not None
             trace = (await rebalancer.snapshot())["recent_load_batches"][-1]
@@ -5312,7 +5312,7 @@ def test_cli_exposes_single_rebalancing_switch(monkeypatch):
     )
     args = parse_args()
     assert args.enable_engine_rebalancing is True
-    assert args.engine_rebalancing_min_load_improvement_ratio == 0.20
+    assert args.engine_rebalancing_min_load_improvement_ratio == 0.10
 
 
 def test_cli_accepts_load_improvement_ratio(monkeypatch):
@@ -5391,12 +5391,12 @@ def test_enabled_proxy_places_first_request_directly_and_reports_state():
         assert loads["enabled"] is True
         assert loads["effective_config"]["metrics_stale_ms"] == 2_000
         assert loads["effective_config"]["load_poll_interval_ms"] == 250
-        assert loads["effective_config"]["history_size"] == 256
+        assert loads["effective_config"]["history_size"] == 512
         assert loads["effective_config"]["min_samples"] == 16
         assert loads["effective_config"]["min_hold_turns"] == 2
         assert loads["effective_config"]["min_risk_ms"] == 10
         assert loads["effective_config"]["cold_start_hit_probability"] == 1.0
-        assert loads["effective_config"]["min_load_improvement_ratio"] == 0.20
+        assert loads["effective_config"]["min_load_improvement_ratio"] == 0.10
         assert loads["compatibility_pools"][0]["state"] in {
             "BOOTSTRAP",
             "ACTIVE",
@@ -5526,7 +5526,7 @@ def test_engine_rebalancing_benchmark_defaults_to_one_off_on_pair(tmp_path):
     assert "response max:  12288" in result.stdout
     assert "sandbox slots: 16" in result.stdout
     assert "slot timeout:  3600" in result.stdout
-    assert "dressage_dapo_prompts_long_tail.jsonl" in result.stdout
+    assert "dressage_dapo_prompts_step_balanced_300.jsonl" in result.stdout
     assert "warm-up" not in result.stdout
     assert "off-r2" not in result.stdout
     assert "on-r2" not in result.stdout

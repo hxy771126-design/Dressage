@@ -25,12 +25,12 @@ class EngineRebalancingConfig:
     enabled: bool = False
     load_poll_interval_ms: int = 250
     metrics_stale_ms: int = 2_000
-    history_size: int = 256
+    history_size: int = 512
     min_samples: int = 16
     min_hold_turns: int = 2
     min_risk_ms: int = 10
     cold_start_hit_probability: float = 1.0
-    min_load_improvement_ratio: float = 0.20
+    min_load_improvement_ratio: float = 0.10
 
     def __post_init__(self) -> None:
         self.metrics_stale_ms = max(
