@@ -2042,6 +2042,10 @@ def test_batch_target_solver_receives_hard_limit_and_lcp_cost(monkeypatch):
             edge.engine_url: edge.migration_cost_tokens
             for edge in problem.edges_by_session["target"]
         }
+        captured["prefills"] = {
+            edge.engine_url: edge.prefill_increment
+            for edge in problem.edges_by_session["target"]
+        }
         source, target = client.urls
         return BatchSolution(
             status=SolverStatus.OPTIMAL,
@@ -2071,6 +2075,11 @@ def test_batch_target_solver_receives_hard_limit_and_lcp_cost(monkeypatch):
     async def scenario():
         await rebalancer.refresh()
         source, target = client.urls
+        for url in client.urls:
+            rebalancer.deployments[url] = replace(
+                rebalancer.deployments[url],
+                page_size=4,
+            )
         fingerprint = rebalancer.deployments[source].cache_fingerprint
         rebalancer.sessions["target"] = SessionRoutingState(
             owner_worker_url=source,
@@ -2107,7 +2116,10 @@ def test_batch_target_solver_receives_hard_limit_and_lcp_cost(monkeypatch):
         assert captured == {
             "limit": pytest.approx(0.8),
             "costs": {source: 0, target: 7},
+            "prefills": {source: 3, target: 6},
         }
+        assert lease.reserved_prefill_tokens == 6
+        assert rebalancer.loads[target].reserved_prefill_tokens == 6
         assert trace["adopted_plan"] == "optimized"
         assert trace["improvement_ratio"] == pytest.approx(0.2)
         assert trace["target_maximum_load"] == pytest.approx(0.8)
@@ -2134,6 +2146,7 @@ def test_batch_target_solver_receives_hard_limit_and_lcp_cost(monkeypatch):
             target: 7,
         }
         assert trace["steps"][0]["migration_cost_tokens"] == 7
+        assert trace["steps"][0]["prefill_increment"] == 6
         await rebalancer.fail(lease)
 
     run(scenario())
@@ -2252,7 +2265,9 @@ def test_batch_zero_lcp_migration_has_zero_kv_cost(monkeypatch):
             target: 0,
         }
         assert trace["steps"][0]["migration_cost_tokens"] == 0
+        assert trace["steps"][0]["prefill_increment"] == 10
         assert trace["optimized"]["migration_cost_tokens"] == 0
+        assert lease.reserved_prefill_tokens == 10
         await rebalancer.fail(lease)
 
     run(scenario())
@@ -2309,6 +2324,9 @@ def test_batch_owner_unhealthy_or_version_invalid_uses_mandatory_failover(
 
         assert lease.worker_url == target
         assert lease.decision.reason == "batch_owner_failover"
+        assert lease.reserved_prefill_tokens == 10
+        trace = (await rebalancer.snapshot())["recent_load_batches"][-1]
+        assert trace["steps"][0]["prefill_increment"] == 10
         await rebalancer.fail(lease)
 
     run(scenario())
@@ -5393,8 +5411,9 @@ def test_engine_rebalancing_benchmark_defaults_to_one_off_on_pair(tmp_path):
     assert "rollout batch: 256" in result.stdout
     assert "global batch:  256" in result.stdout
     assert "response max:  12288" in result.stdout
-    assert "sandbox slots: 16" in result.stdout
+    assert "sandbox slots: 24" in result.stdout
     assert "slot timeout:  3600" in result.stdout
+    assert "Mooncake size: 24gb" in result.stdout
     assert "dressage_dapo_prompts_step_balanced_300.jsonl" in result.stdout
     assert "warm-up" not in result.stdout
     assert "off-r2" not in result.stdout
@@ -5421,8 +5440,9 @@ def test_engine_rebalancing_benchmark_samples_long_tail_dataset_once():
     assert "ROLLOUT_BATCH_SIZE=256" in source
     assert "GLOBAL_BATCH_SIZE=256" in source
     assert "ROLLOUT_MAX_RESPONSE_LEN=12288" in source
-    assert "DRESSAGE_BLACKBOX_SLOTS_PER_NODE=16" in source
+    assert "DRESSAGE_BLACKBOX_SLOTS_PER_NODE=24" in source
     assert "DRESSAGE_BLACKBOX_ACQUIRE_TIMEOUT_SEC=3600" in source
+    assert "MOONCAKE_GLOBAL_SEGMENT_SIZE=24gb" in source
 
 
 def test_disabled_rebalancer_does_not_create_session_context_state():

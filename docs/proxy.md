@@ -319,6 +319,14 @@ weight-version, Mooncake readiness, and step capability checks still define
 migration eligibility. Mandatory failover is never blocked by the voluntary
 migration target or cost.
 
+The prefill delta is separate from that optimization cost. An owner stay uses
+the exact uncached suffix after the LCP. A Mooncake-ready voluntary migration
+rounds the LCP down to the target Engine's KV page size and counts only the
+remaining input as prefill. New sessions and mandatory failovers conservatively
+count the complete input. In every case the Proxy still sends complete
+`input_ids`; SGLang decides the actual cache hit and safely falls back to full
+prefill when the expected pages are unavailable.
+
 Every committed lease owns a uniquely identified live reservation. Completion,
 failure, and cancellation release it idempotently; a later complete load
 generation retires only its prefill component. The Proxy never supplies a cache

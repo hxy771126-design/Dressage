@@ -2057,6 +2057,14 @@ class EngineRebalancer:
                         context_remaining_tokens=pending.context_remaining_tokens,
                     )
                     prompt_tokens = len(pending.input_ids)
+                    if healthy_owner and target == source:
+                        prefill_increment = prompt_tokens - lcp
+                    elif voluntary:
+                        page_size = max(1, self.deployments[target].page_size)
+                        page_aligned_lcp = lcp - lcp % page_size
+                        prefill_increment = prompt_tokens - page_aligned_lcp
+                    else:
+                        prefill_increment = prompt_tokens
                     edges.append(
                         FeasibleEdge(
                             session_id=pending.session_id,
@@ -2066,11 +2074,7 @@ class EngineRebalancer:
                                 prompt_tokens
                                 + (budget.estimated_step_output_tokens or 0)
                             ),
-                            prefill_increment=(
-                                prompt_tokens - lcp
-                                if healthy_owner and target == source
-                                else prompt_tokens
-                            ),
+                            prefill_increment=prefill_increment,
                             voluntary_migration=voluntary,
                             migration_cost_tokens=lcp if voluntary else 0,
                         )
@@ -2484,6 +2488,7 @@ class EngineRebalancer:
                         engine.url: [0.0, 0.0, 0.0]
                         for engine in frozen.decision_engines
                     }
+                    selected_edges_by_arrival: dict[int, FeasibleEdge] = {}
                     for frozen_step in frozen.steps:
                         if frozen_step.pending.cancelled or frozen_step.failure:
                             continue
@@ -2518,6 +2523,9 @@ class EngineRebalancer:
                                 voluntary_migration=False,
                             )
                         if edge is not None:
+                            selected_edges_by_arrival[
+                                frozen_step.pending.arrival_id
+                            ] = edge
                             totals = increments[edge.engine_url]
                             totals[0] += edge.request_increment
                             totals[1] += edge.token_increment
@@ -2619,6 +2627,11 @@ class EngineRebalancer:
                             base_tokens=base_tokens,
                             budget=budget,
                             batch_id=batch.id,
+                            prefill_increment=int(
+                                selected_edges_by_arrival[
+                                    step.arrival_id
+                                ].prefill_increment
+                            ),
                         )
                         step.lease = lease
                         leases.append((step, lease))
@@ -3058,6 +3071,7 @@ class EngineRebalancer:
         base_tokens: int,
         budget: StepGenerationBudget,
         batch_id: int | None = None,
+        prefill_increment: int | None = None,
     ) -> RoutingLease:
         target = decision.target_worker_url
         expected_output_tokens = budget.estimated_step_output_tokens or 0
@@ -3078,7 +3092,9 @@ class EngineRebalancer:
                 and decision.target_context is not None
             ):
                 selected_context = decision.target_context
-            if selected_context is not None:
+            if prefill_increment is not None:
+                reserved_prefill_tokens = max(0, int(prefill_increment))
+            elif selected_context is not None:
                 reserved_prefill_tokens = max(
                     0, int(selected_context.expected_prefill_tokens)
                 )
