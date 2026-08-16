@@ -1,8 +1,8 @@
 """Runtime state for Proxy-side SGLang engine rebalancing.
 
 The state machine is deliberately independent from SGLang cache internals.  It
-only answers whether a compatible engine pool has enough fresh performance data
-to make routing decisions.
+only answers whether a compatible engine pool has enough fresh load data to
+make routing decisions.
 """
 
 from __future__ import annotations
@@ -27,10 +27,8 @@ class EngineRebalancingConfig:
     metrics_stale_ms: int = 2_000
     history_size: int = 256
     min_samples: int = 16
-    min_hold_turns: int = 2
     min_risk_ms: int = 10
     cold_start_hit_probability: float = 1.0
-    min_load_improvement_ratio: float = 0.20
 
     def __post_init__(self) -> None:
         self.metrics_stale_ms = max(
@@ -43,14 +41,10 @@ class EngineRebalancingConfig:
             raise ValueError("history_size must be positive")
         if self.min_samples <= 0:
             raise ValueError("min_samples must be positive")
-        if self.min_hold_turns < 0:
-            raise ValueError("min_hold_turns must be non-negative")
         if self.min_risk_ms < 0:
             raise ValueError("min_risk_ms must be non-negative")
         if not 0.0 <= self.cold_start_hit_probability <= 1.0:
             raise ValueError("cold_start_hit_probability must be between 0 and 1")
-        if not 0.0 <= self.min_load_improvement_ratio <= 1.0:
-            raise ValueError("min_load_improvement_ratio must be between 0 and 1")
 
     def snapshot(self) -> dict[str, Any]:
         return asdict(self)
@@ -63,14 +57,12 @@ class PoolReadiness:
     model_cache_profile_ready: bool
     queue_model_ready: bool
     prefill_model_ready: bool
-    eligible_paths: int
 
     @property
     def ready(self) -> bool:
         return (
             self.healthy_engines >= 2
             and self.metrics_fresh
-            and self.eligible_paths > 0
         )
 
     def snapshot(self) -> dict[str, Any]:

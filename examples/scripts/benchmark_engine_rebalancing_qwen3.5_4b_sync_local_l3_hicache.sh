@@ -971,7 +971,6 @@ for pair_number, off_name, on_name in pairs:
             "effective_tokens_equal": token_total_equal,
             "trajectory_hash_equal": trajectory_hash_equal,
             "on_calibration_ready": calibration_ready,
-            "kv_migration_evidence": bool(on.get("kv_migration_evidence")),
             "invalid_reasons": " | ".join(reasons),
         }
     )
@@ -981,7 +980,6 @@ speedups = [row["rollout_speedup"] for row in valid_rows if row["rollout_speedup
 gains = [row["throughput_gain"] for row in valid_rows if row["throughput_gain"] is not None]
 rollout_speedup = speedups[0] if speedups else None
 throughput_gain = gains[0] if gains else None
-kv_evidence = any(row["kv_migration_evidence"] for row in rows)
 all_pairs_valid = len(valid_rows) == len(rows)
 
 fieldnames = list(rows[0].keys())
@@ -1002,9 +1000,6 @@ exit_code = 0
 if not all_pairs_valid:
     status = "INVALID"
     exit_code = 1
-elif not kv_evidence:
-    status = "INCONCLUSIVE_NO_KV_MIGRATION"
-    exit_code = 2
 
 lines = [
     "# Engine Rebalancing A/B Benchmark",
@@ -1014,10 +1009,9 @@ lines = [
     f"- Valid measured pairs: `{len(valid_rows)}/1`",
     f"- Rollout speedup (OFF / ON): `{fmt(rollout_speedup)}`",
     f"- Effective throughput gain: `{fmt(throughput_gain, percent=True)}`",
-    f"- Observed moved=true + Mooncake cached tokens: `{'yes' if kv_evidence else 'no'}`",
     "",
-    "| Pair | Valid | OFF rollout (s) | ON rollout (s) | Speedup | Throughput gain | KV evidence |",
-    "|---:|:---:|---:|---:|---:|---:|:---:|",
+    "| Pair | Valid | OFF rollout (s) | ON rollout (s) | Speedup | Throughput gain |",
+    "|---:|:---:|---:|---:|---:|---:|",
 ]
 for row in rows:
     lines.append(
@@ -1025,20 +1019,14 @@ for row in rows:
         f"{fmt(row['off_rollout_time_seconds'])} | "
         f"{fmt(row['on_rollout_time_seconds'])} | "
         f"{fmt(row['rollout_speedup'])} | "
-        f"{fmt(row['throughput_gain'], percent=True)} | "
-        f"{'yes' if row['kv_migration_evidence'] else 'no'} |"
+        f"{fmt(row['throughput_gain'], percent=True)} |"
     )
 
 invalid = [row for row in rows if not row["valid"]]
-if invalid or not kv_evidence:
+if invalid:
     lines.extend(["", "## Acceptance notes", ""])
     for row in invalid:
         lines.append(f"- Pair {row['pair']}: {row['invalid_reasons']}")
-    if not kv_evidence:
-        lines.append(
-            "- No correlated moved decision with `cache_source=mooncake` and "
-            "`actual_cached_tokens>0` was observed; do not claim a KV-migration result."
-        )
 
 (root / "summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 print(f"summary: {root / 'summary.md'}")

@@ -11,6 +11,7 @@ import signal
 import subprocess
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import httpx
@@ -184,13 +185,14 @@ def test_config_derives_metrics_staleness():
 
 def test_config_defaults_propagate_to_online_models():
     config = EngineRebalancingConfig(enabled=True)
-    assert config.snapshot()["load_poll_interval_ms"] == 250
-    assert config.snapshot()["history_size"] == 256
-    assert config.snapshot()["min_samples"] == 16
-    assert config.snapshot()["min_hold_turns"] == 2
-    assert config.snapshot()["min_risk_ms"] == 10
-    assert config.snapshot()["cold_start_hit_probability"] == 1.0
-    assert config.snapshot()["min_load_improvement_ratio"] == 0.20
+    snapshot = config.snapshot()
+    assert snapshot["load_poll_interval_ms"] == 250
+    assert snapshot["history_size"] == 256
+    assert snapshot["min_samples"] == 16
+    assert snapshot["min_risk_ms"] == 10
+    assert snapshot["cold_start_hit_probability"] == 1.0
+    assert "min_hold_turns" not in snapshot
+    assert "min_load_improvement_ratio" not in snapshot
 
     rebalancer = EngineRebalancer(
         ControlPlaneClient(),
@@ -202,12 +204,6 @@ def test_config_defaults_propagate_to_online_models():
     assert rebalancer.cache_hits.min_samples == 16
     assert rebalancer.cache_hits.cold_start_probability == 1.0
     assert rebalancer.step_lengths.min_samples == 16
-
-
-@pytest.mark.parametrize("value", [-0.01, 1.01])
-def test_config_rejects_out_of_range_load_improvement_ratio(value):
-    with pytest.raises(ValueError, match="min_load_improvement_ratio"):
-        EngineRebalancingConfig(min_load_improvement_ratio=value)
 
 
 def test_load_score_uses_reservation_envelopes_and_adds_pending_step_once():
@@ -291,8 +287,8 @@ def test_load_score_uses_reservation_envelopes_and_adds_pending_step_once():
 def test_state_machine_distinguishes_bootstrap_and_degraded():
     config = EngineRebalancingConfig(enabled=True)
     state = CompatibilityPoolStateMachine("fp", config, now=1.0)
-    not_ready = PoolReadiness(2, True, True, False, False, 0)
-    ready = PoolReadiness(2, True, True, True, True, 1)
+    not_ready = PoolReadiness(2, False, True, False, False)
+    ready = PoolReadiness(2, True, True, True, True)
 
     assert state.update(not_ready, now=2.0) is SchedulerState.BOOTSTRAP
     assert state.update(ready, now=3.0) is SchedulerState.ACTIVE
@@ -307,10 +303,26 @@ def test_pool_readiness_does_not_require_performance_history():
         model_cache_profile_ready=False,
         queue_model_ready=False,
         prefill_model_ready=False,
-        eligible_paths=1,
     )
 
     assert readiness.ready is True
+
+
+def test_pool_readiness_for_placement_does_not_require_migration_path():
+    rebalancer = EngineRebalancer(
+        ControlPlaneClient(shared_l3=False),
+        config=EngineRebalancingConfig(enabled=True),
+        model_id="model",
+        model_config=simple_model_config(),
+    )
+
+    async def scenario():
+        await rebalancer.refresh()
+        fingerprint = next(iter(rebalancer.pools))
+        readiness = rebalancer._pool_readiness(fingerprint, now=time.monotonic())
+        assert readiness.ready is True
+
+    run(scenario())
 
 
 def test_model_cache_profile_uses_context_and_dtype():
@@ -1129,7 +1141,7 @@ def test_shared_l3_calibration_plan_executes_required_restore_links():
     assert "d2h" not in readiness.required_links
 
 
-def test_missing_l3_calibration_is_not_migration_eligible():
+def test_missing_l3_calibration_does_not_block_placement_readiness():
     client = ControlPlaneClient(shared_l3=True)
     rebalancer = EngineRebalancer(
         client,
@@ -1160,8 +1172,7 @@ def test_missing_l3_calibration_is_not_migration_eligible():
         assert readiness.cache_source is CacheSource.NONE
         assert "full prefill" in readiness.skipped_links["fallback"]
         pool = rebalancer._pool_readiness(fingerprint, now=time.monotonic())
-        assert pool.ready is False
-        assert pool.eligible_paths == 0
+        assert pool.ready is True
 
     run(scenario())
 
@@ -1599,7 +1610,7 @@ def test_reservations_spread_simultaneous_new_sessions():
             assert first.worker_url != second.worker_url
             assert first.decision.reason == "new_session_min_load"
             assert second.decision.reason == "new_session_min_load"
-            assert first.decision.source_base_load is None
+            assert "source_base_load" not in first.decision.snapshot()
             assert first.decision.target_projected_load is not None
             assert first.decision.target_projected_load.total > 0
         finally:
@@ -1609,504 +1620,8 @@ def test_reservations_spread_simultaneous_new_sessions():
     run(scenario())
 
 
-@pytest.mark.parametrize(
-    (
-        "source_running",
-        "target_running",
-        "source_queued",
-        "target_queued",
-        "source_prefill",
-        "target_prefill",
-        "expected_worker",
-        "expected_reason",
-        "expected_required_ratio",
-    ),
-    [
-        (
-            100,
-            61,
-            0,
-            0,
-            0,
-            0,
-            "source",
-            "no_backlog_load_improvement_below_threshold",
-            0.40,
-        ),
-        (
-            100,
-            60,
-            0,
-            0,
-            0,
-            0,
-            "target",
-            "no_backlog_load_improvement_threshold_met",
-            0.40,
-        ),
-        (
-            2,
-            1,
-            0,
-            0,
-            0,
-            0,
-            "target",
-            "no_backlog_load_improvement_threshold_met",
-            0.40,
-        ),
-        (
-            2,
-            0,
-            1,
-            1,
-            0,
-            0,
-            "target",
-            "no_backlog_load_improvement_threshold_met",
-            0.40,
-        ),
-        (2, 1, 1, 0, 0, 0, "target", "load_improvement_threshold_met", 0.20),
-        (
-            2,
-            1,
-            0,
-            0,
-            1_000,
-            0,
-            "target",
-            "load_improvement_threshold_met",
-            0.20,
-        ),
-    ],
-)
-def test_existing_session_uses_two_level_backlog_threshold(
-    source_running,
-    target_running,
-    source_queued,
-    target_queued,
-    source_prefill,
-    target_prefill,
-    expected_worker,
-    expected_reason,
-    expected_required_ratio,
-):
+def test_healthy_existing_session_stays_on_owner_regardless_of_load_or_l3_path():
     client = ControlPlaneClient(shared_l3=True)
-
-    async def benchmark(task, payload):
-        del task
-        return CalibrationSample(
-            latency_seconds=0.01,
-            bandwidth_bytes_per_second=max(1, payload * 10),
-        )
-
-    rebalancer = EngineRebalancer(
-        client,
-        config=EngineRebalancingConfig(enabled=True, min_hold_turns=1),
-        model_id="model",
-        model_config=simple_model_config(),
-        calibration_benchmark=benchmark,
-    )
-
-    async def scenario():
-        await rebalancer.refresh()
-        source, target = client.urls
-        rebalancer.loads[source].running = source_running
-        rebalancer.loads[source].queued = source_queued
-        rebalancer.loads[source].waiting_uncached_tokens = source_prefill
-        rebalancer.loads[target].running = target_running
-        rebalancer.loads[target].queued = target_queued
-        rebalancer.loads[target].waiting_uncached_tokens = target_prefill
-        fingerprint = rebalancer.deployments[source].cache_fingerprint
-        rebalancer.sessions["backlog"] = SessionRoutingState(
-            owner_worker_url=source,
-            fingerprint=fingerprint,
-            previous_committed_tokens=[1] * 100,
-            seen_engines={source},
-            owner_turns=2,
-        )
-
-        lease = await rebalancer.acquire(
-            session_id="backlog",
-            input_ids=[1] * 100,
-        )
-        try:
-            assert lease.worker_url == (
-                source if expected_worker == "source" else target
-            )
-            assert lease.decision.reason == expected_reason
-            assert (
-                lease.decision.required_load_improvement_ratio
-                == expected_required_ratio
-            )
-        finally:
-            await rebalancer.fail(lease)
-
-    run(scenario())
-
-
-def test_existing_session_selects_lowest_load_target_with_backlog_advantage():
-    client = ControlPlaneClient(shared_l3=True)
-    client.urls.append("http://node-c:30000")
-
-    async def benchmark(task, payload):
-        del task
-        return CalibrationSample(
-            latency_seconds=0.01,
-            bandwidth_bytes_per_second=max(1, payload * 10),
-        )
-
-    rebalancer = EngineRebalancer(
-        client,
-        config=EngineRebalancingConfig(enabled=True, min_hold_turns=1),
-        model_id="model",
-        model_config=simple_model_config(),
-        calibration_benchmark=benchmark,
-    )
-
-    async def scenario():
-        await rebalancer.refresh()
-        source, lowest_load_without_advantage, eligible_target = client.urls
-        rebalancer.loads[source].running = 4
-        rebalancer.loads[source].queued = 1
-        rebalancer.loads[lowest_load_without_advantage].queued = 1
-        rebalancer.loads[eligible_target].running = 2
-        fingerprint = rebalancer.deployments[source].cache_fingerprint
-        rebalancer.sessions["backlog-target"] = SessionRoutingState(
-            owner_worker_url=source,
-            fingerprint=fingerprint,
-            previous_committed_tokens=[1] * 100,
-            seen_engines={source},
-            owner_turns=2,
-        )
-
-        lease = await rebalancer.acquire(
-            session_id="backlog-target",
-            input_ids=[1] * 100,
-        )
-        try:
-            assert lease.worker_url == eligible_target
-            assert lease.decision.reason == "load_improvement_threshold_met"
-            assert lease.decision.target_base_load is not None
-            assert lease.decision.target_base_load.queue_pressure == 0.0
-        finally:
-            await rebalancer.fail(lease)
-
-    run(scenario())
-
-
-def test_existing_session_selects_lowest_load_target_without_backlog_advantage():
-    client = ControlPlaneClient(shared_l3=True)
-    client.urls.append("http://node-c:30000")
-
-    async def benchmark(task, payload):
-        del task
-        return CalibrationSample(
-            latency_seconds=0.01,
-            bandwidth_bytes_per_second=max(1, payload * 10),
-        )
-
-    rebalancer = EngineRebalancer(
-        client,
-        config=EngineRebalancingConfig(enabled=True, min_hold_turns=1),
-        model_id="model",
-        model_config=simple_model_config(),
-        calibration_benchmark=benchmark,
-    )
-
-    async def scenario():
-        await rebalancer.refresh()
-        source, lowest_load, higher_load = client.urls
-        rebalancer.loads[source].running = 100
-        rebalancer.loads[lowest_load].running = 20
-        rebalancer.loads[higher_load].running = 50
-        fingerprint = rebalancer.deployments[source].cache_fingerprint
-        rebalancer.sessions["no-backlog-target"] = SessionRoutingState(
-            owner_worker_url=source,
-            fingerprint=fingerprint,
-            previous_committed_tokens=[1] * 100,
-            seen_engines={source},
-            owner_turns=2,
-        )
-
-        lease = await rebalancer.acquire(
-            session_id="no-backlog-target",
-            input_ids=[1] * 100,
-        )
-        try:
-            assert lease.worker_url == lowest_load
-            assert (
-                lease.decision.reason
-                == "no_backlog_load_improvement_threshold_met"
-            )
-            assert lease.decision.required_load_improvement_ratio == 0.40
-        finally:
-            await rebalancer.fail(lease)
-
-    run(scenario())
-
-
-@pytest.mark.parametrize(
-    (
-        "target_running",
-        "minimum_ratio",
-        "expected_worker",
-        "expected_reason",
-    ),
-    [
-        (71, 0.30, "source", "load_improvement_below_threshold"),
-        (70, 0.30, "target", "load_improvement_threshold_met"),
-        (69, 0.30, "target", "load_improvement_threshold_met"),
-        (65, 0.40, "source", "load_improvement_below_threshold"),
-    ],
-)
-def test_existing_session_uses_base_load_improvement_threshold(
-    target_running, minimum_ratio, expected_worker, expected_reason
-):
-    client = ControlPlaneClient(shared_l3=True)
-
-    async def benchmark(task, payload):
-        del task
-        return CalibrationSample(
-            latency_seconds=0.01,
-            bandwidth_bytes_per_second=max(1, payload * 10),
-        )
-
-    rebalancer = EngineRebalancer(
-        client,
-        config=EngineRebalancingConfig(
-            enabled=True,
-            min_hold_turns=1,
-            min_load_improvement_ratio=minimum_ratio,
-        ),
-        model_id="model",
-        model_config=simple_model_config(),
-        calibration_benchmark=benchmark,
-    )
-
-    async def scenario():
-        await rebalancer.refresh()
-        source, target = client.urls
-        rebalancer.loads[source].running = 100
-        rebalancer.loads[source].waiting_uncached_tokens = 1
-        rebalancer.loads[target].running = target_running
-        fingerprint = rebalancer.deployments[source].cache_fingerprint
-        rebalancer.sessions["threshold"] = SessionRoutingState(
-            owner_worker_url=source,
-            fingerprint=fingerprint,
-            previous_committed_tokens=[1] * 100,
-            seen_engines={source, target},
-            owner_turns=2,
-        )
-
-        lease = await rebalancer.acquire(
-            session_id="threshold",
-            input_ids=[1] * 100,
-        )
-        try:
-            assert lease.worker_url == (
-                source if expected_worker == "source" else target
-            )
-            assert lease.decision.reason == expected_reason
-            assert lease.decision.source_base_load is not None
-            assert lease.decision.target_base_load is not None
-            assert lease.decision.load_improvement_ratio == pytest.approx(
-                (
-                    lease.decision.source_base_load.total
-                    - lease.decision.target_base_load.total
-                )
-                / lease.decision.source_base_load.total
-            )
-            assert lease.decision.required_load_improvement_ratio == minimum_ratio
-            assert lease.decision.source_context is None
-            assert lease.decision.target_context is None
-        finally:
-            await rebalancer.fail(lease)
-
-    run(scenario())
-
-
-@pytest.mark.parametrize(
-    (
-        "min_hold_turns",
-        "target_running",
-        "owner_turns",
-        "expected_worker",
-        "expected_reason",
-        "required",
-    ),
-    [
-        (1, 50, 1, "source", "return_hysteresis_below_threshold", 0.60),
-        (1, 40, 1, "target", "load_improvement_threshold_met", 0.60),
-        (2, 50, 2, "source", "return_hysteresis_below_threshold", 0.60),
-        (2, 40, 2, "target", "load_improvement_threshold_met", 0.60),
-        (2, 50, 3, "target", "load_improvement_threshold_met", 0.30),
-    ],
-)
-def test_previous_owner_uses_double_threshold_only_for_first_step(
-    min_hold_turns,
-    target_running,
-    owner_turns,
-    expected_worker,
-    expected_reason,
-    required,
-):
-    client = ControlPlaneClient(shared_l3=True)
-
-    async def benchmark(task, payload):
-        del task
-        return CalibrationSample(
-            latency_seconds=0.01,
-            bandwidth_bytes_per_second=max(1, payload * 10),
-        )
-
-    rebalancer = EngineRebalancer(
-        client,
-        config=EngineRebalancingConfig(
-            enabled=True,
-            min_hold_turns=min_hold_turns,
-            min_load_improvement_ratio=0.30,
-        ),
-        model_id="model",
-        model_config=simple_model_config(),
-        calibration_benchmark=benchmark,
-    )
-
-    async def scenario():
-        await rebalancer.refresh()
-        source, target = client.urls
-        rebalancer.loads[source].running = 100
-        rebalancer.loads[source].waiting_uncached_tokens = 1
-        rebalancer.loads[target].running = target_running
-        fingerprint = rebalancer.deployments[source].cache_fingerprint
-        rebalancer.sessions["return"] = SessionRoutingState(
-            owner_worker_url=source,
-            previous_owner_worker_url=target,
-            fingerprint=fingerprint,
-            previous_committed_tokens=[1] * 100,
-            seen_engines={source, target},
-            owner_turns=owner_turns,
-        )
-
-        lease = await rebalancer.acquire(
-            session_id="return",
-            input_ids=[1] * 100,
-        )
-        try:
-            assert lease.worker_url == (
-                source if expected_worker == "source" else target
-            )
-            assert lease.decision.reason == expected_reason
-            assert lease.decision.required_load_improvement_ratio == required
-        finally:
-            await rebalancer.fail(lease)
-
-    run(scenario())
-
-
-def test_no_backlog_and_previous_owner_share_one_double_threshold():
-    client = ControlPlaneClient(shared_l3=True)
-
-    async def benchmark(task, payload):
-        del task
-        return CalibrationSample(
-            latency_seconds=0.01,
-            bandwidth_bytes_per_second=max(1, payload * 10),
-        )
-
-    rebalancer = EngineRebalancer(
-        client,
-        config=EngineRebalancingConfig(
-            enabled=True,
-            min_hold_turns=2,
-            min_load_improvement_ratio=0.20,
-        ),
-        model_id="model",
-        model_config=simple_model_config(),
-        calibration_benchmark=benchmark,
-    )
-
-    async def scenario():
-        await rebalancer.refresh()
-        source, previous_owner = client.urls
-        rebalancer.loads[source].running = 100
-        rebalancer.loads[previous_owner].running = 50
-        fingerprint = rebalancer.deployments[source].cache_fingerprint
-        rebalancer.sessions["no-backlog-return"] = SessionRoutingState(
-            owner_worker_url=source,
-            previous_owner_worker_url=previous_owner,
-            fingerprint=fingerprint,
-            previous_committed_tokens=[1] * 100,
-            seen_engines={source, previous_owner},
-            owner_turns=2,
-        )
-
-        lease = await rebalancer.acquire(
-            session_id="no-backlog-return",
-            input_ids=[1] * 100,
-        )
-        try:
-            assert lease.worker_url == previous_owner
-            assert (
-                lease.decision.reason
-                == "no_backlog_load_improvement_threshold_met"
-            )
-            assert lease.decision.required_load_improvement_ratio == 0.40
-        finally:
-            await rebalancer.fail(lease)
-
-    run(scenario())
-
-
-def test_min_hold_turns_blocks_otherwise_beneficial_migration():
-    client = ControlPlaneClient(shared_l3=True)
-
-    async def benchmark(task, payload):
-        del task
-        return CalibrationSample(
-            latency_seconds=0.01,
-            bandwidth_bytes_per_second=max(1, payload * 10),
-        )
-
-    rebalancer = EngineRebalancer(
-        client,
-        config=EngineRebalancingConfig(enabled=True, min_hold_turns=2),
-        model_id="model",
-        model_config=simple_model_config(),
-        calibration_benchmark=benchmark,
-    )
-
-    async def scenario():
-        await rebalancer.refresh()
-        source, target = client.urls
-        rebalancer.loads[source].running = 100
-        rebalancer.loads[target].running = 50
-        fingerprint = rebalancer.deployments[source].cache_fingerprint
-        rebalancer.sessions["held"] = SessionRoutingState(
-            owner_worker_url=source,
-            fingerprint=fingerprint,
-            previous_committed_tokens=[1] * 100,
-            seen_engines={source},
-            owner_turns=1,
-        )
-
-        lease = await rebalancer.acquire(
-            session_id="held",
-            input_ids=[1] * 100,
-        )
-        try:
-            assert lease.worker_url == source
-            assert lease.decision.reason == "min_hold_turns_not_met"
-            assert lease.decision.load_improvement_ratio == pytest.approx(0.5)
-        finally:
-            await rebalancer.fail(lease)
-
-    run(scenario())
-
-
-def test_default_hold_blocks_next_hop_until_second_owner_turn():
-    client = ControlPlaneClient(shared_l3=True)
-    client.urls.append("http://node-c:30000")
 
     async def benchmark(task, payload):
         del task
@@ -2125,157 +1640,62 @@ def test_default_hold_blocks_next_hop_until_second_owner_turn():
 
     async def scenario():
         await rebalancer.refresh()
-        previous_owner, source, target = client.urls
-        rebalancer.loads[previous_owner].running = 100
-        rebalancer.loads[source].running = 4
-        rebalancer.loads[source].queued = 1
-        fingerprint = rebalancer.deployments[source].cache_fingerprint
-        rebalancer.sessions["multi-hop"] = SessionRoutingState(
-            owner_worker_url=source,
-            previous_owner_worker_url=previous_owner,
-            fingerprint=fingerprint,
-            previous_committed_tokens=[1] * 100,
-            seen_engines={previous_owner, source},
-            owner_turns=1,
-        )
-
-        sticky = await rebalancer.acquire(
-            session_id="multi-hop",
-            input_ids=[1] * 100,
-        )
-        assert sticky.worker_url == source
-        assert sticky.decision.reason == "min_hold_turns_not_met"
-        await rebalancer.complete(
-            sticky,
-            response_meta={
-                "cached_tokens": 100,
-                "queue_time": 0.0,
-                "e2e_latency": 1.0,
-                "decode_throughput": 10.0,
-            },
-            output_tokens=1,
-            committed_tokens=[1] * 100,
-        )
-        assert rebalancer.sessions["multi-hop"].owner_turns == 2
-
-        movable = await rebalancer.acquire(
-            session_id="multi-hop",
-            input_ids=[1] * 100,
-        )
-        try:
-            assert movable.worker_url == target
-            assert movable.decision.reason == "load_improvement_threshold_met"
-        finally:
-            await rebalancer.fail(movable)
-
-    run(scenario())
-
-
-def test_seen_engine_without_shared_l3_is_not_a_migration_target():
-    client = ControlPlaneClient(shared_l3=False)
-    rebalancer = EngineRebalancer(
-        client,
-        config=EngineRebalancingConfig(enabled=True),
-        model_id="model",
-        model_config=simple_model_config(),
-    )
-
-    async def scenario():
-        await rebalancer.refresh()
         source, target = client.urls
-        rebalancer.loads[source].running = 100
-        rebalancer.loads[source].waiting_uncached_tokens = 1
+        rebalancer.loads[target].running = 100
         fingerprint = rebalancer.deployments[source].cache_fingerprint
-        rebalancer.sessions["seen-no-l3"] = SessionRoutingState(
+        rebalancer.sessions["sticky"] = SessionRoutingState(
             owner_worker_url=source,
             fingerprint=fingerprint,
             previous_committed_tokens=[1] * 100,
-            seen_engines={source, target},
-            owner_turns=2,
-        )
-        session = rebalancer.sessions["seen-no-l3"]
-        assert (
-            rebalancer._candidate_path_readiness(session, source, source).cache_source
-            is CacheSource.LOCAL
-        )
-        assert (
-            rebalancer._candidate_path_readiness(session, source, target).cache_source
-            is CacheSource.NONE
-        )
-
-        lease = await rebalancer.acquire(
-            session_id="seen-no-l3",
-            input_ids=[1] * 100,
-        )
-        try:
-            assert lease.worker_url == source
-            assert lease.decision.reason == "no_eligible_migration_target"
-            assert lease.decision.target_base_load is None
-        finally:
-            await rebalancer.fail(lease)
-
-    run(scenario())
-
-
-def test_existing_session_rejects_move_when_projected_target_is_busier():
-    client = ControlPlaneClient(shared_l3=True)
-
-    async def benchmark(task, payload):
-        del task
-        return CalibrationSample(
-            latency_seconds=0.01,
-            bandwidth_bytes_per_second=max(1, payload * 10),
-        )
-
-    rebalancer = EngineRebalancer(
-        client,
-        config=EngineRebalancingConfig(enabled=True, min_hold_turns=1),
-        model_id="model",
-        model_config=simple_model_config(),
-        calibration_benchmark=benchmark,
-    )
-
-    async def scenario():
-        await rebalancer.refresh()
-        source, target = client.urls
-        rebalancer.loads[source].running = 100
-        rebalancer.loads[source].request_capacity = 100
-        rebalancer.loads[source].token_capacity = 1_000
-        rebalancer.loads[target].running = 6
-        rebalancer.loads[target].request_capacity = 10
-        rebalancer.loads[target].token_capacity = 100
-        fingerprint = rebalancer.deployments[source].cache_fingerprint
-        rebalancer.sessions["projected-safety"] = SessionRoutingState(
-            owner_worker_url=source,
-            fingerprint=fingerprint,
-            previous_committed_tokens=[1] * 150,
             seen_engines={source},
-            owner_turns=2,
         )
 
+        for _ in range(2):
+            sticky = await rebalancer.acquire(
+                session_id="sticky",
+                input_ids=[1] * 100,
+            )
+            assert sticky.worker_url == source
+            await rebalancer.complete(
+                sticky,
+                response_meta={
+                    "cached_tokens": 100,
+                    "queue_time": 0.0,
+                    "e2e_latency": 1.0,
+                    "decode_throughput": 10.0,
+                },
+                output_tokens=1,
+                committed_tokens=[1] * 100,
+            )
+
+        rebalancer.loads[source].running = 100
+        rebalancer.loads[source].queued = 10
+        rebalancer.loads[source].waiting_uncached_tokens = 10_000
+        rebalancer.loads[target].running = 0
+
         lease = await rebalancer.acquire(
-            session_id="projected-safety",
-            input_ids=[1] * 150,
+            session_id="sticky",
+            input_ids=[1] * 100,
         )
         try:
             assert lease.worker_url == source
-            assert lease.decision.reason == "projected_load_safety_check_failed"
-            assert lease.decision.required_load_improvement_ratio == 0.40
-            assert lease.decision.load_improvement_ratio == pytest.approx(
-                (
-                    lease.decision.source_base_load.total
-                    - lease.decision.target_base_load.total
-                )
-                / lease.decision.source_base_load.total
-            )
-            assert (
-                lease.decision.target_projected_load.total
-                > lease.decision.source_projected_load.total
-            )
+            assert lease.decision.reason == "existing_session_sticky"
+            assert lease.decision.moved is False
+            assert lease.decision.target_projected_load is None
+            snapshot = lease.decision.snapshot()
+            for field in (
+                "source_base_load",
+                "target_base_load",
+                "source_projected_load",
+                "load_improvement_ratio",
+                "required_load_improvement_ratio",
+            ):
+                assert field not in snapshot
         finally:
             await rebalancer.fail(lease)
 
     run(scenario())
+
 
 
 def test_new_session_uses_projected_load_instead_of_prediction_history():
@@ -2464,7 +1884,7 @@ def test_step_budget_prefers_request_and_rollout_caps_before_context():
     run(scenario())
 
 
-def test_bootstrap_sticky_turn_keeps_committed_prefix_for_hit_learning():
+def test_sticky_turn_keeps_committed_prefix_for_hit_learning():
     client = ControlPlaneClient()
     rebalancer = EngineRebalancer(
         client,
@@ -2488,7 +1908,7 @@ def test_bootstrap_sticky_turn_keeps_committed_prefix_for_hit_learning():
             input_ids=[1, 2, 3, 9, 10],
         )
         try:
-            assert lease.decision.state is SchedulerState.BOOTSTRAP
+            assert lease.decision.state is SchedulerState.ACTIVE
             assert lease.base_tokens == 3
         finally:
             await rebalancer.fail(lease)
@@ -2769,325 +2189,6 @@ def test_prefill_reservations_expire_by_load_generation_and_release_on_failure()
     run(scenario())
 
 
-def test_active_scheduler_routes_from_load_without_prediction_history():
-    async def benchmark(task, payload):
-        del task
-        return CalibrationSample(
-            latency_seconds=0.01,
-            bandwidth_bytes_per_second=max(1, payload * 10),
-        )
-
-    client = ControlPlaneClient(shared_l3=True)
-    config = EngineRebalancingConfig(
-        enabled=True,
-        min_samples=1,
-        min_hold_turns=0,
-        min_risk_ms=100,
-    )
-    rebalancer = EngineRebalancer(
-        client,
-        config=config,
-        model_id="model",
-        model_config=simple_model_config(),
-        calibration_benchmark=benchmark,
-    )
-
-    async def scenario():
-        await rebalancer.refresh()
-        source, target = client.urls
-        fingerprint = rebalancer.deployments[source].cache_fingerprint
-        for url, queue in ((source, 5.0), (target, 0.0)):
-            rebalancer.performance.observe(
-                fingerprint=fingerprint,
-                engine_url=url,
-                running=1,
-                context_tokens=100,
-                queue_seconds=queue,
-                context_seconds=1.0,
-                cached_tokens=0,
-                output_tokens=1,
-                decode_throughput=10,
-            )
-        rebalancer.loads[source].running = 100
-        rebalancer.loads[source].waiting_uncached_tokens = 1
-        rebalancer.loads[target].running = 50
-        rebalancer.sessions["session"] = SessionRoutingState(
-            owner_worker_url=source,
-            fingerprint=fingerprint,
-            previous_committed_tokens=[1] * 80,
-            seen_engines={source},
-            owner_turns=2,
-        )
-        lease = await rebalancer.acquire(
-            session_id="session",
-            input_ids=[1] * 100,
-        )
-        try:
-            assert lease.decision.state is SchedulerState.ACTIVE
-            assert lease.decision.moved is True
-            assert lease.worker_url == target
-            assert lease.decision.reason == "load_improvement_threshold_met"
-            assert lease.decision.source_context is None
-            assert lease.decision.target_context is None
-            assert lease.decision.queue_risk_seconds == 0.0
-            assert lease.decision.context_risk_seconds == 0.0
-            assert lease.decision.decision_risk_seconds == 0.0
-            assert lease.decision.source_base_load is not None
-            assert lease.decision.target_base_load is not None
-            assert (
-                lease.decision.source_base_load.total
-                > lease.decision.target_base_load.total
-            )
-            snapshot = lease.decision.snapshot()
-            assert snapshot["source_base_load"]["total"] == pytest.approx(1.00001)
-            assert snapshot["target_base_load"]["total"] == pytest.approx(0.5)
-        finally:
-            await rebalancer.fail(lease)
-
-    run(scenario())
-
-
-def test_prefill_pressure_can_prevent_load_ratio_migration():
-    async def benchmark(task, payload):
-        del task
-        return CalibrationSample(
-            latency_seconds=0.01,
-            bandwidth_bytes_per_second=max(1, payload * 10),
-        )
-
-    client = ControlPlaneClient(shared_l3=True)
-    rebalancer = EngineRebalancer(
-        client,
-        config=EngineRebalancingConfig(
-            enabled=True,
-            min_samples=1,
-            min_hold_turns=0,
-            min_risk_ms=100,
-        ),
-        model_id="model",
-        model_config=simple_model_config(),
-        calibration_benchmark=benchmark,
-    )
-
-    async def scenario():
-        await rebalancer.refresh()
-        source, target = client.urls
-        fingerprint = rebalancer.deployments[source].cache_fingerprint
-        for url, queue in ((source, 2.0), (target, 0.1)):
-            rebalancer.performance.observe(
-                fingerprint=fingerprint,
-                engine_url=url,
-                running=1,
-                context_tokens=100,
-                queue_seconds=queue,
-                context_seconds=1.0,
-                cached_tokens=0,
-                output_tokens=1,
-                decode_throughput=10.0,
-                cache_source=CacheSource.NONE,
-            )
-        rebalancer.loads[source].running = 50
-        rebalancer.loads[target].running = 20
-        rebalancer.loads[source].waiting_uncached_tokens = 0
-        rebalancer.loads[target].waiting_uncached_tokens = 40_000
-        rebalancer.sessions["live-backlog"] = SessionRoutingState(
-            owner_worker_url=source,
-            fingerprint=fingerprint,
-            previous_committed_tokens=[1] * 80,
-            seen_engines={source},
-            owner_turns=2,
-        )
-
-        lease = await rebalancer.acquire(
-            session_id="live-backlog",
-            input_ids=[1] * 100,
-        )
-        try:
-            assert lease.decision.state is SchedulerState.ACTIVE
-            assert lease.decision.moved is False
-            assert lease.worker_url == source
-            assert lease.decision.reason == "owner_min_load"
-            assert lease.decision.target_base_load is not None
-            assert lease.decision.target_base_load.prefill_pressure == pytest.approx(
-                0.4
-            )
-            assert lease.reserved_prefill_tokens == 20
-        finally:
-            await rebalancer.fail(lease)
-
-    run(scenario())
-
-
-def test_mooncake_prior_does_not_affect_load_routing():
-    async def benchmark(task, payload):
-        del task
-        return CalibrationSample(
-            latency_seconds=0.01,
-            bandwidth_bytes_per_second=max(1, payload * 10),
-        )
-
-    async def prepare(cold_start_probability: float) -> EngineRebalancer:
-        client = ControlPlaneClient(shared_l3=True)
-        rebalancer = EngineRebalancer(
-            client,
-            config=EngineRebalancingConfig(
-                enabled=True,
-                cold_start_hit_probability=cold_start_probability,
-                min_hold_turns=1,
-            ),
-            model_id="model",
-            model_config=simple_model_config(),
-            calibration_benchmark=benchmark,
-        )
-        await rebalancer.refresh()
-        source, target = client.urls
-        fingerprint = rebalancer.deployments[source].cache_fingerprint
-        for _ in range(rebalancer.config.min_samples):
-            for engine_url, queue_seconds in ((source, 0.5), (target, 0.0)):
-                rebalancer.performance.observe(
-                    fingerprint=fingerprint,
-                    engine_url=engine_url,
-                    running=1,
-                    context_tokens=100,
-                    queue_seconds=queue_seconds,
-                    context_seconds=1.0,
-                    cached_tokens=0,
-                    output_tokens=1,
-                    decode_throughput=10.0,
-                    cache_source=CacheSource.NONE,
-                )
-        rebalancer.loads[source].queued = 1
-        rebalancer.pools[fingerprint].update(
-            rebalancer._pool_readiness(fingerprint, now=time.monotonic())
-        )
-        return rebalancer
-
-    async def decide(
-        rebalancer: EngineRebalancer,
-        *,
-        session_id: str,
-        owner_turns: int,
-    ) -> RoutingDecision:
-        source = rebalancer.client.urls[0]
-        fingerprint = rebalancer.deployments[source].cache_fingerprint
-        rebalancer.sessions[session_id] = SessionRoutingState(
-            owner_worker_url=source,
-            fingerprint=fingerprint,
-            previous_committed_tokens=[1] * 80,
-            seen_engines={source},
-            owner_turns=owner_turns,
-        )
-        lease = await rebalancer.acquire(
-            session_id=session_id,
-            input_ids=[1] * 100,
-        )
-        try:
-            return lease.decision
-        finally:
-            await rebalancer.fail(lease)
-
-    async def scenario():
-        conservative = await prepare(0.1)
-        default = await prepare(EngineRebalancingConfig().cold_start_hit_probability)
-
-        conservative_decision = await decide(
-            conservative,
-            session_id="conservative",
-            owner_turns=2,
-        )
-        held_decision = await decide(
-            default,
-            session_id="held",
-            owner_turns=1,
-        )
-        default_decision = await decide(
-            default,
-            session_id="default",
-            owner_turns=2,
-        )
-
-        for decision in (
-            conservative_decision,
-            held_decision,
-            default_decision,
-        ):
-            assert decision.moved is True
-            assert decision.reason == "load_improvement_threshold_met"
-            assert decision.source_context is None
-            assert decision.target_context is None
-        assert conservative_decision.load_improvement_ratio == pytest.approx(
-            default_decision.load_improvement_ratio
-        )
-        assert default.config.min_hold_turns == 1
-        assert default.config.min_risk_ms == 10
-
-    run(scenario())
-
-
-def test_prediction_history_cannot_bypass_missing_l3_path():
-    client = ControlPlaneClient()
-    rebalancer = EngineRebalancer(
-        client,
-        config=EngineRebalancingConfig(
-            enabled=True,
-            min_samples=1,
-            min_hold_turns=0,
-            min_risk_ms=100,
-        ),
-        model_id="model",
-        model_config=simple_model_config(),
-    )
-
-    async def scenario():
-        await rebalancer.refresh()
-        source, target = client.urls
-        fingerprint = rebalancer.deployments[source].cache_fingerprint
-        for url, queue_seconds, context_seconds in (
-            (source, 0.0, 4.0),
-            (target, 0.5, 1.0),
-        ):
-            rebalancer.performance.observe(
-                fingerprint=fingerprint,
-                engine_url=url,
-                running=1,
-                context_tokens=100,
-                queue_seconds=queue_seconds,
-                context_seconds=context_seconds,
-                cached_tokens=0,
-                output_tokens=10,
-                decode_throughput=10.0,
-                cache_source=CacheSource.NONE,
-            )
-        rebalancer.loads[source].queued = 1
-        rebalancer.pools[fingerprint].update(
-            rebalancer._pool_readiness(fingerprint, now=time.monotonic())
-        )
-        rebalancer.sessions["total-step"] = SessionRoutingState(
-            owner_worker_url=source,
-            fingerprint=fingerprint,
-            previous_committed_tokens=[],
-            seen_engines={source},
-            owner_turns=2,
-        )
-
-        lease = await rebalancer.acquire(
-            session_id="total-step",
-            input_ids=[1] * 100,
-            step_max_new_tokens=10,
-        )
-        try:
-            assert lease.worker_url == source
-            assert lease.decision.moved is False
-            assert lease.decision.reason == "no_eligible_migration_target"
-            assert lease.decision.stay_seconds is None
-            assert lease.decision.move_seconds is None
-            assert lease.decision.source_context is None
-            assert lease.decision.target_context is None
-        finally:
-            await rebalancer.fail(lease)
-
-    run(scenario())
-
 
 def test_owner_failure_uses_projected_load_without_threshold():
     client = ControlPlaneClient()
@@ -3120,7 +2221,6 @@ def test_owner_failure_uses_projected_load_without_threshold():
             fingerprint=fingerprint,
             previous_committed_tokens=[1] * 80,
             seen_engines={source},
-            owner_turns=2,
         )
 
         lease = await rebalancer.acquire(
@@ -3135,9 +2235,44 @@ def test_owner_failure_uses_projected_load_without_threshold():
             assert lease.decision.decision_risk_seconds == 0.0
             assert lease.decision.target_context is None
             assert lease.decision.target_projected_load is not None
-            assert lease.decision.required_load_improvement_ratio is None
+            assert "required_load_improvement_ratio" not in lease.decision.snapshot()
         finally:
             await rebalancer.fail(lease)
+
+    run(scenario())
+
+
+def test_owner_failure_without_compatible_healthy_engine_fails():
+    client = ControlPlaneClient()
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(enabled=True),
+        model_id="model",
+        model_config=simple_model_config(),
+    )
+
+    async def scenario():
+        await rebalancer.refresh()
+        source, target = client.urls
+        fingerprint = rebalancer.deployments[source].cache_fingerprint
+        rebalancer.loads[source].healthy = False
+        rebalancer.deployments[target] = replace(
+            rebalancer.deployments[target],
+            cache_fingerprint="incompatible",
+        )
+        rebalancer.sessions["failed-owner"] = SessionRoutingState(
+            owner_worker_url=source,
+            fingerprint=fingerprint,
+        )
+
+        with pytest.raises(
+            RuntimeError,
+            match="no healthy SGLang worker matches the session cache fingerprint",
+        ):
+            await rebalancer.acquire(
+                session_id="failed-owner",
+                input_ids=[1] * 100,
+            )
 
     run(scenario())
 
@@ -3156,7 +2291,6 @@ def test_load_routing_keeps_single_step_budget_for_reservation():
         config=EngineRebalancingConfig(
             enabled=True,
             min_samples=1,
-            min_hold_turns=0,
             min_risk_ms=100,
         ),
         model_id="model",
@@ -3184,13 +2318,6 @@ def test_load_routing_keeps_single_step_budget_for_reservation():
         rebalancer.loads[source].queued = 1
         rebalancer.loads[source].running = 100
         rebalancer.loads[target].running = 50
-        rebalancer.sessions["heterogeneous"] = SessionRoutingState(
-            owner_worker_url=source,
-            fingerprint=fingerprint,
-            previous_committed_tokens=[1] * 80,
-            seen_engines={source},
-            owner_turns=2,
-        )
         lease = await rebalancer.acquire(
             session_id="heterogeneous",
             input_ids=[1] * 100,
@@ -3198,11 +2325,12 @@ def test_load_routing_keeps_single_step_budget_for_reservation():
             context_remaining_tokens=56 * 1024,
         )
         try:
-            assert lease.decision.moved is True
+            assert lease.worker_url == target
+            assert lease.decision.reason == "new_session_min_load"
+            assert lease.decision.moved is False
             assert lease.decision.estimated_step_output_tokens == 8192
             assert lease.decision.source_decode_seconds is None
             assert lease.decision.target_decode_seconds is None
-            assert lease.decision.source_projected_load is not None
             assert lease.decision.target_projected_load is not None
             assert lease.reserved_tokens == 100 + 8192
         finally:
@@ -3210,92 +2338,6 @@ def test_load_routing_keeps_single_step_budget_for_reservation():
 
     run(scenario())
 
-
-def test_prediction_risks_do_not_block_load_ratio_migration():
-    async def benchmark(task, payload):
-        del task
-        return CalibrationSample(
-            latency_seconds=0.01,
-            bandwidth_bytes_per_second=max(1, payload * 10),
-        )
-
-    client = ControlPlaneClient(shared_l3=True)
-    rebalancer = EngineRebalancer(
-        client,
-        config=EngineRebalancingConfig(
-            enabled=True,
-            min_samples=1,
-            min_hold_turns=0,
-            min_risk_ms=100,
-        ),
-        model_id="model",
-        model_config=simple_model_config(),
-        calibration_benchmark=benchmark,
-    )
-
-    async def scenario():
-        await rebalancer.refresh()
-        source, target = client.urls
-        fingerprint = rebalancer.deployments[source].cache_fingerprint
-        # Queue errors are 1s on the source and 2s on the target. Context
-        # errors are also 1s and 2s, respectively.
-        rebalancer.performance.observe(
-            fingerprint=fingerprint,
-            engine_url=source,
-            running=1,
-            context_tokens=100,
-            queue_seconds=5.0,
-            predicted_queue_seconds=4.0,
-            context_seconds=1.0,
-            cached_tokens=80,
-            output_tokens=1,
-            decode_throughput=10,
-            estimated_context_seconds=2.0,
-            cache_source=CacheSource.LOCAL,
-        )
-        rebalancer.performance.observe(
-            fingerprint=fingerprint,
-            engine_url=target,
-            running=1,
-            context_tokens=100,
-            queue_seconds=0.0,
-            predicted_queue_seconds=2.0,
-            context_seconds=1.0,
-            cached_tokens=0,
-            output_tokens=1,
-            decode_throughput=10,
-            estimated_context_seconds=3.0,
-            cache_source=CacheSource.NONE,
-        )
-        rebalancer.loads[source].queued = 1
-        rebalancer.loads[source].running = 100
-        rebalancer.loads[target].running = 50
-        rebalancer.sessions["risk-blocked"] = SessionRoutingState(
-            owner_worker_url=source,
-            fingerprint=fingerprint,
-            previous_committed_tokens=[1] * 80,
-            seen_engines={source},
-            owner_turns=2,
-        )
-
-        lease = await rebalancer.acquire(
-            session_id="risk-blocked",
-            input_ids=[1] * 100,
-        )
-        try:
-            assert lease.decision.state is SchedulerState.ACTIVE
-            assert lease.decision.moved is True
-            assert lease.worker_url == target
-            assert lease.decision.reason == "load_improvement_threshold_met"
-            assert lease.decision.queue_risk_seconds == 0.0
-            assert lease.decision.context_risk_seconds == 0.0
-            assert lease.decision.decision_risk_seconds == 0.0
-            assert lease.decision.source_context is None
-            assert lease.decision.target_context is None
-        finally:
-            await rebalancer.fail(lease)
-
-    run(scenario())
 
 
 def test_completion_pairs_actual_queue_with_the_selected_path_prediction():
@@ -3480,45 +2522,8 @@ def test_cli_exposes_single_rebalancing_switch(monkeypatch):
     )
     args = parse_args()
     assert args.enable_engine_rebalancing is True
-    assert args.engine_rebalancing_min_load_improvement_ratio == 0.20
+    assert not hasattr(args, "engine_rebalancing_min_load_improvement_ratio")
 
-
-def test_cli_accepts_load_improvement_ratio(monkeypatch):
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            "dressage-proxy",
-            "--tokenizer-path",
-            "model",
-            "--enable-engine-rebalancing",
-            "--engine-rebalancing-min-load-improvement-ratio",
-            "0.45",
-        ],
-    )
-
-    assert parse_args().engine_rebalancing_min_load_improvement_ratio == 0.45
-
-
-@pytest.mark.parametrize("value", ["-0.01", "1.01"])
-def test_cli_rejects_out_of_range_load_improvement_ratio(
-    monkeypatch, capsys, value
-):
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            "dressage-proxy",
-            "--tokenizer-path",
-            "model",
-            "--engine-rebalancing-min-load-improvement-ratio",
-            value,
-        ],
-    )
-
-    with pytest.raises(SystemExit):
-        parse_args()
-    assert "must be between 0 and 1" in capsys.readouterr().err
 
 
 def test_enabled_proxy_places_first_request_directly_and_reports_state():
@@ -3561,10 +2566,10 @@ def test_enabled_proxy_places_first_request_directly_and_reports_state():
         assert loads["effective_config"]["load_poll_interval_ms"] == 250
         assert loads["effective_config"]["history_size"] == 256
         assert loads["effective_config"]["min_samples"] == 16
-        assert loads["effective_config"]["min_hold_turns"] == 2
         assert loads["effective_config"]["min_risk_ms"] == 10
         assert loads["effective_config"]["cold_start_hit_probability"] == 1.0
-        assert loads["effective_config"]["min_load_improvement_ratio"] == 0.20
+        assert "min_hold_turns" not in loads["effective_config"]
+        assert "min_load_improvement_ratio" not in loads["effective_config"]
         assert loads["compatibility_pools"][0]["state"] in {
             "BOOTSTRAP",
             "ACTIVE",
@@ -4316,6 +3321,46 @@ def test_engine_rebalancing_benchmark_prepares_once_before_both_runs():
     assert source.index(prepare_call) < source.index(run_loop)
     assert run_one.count('export PROMPT_DATA="${PROMPT_EFFECTIVE}"') == 1
     assert "prepare_long_tail_prompts" not in run_one
+
+
+def test_engine_rebalancing_benchmark_does_not_require_kv_migration_evidence(
+    tmp_path,
+):
+    source = Path(
+        "examples/scripts/benchmark_engine_rebalancing_qwen3.5_4b_sync_local_l3_hicache.sh"
+    ).read_text(encoding="utf-8")
+
+    assert "INCONCLUSIVE_NO_KV_MIGRATION" not in source
+    assert "elif not kv_evidence:" not in source
+    assert "if invalid or not kv_evidence:" not in source
+
+    seed = "20260806"
+    common = {
+        "valid_run": True,
+        "acceptance_errors": [],
+        "hostname": "host",
+        "gpu_inventory_sha256": "gpu",
+        "code_fingerprint": "code",
+        "effective_token_total": 100,
+        "trajectory_hash": "same",
+        "rollout_time_seconds": 10.0,
+        "effective_tokens_per_gpu_per_sec": 1.0,
+        "kv_migration_evidence": False,
+    }
+    for mode in ("off", "on"):
+        run_dir = tmp_path / f"seed{seed}-{mode}-r1"
+        run_dir.mkdir()
+        metrics = dict(common, calibration_state="READY" if mode == "on" else None)
+        (run_dir / "metrics.json").write_text(json.dumps(metrics), encoding="utf-8")
+
+    completed = _run_benchmark_heredoc(
+        "write_summary",
+        str(tmp_path),
+        seed,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "- Status: `PASS`" in (tmp_path / "summary.md").read_text()
 
 
 def test_engine_rebalancing_benchmark_environment_records_prompt_fingerprints(

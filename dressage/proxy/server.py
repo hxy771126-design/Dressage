@@ -190,16 +190,6 @@ def _non_negative_finite_float(value: str) -> float:
     return parsed
 
 
-def _unit_interval_float(value: str) -> float:
-    try:
-        parsed = float(value)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError("must be a number") from exc
-    if not math.isfinite(parsed) or not 0.0 <= parsed <= 1.0:
-        raise argparse.ArgumentTypeError("must be between 0 and 1")
-    return parsed
-
-
 def _real_token_version(value: Any) -> str | None:
     if value is None:
         return None
@@ -2747,17 +2737,8 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         default=False,
         help=(
-            "Enable Proxy-side SGLang engine placement and turn-boundary "
-            "rebalancing. Disabled by default."
-        ),
-    )
-    parser.add_argument(
-        "--engine-rebalancing-min-load-improvement-ratio",
-        type=_unit_interval_float,
-        default=0.20,
-        help=(
-            "Minimum relative base-load improvement required for a voluntary "
-            "cross-Engine session migration."
+            "Enable load-aware initial SGLang Engine placement, sticky session "
+            "affinity, and unhealthy-owner failover. Disabled by default."
         ),
     )
     parser.add_argument(
@@ -2805,9 +2786,6 @@ def main() -> None:
         enable_engine_rebalancing=args.enable_engine_rebalancing,
         engine_rebalancing_config=EngineRebalancingConfig(
             enabled=args.enable_engine_rebalancing,
-            min_load_improvement_ratio=(
-                args.engine_rebalancing_min_load_improvement_ratio
-            ),
         ),
         engine_rebalancing_snapshot_root=(
             log_dir() / "proxy" / "rebalancing"
