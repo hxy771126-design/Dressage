@@ -288,7 +288,7 @@ def test_config_defaults_propagate_to_online_models():
     assert config.snapshot()["load_batch_coalescing_window_ms"] == 125
     assert config.snapshot()["history_size"] == 512
     assert config.snapshot()["min_samples"] == 16
-    assert config.snapshot()["min_hold_turns"] == 2
+    assert "min_hold_turns" not in config.snapshot()
     assert config.snapshot()["min_risk_ms"] == 10
     assert config.snapshot()["cold_start_hit_probability"] == 1.0
     assert config.snapshot()["min_load_improvement_ratio"] == 0.10
@@ -3843,7 +3843,7 @@ def test_existing_session_uses_two_level_backlog_threshold(
 
     rebalancer = EngineRebalancer(
         client,
-        config=EngineRebalancingConfig(enabled=True, min_hold_turns=1),
+        config=EngineRebalancingConfig(enabled=True),
         model_id="model",
         model_config=simple_model_config(),
         calibration_benchmark=benchmark,
@@ -3901,7 +3901,7 @@ def test_existing_session_selects_lowest_load_target_with_backlog_advantage():
 
     rebalancer = EngineRebalancer(
         client,
-        config=EngineRebalancingConfig(enabled=True, min_hold_turns=1),
+        config=EngineRebalancingConfig(enabled=True),
         model_id="model",
         model_config=simple_model_config(),
         calibration_benchmark=benchmark,
@@ -3954,7 +3954,7 @@ def test_existing_session_selects_lowest_load_target_without_backlog_advantage()
 
     rebalancer = EngineRebalancer(
         client,
-        config=EngineRebalancingConfig(enabled=True, min_hold_turns=1),
+        config=EngineRebalancingConfig(enabled=True),
         model_id="model",
         model_config=simple_model_config(),
         calibration_benchmark=benchmark,
@@ -4022,7 +4022,6 @@ def test_existing_session_uses_base_load_improvement_threshold(
         client,
         config=EngineRebalancingConfig(
             enabled=True,
-            min_hold_turns=1,
             min_load_improvement_ratio=minimum_ratio,
         ),
         model_id="model",
@@ -4066,19 +4065,8 @@ def test_existing_session_uses_base_load_improvement_threshold(
     run(scenario())
 
 
-@pytest.mark.parametrize(
-    ("min_hold_turns", "target_running"),
-    [
-        (1, 50),
-        (1, 40),
-        (2, 50),
-        (2, 40),
-        (3, 50),
-    ],
-)
-def test_batch_gate_ignores_legacy_hold_configuration(
-    min_hold_turns, target_running
-):
+@pytest.mark.parametrize("target_running", [50, 40])
+def test_batch_gate_uses_configured_ratio_across_target_loads(target_running):
     client = ControlPlaneClient(shared_l3=True)
 
     async def benchmark(task, payload):
@@ -4092,7 +4080,6 @@ def test_batch_gate_ignores_legacy_hold_configuration(
         client,
         config=EngineRebalancingConfig(
             enabled=True,
-            min_hold_turns=min_hold_turns,
             min_load_improvement_ratio=0.30,
         ),
         model_id="model",
@@ -4146,7 +4133,6 @@ def test_batch_gate_uses_configured_ratio_without_previous_owner_state():
         client,
         config=EngineRebalancingConfig(
             enabled=True,
-            min_hold_turns=2,
             min_load_improvement_ratio=0.20,
         ),
         model_id="model",
@@ -4179,55 +4165,6 @@ def test_batch_gate_uses_configured_ratio_without_previous_owner_state():
                 "batch_optimized_migration",
             }
             assert lease.decision.required_load_improvement_ratio == 0.20
-        finally:
-            await rebalancer.fail(lease)
-
-    run(scenario())
-
-
-def test_min_hold_turns_does_not_restrict_batch_migration_edges():
-    client = ControlPlaneClient(shared_l3=True)
-
-    async def benchmark(task, payload):
-        del task
-        return CalibrationSample(
-            latency_seconds=0.01,
-            bandwidth_bytes_per_second=max(1, payload * 10),
-        )
-
-    rebalancer = EngineRebalancer(
-        client,
-        config=EngineRebalancingConfig(enabled=True, min_hold_turns=2),
-        model_id="model",
-        model_config=simple_model_config(),
-        calibration_benchmark=benchmark,
-    )
-
-    async def scenario():
-        await rebalancer.refresh()
-        source, target = client.urls
-        rebalancer.loads[source].running = 100
-        rebalancer.loads[target].running = 50
-        serve_current_loads_for_batch(client, rebalancer)
-        fingerprint = rebalancer.deployments[source].cache_fingerprint
-        rebalancer.sessions["held"] = SessionRoutingState(
-            owner_worker_url=source,
-            fingerprint=fingerprint,
-            previous_committed_tokens=[1] * 100,
-            seen_engines={source},
-        )
-
-        lease = await rebalancer.acquire(
-            session_id="held",
-            input_ids=[1] * 100,
-        )
-        try:
-            assert lease.worker_url in {source, target}
-            assert lease.decision.reason in {
-                "batch_sticky",
-                "batch_optimized_migration",
-            }
-            assert lease.decision.required_load_improvement_ratio == 0.10
         finally:
             await rebalancer.fail(lease)
 
@@ -4366,7 +4303,7 @@ def test_existing_session_rejects_move_when_projected_target_is_busier():
 
     rebalancer = EngineRebalancer(
         client,
-        config=EngineRebalancingConfig(enabled=True, min_hold_turns=1),
+        config=EngineRebalancingConfig(enabled=True),
         model_id="model",
         model_config=simple_model_config(),
         calibration_benchmark=benchmark,
@@ -5031,7 +4968,6 @@ def test_active_scheduler_routes_from_load_without_prediction_history():
     config = EngineRebalancingConfig(
         enabled=True,
         min_samples=1,
-        min_hold_turns=0,
         min_risk_ms=100,
     )
     rebalancer = EngineRebalancer(
@@ -5109,7 +5045,6 @@ def test_prefill_pressure_can_prevent_load_ratio_migration():
         config=EngineRebalancingConfig(
             enabled=True,
             min_samples=1,
-            min_hold_turns=0,
             min_risk_ms=100,
         ),
         model_id="model",
@@ -5183,7 +5118,6 @@ def test_mooncake_prior_does_not_affect_load_routing():
             config=EngineRebalancingConfig(
                 enabled=True,
                 cold_start_hit_probability=cold_start_probability,
-                min_hold_turns=1,
             ),
             model_id="model",
             model_config=simple_model_config(),
@@ -5259,7 +5193,6 @@ def test_mooncake_prior_does_not_affect_load_routing():
         assert conservative_decision.load_improvement_ratio == pytest.approx(
             default_decision.load_improvement_ratio
         )
-        assert default.config.min_hold_turns == 1
         assert default.config.min_risk_ms == 10
 
     run(scenario())
@@ -5272,7 +5205,6 @@ def test_prediction_history_cannot_bypass_missing_l3_path():
         config=EngineRebalancingConfig(
             enabled=True,
             min_samples=1,
-            min_hold_turns=0,
             min_risk_ms=100,
         ),
         model_id="model",
@@ -5399,7 +5331,6 @@ def test_load_routing_keeps_single_step_budget_for_reservation():
         config=EngineRebalancingConfig(
             enabled=True,
             min_samples=1,
-            min_hold_turns=0,
             min_risk_ms=100,
         ),
         model_id="model",
@@ -5471,7 +5402,6 @@ def test_prediction_risks_do_not_block_load_ratio_migration():
         config=EngineRebalancingConfig(
             enabled=True,
             min_samples=1,
-            min_hold_turns=0,
             min_risk_ms=100,
         ),
         model_id="model",
@@ -6038,7 +5968,7 @@ def test_enabled_proxy_places_first_request_directly_and_reports_state():
         )
         assert loads["effective_config"]["history_size"] == 512
         assert loads["effective_config"]["min_samples"] == 16
-        assert loads["effective_config"]["min_hold_turns"] == 2
+        assert "min_hold_turns" not in loads["effective_config"]
         assert loads["effective_config"]["min_risk_ms"] == 10
         assert loads["effective_config"]["cold_start_hit_probability"] == 1.0
         assert loads["effective_config"]["min_load_improvement_ratio"] == 0.10
@@ -6174,7 +6104,7 @@ def test_engine_rebalancing_benchmark_defaults_to_one_off_on_pair(tmp_path):
     assert "Mooncake size: 24gb" in result.stdout
     assert "load batch window: 60 ms" in result.stdout
     assert "min load improvement ratio: 0.10" in result.stdout
-    assert "dressage_dapo_prompts_step_balanced_300.jsonl" in result.stdout
+    assert "dressage_dapo_prompts_step_balanced_256.jsonl" in result.stdout
     assert "warm-up" not in result.stdout
     assert "off-r2" not in result.stdout
     assert "on-r2" not in result.stdout
