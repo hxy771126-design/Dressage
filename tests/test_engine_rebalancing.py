@@ -76,8 +76,8 @@ def serve_current_loads_for_batch(client, rebalancer):
                     "num_running_reqs": load.running,
                     "num_waiting_reqs": load.queued,
                     "num_total_tokens": load.active_tokens,
-                    "max_total_num_tokens": load.token_capacity,
-                    "max_running_requests": load.request_capacity,
+                    "max_total_num_tokens": load.token_capacity or 100_000,
+                    "max_running_requests": load.request_capacity or 100,
                     "token_usage": load.token_usage,
                     "num_waiting_uncached_tokens": load.waiting_uncached_tokens,
                 }
@@ -266,9 +266,20 @@ async def wait_for_condition(condition, *, timeout=1.0):
         await asyncio.sleep(0)
 
 
-def test_config_derives_metrics_staleness():
+def test_config_metrics_staleness_is_independent_of_control_poll_interval():
     config = EngineRebalancingConfig(load_poll_interval_ms=750)
-    assert config.metrics_stale_ms == 3_000
+    assert config.metrics_stale_ms == 2_000
+    explicit = EngineRebalancingConfig(
+        load_poll_interval_ms=750,
+        metrics_stale_ms=3_000,
+    )
+    assert explicit.metrics_stale_ms == 3_000
+
+
+@pytest.mark.parametrize("value", [0, -1])
+def test_config_rejects_non_positive_metrics_staleness(value):
+    with pytest.raises(ValueError, match="metrics_stale_ms"):
+        EngineRebalancingConfig(metrics_stale_ms=value)
 
 
 def test_config_defaults_propagate_to_online_models():
@@ -325,6 +336,8 @@ def test_load_score_uses_reservation_envelopes_and_adds_pending_step_once():
         load.queued = 3
         load.active_tokens = 1_000
         load.reserved_tokens = 1_000
+        load.request_capacity = 100
+        load.token_capacity = 100_000
         load.token_usage = 0.005
         load.waiting_uncached_tokens = 80
         load.reserved_prefill_tokens = 80
@@ -956,6 +969,115 @@ def test_machine_calibration_finishes_before_router_discovery(monkeypatch):
     run(scenario())
 
 
+def test_first_acquire_waits_for_calibration_before_engine_discovery():
+    class CountingControlPlaneClient(ControlPlaneClient):
+        def __init__(self):
+            super().__init__()
+            self.list_workers_calls = 0
+
+        async def list_workers(self):
+            self.list_workers_calls += 1
+            return await super().list_workers()
+
+    client = CountingControlPlaneClient()
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(
+            enabled=True,
+            load_batch_coalescing_window_ms=0,
+        ),
+        model_id="model",
+        model_config=simple_model_config(),
+    )
+
+    async def scenario():
+        calibration_gate = asyncio.Event()
+
+        async def blocked_calibration():
+            await calibration_gate.wait()
+
+        rebalancer._calibration_task = asyncio.create_task(blocked_calibration())
+        acquire_task = asyncio.create_task(
+            rebalancer.acquire(session_id="first", input_ids=[1, 2, 3])
+        )
+        await asyncio.sleep(0)
+        assert client.list_workers_calls == 0
+
+        calibration_gate.set()
+        lease = await acquire_task
+        try:
+            assert client.list_workers_calls == 1
+            assert lease.worker_url in client.urls
+        finally:
+            await rebalancer.fail(lease)
+
+    run(scenario())
+
+
+def test_control_refresh_tracks_topology_without_fetching_worker_loads():
+    class MutableControlPlaneClient(ControlPlaneClient):
+        def __init__(self):
+            super().__init__()
+            self.health = {url: True for url in self.urls}
+            self.versions = {url: "7" for url in self.urls}
+            self.load_calls = 0
+
+        async def list_workers(self):
+            return [
+                {
+                    "url": url,
+                    "is_healthy": self.health[url],
+                    "connection_mode": "http",
+                }
+                for url in self.urls
+            ]
+
+        async def get_worker_loads(self, url):
+            self.load_calls += 1
+            return await super().get_worker_loads(url)
+
+        async def get_worker_weight_version(self, url):
+            return self.versions[url]
+
+    client = MutableControlPlaneClient()
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(enabled=True),
+        model_id="model",
+        model_config=simple_model_config(),
+    )
+
+    async def scenario():
+        await rebalancer.refresh()
+
+        assert client.load_calls == 0
+        assert set(rebalancer.deployments) == set(client.urls)
+        assert set(rebalancer.loads) == set(client.urls)
+        assert all(load.healthy for load in rebalancer.loads.values())
+        assert all(load.metrics_timestamp == 0 for load in rebalancer.loads.values())
+
+        unhealthy = client.urls[0]
+        existing = client.urls[1]
+        added = "http://node-c:30000"
+        client.health[unhealthy] = False
+        client.urls.append(added)
+        client.health[added] = True
+        client.versions[added] = "8"
+        client.versions[existing] = "8"
+        rebalancer._deployment_refresh_seconds = 0
+
+        await rebalancer.refresh()
+
+        assert client.load_calls == 0
+        assert rebalancer.loads[unhealthy].healthy is False
+        assert rebalancer.loads[existing].healthy is True
+        assert rebalancer.loads[added].healthy is True
+        assert rebalancer.deployments[existing].weight_version == "8"
+        assert rebalancer.deployments[added].weight_version == "8"
+
+    run(scenario())
+
+
 def test_initial_snapshot_finishes_before_router_poll_starts(monkeypatch, tmp_path):
     rebalancer = EngineRebalancer(
         ControlPlaneClient(),
@@ -1390,6 +1512,61 @@ def test_batch_acquires_fetch_each_engine_once_and_publish_one_trace():
         ]
         for lease in leases:
             await rebalancer.fail(lease)
+
+    run(scenario())
+
+
+def test_batch_snapshot_refreshes_pool_readiness_after_control_only_polling():
+    async def benchmark(task, payload):
+        del task
+        return CalibrationSample(
+            latency_seconds=0.01,
+            bandwidth_bytes_per_second=max(1, payload * 10),
+        )
+
+    client = ControlPlaneClient(shared_l3=True)
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(enabled=True, min_samples=1),
+        model_id="model",
+        model_config=simple_model_config(),
+        calibration_benchmark=benchmark,
+    )
+
+    async def scenario():
+        await rebalancer.refresh()
+        fingerprint = rebalancer.deployments[client.urls[0]].cache_fingerprint
+        assert rebalancer.pools[fingerprint].state is SchedulerState.BOOTSTRAP
+
+        first = await rebalancer.acquire(
+            session_id="readiness-first",
+            input_ids=[1] * 10,
+        )
+        assert first.decision.state is SchedulerState.ACTIVE
+        await rebalancer.fail(first)
+
+        stale_timestamp = time.monotonic() - (
+            rebalancer.config.metrics_stale_ms / 1000.0
+        ) - 1.0
+        for load in rebalancer.loads.values():
+            load.metrics_timestamp = stale_timestamp
+        await rebalancer.refresh()
+        assert rebalancer.pools[fingerprint].state is SchedulerState.DEGRADED
+
+        second = await rebalancer.acquire(
+            session_id="readiness-second",
+            input_ids=[2] * 10,
+        )
+        try:
+            assert second.decision.state is SchedulerState.ACTIVE
+            snapshot = await rebalancer.snapshot()
+            assert len(snapshot["recent_load_batches"]) == 2
+            assert all(
+                engine["fetch_status"] == "ok"
+                for engine in snapshot["recent_load_batches"][-1]["engines"]
+            )
+        finally:
+            await rebalancer.fail(second)
 
     run(scenario())
 
@@ -4290,13 +4467,12 @@ def test_bootstrap_sticky_turn_keeps_committed_prefix_for_hit_learning():
 
 
 def test_load_snapshot_accepts_public_and_internal_queue_field_names():
-    client = ControlPlaneClient()
     rebalancer = EngineRebalancer(
-        client,
+        ControlPlaneClient(),
         config=EngineRebalancingConfig(enabled=True),
         model_id="model",
     )
-    rebalancer._update_load(
+    load = rebalancer._normalize_load(
         "worker",
         {
             "loads": [
@@ -4306,10 +4482,11 @@ def test_load_snapshot_accepts_public_and_internal_queue_field_names():
         },
         now=1.0,
     )
-    assert rebalancer.loads["worker"].queued == 5
-    assert rebalancer.loads["worker"].waiting_uncached_tokens == 0
-    assert rebalancer.loads["worker"].gen_throughput == 0.0
-    assert rebalancer.loads["worker"].live_queue_metrics_available is False
+    assert load is not None
+    assert load.queued == 5
+    assert load.waiting_uncached_tokens == 0
+    assert load.gen_throughput == 0.0
+    assert load.live_queue_metrics_available is False
 
 
 def test_load_snapshot_aggregates_live_queue_fields_across_dp_ranks():
@@ -4318,7 +4495,7 @@ def test_load_snapshot_aggregates_live_queue_fields_across_dp_ranks():
         config=EngineRebalancingConfig(enabled=True),
         model_id="model",
     )
-    rebalancer._update_load(
+    load = rebalancer._normalize_load(
         "worker",
         {
             "loads": [
@@ -4349,7 +4526,7 @@ def test_load_snapshot_aggregates_live_queue_fields_across_dp_ranks():
         now=1.0,
     )
 
-    load = rebalancer.loads["worker"]
+    assert load is not None
     assert load.queued == 7
     assert load.waiting_uncached_tokens == 8_000
     assert load.gen_throughput == 200.0
@@ -4600,15 +4777,6 @@ def test_live_prefill_ledger_retires_by_load_generation_and_releases_on_failure(
     async def scenario():
         await rebalancer.refresh()
         target = client.urls[0]
-        live_payload = {
-            "loads": [
-                {
-                    "num_waiting_uncached_tokens": 0,
-                    "num_waiting_reqs": 0,
-                }
-            ]
-        }
-        rebalancer._update_load(target, live_payload, now=time.monotonic())
         fingerprint = rebalancer.deployments[target].cache_fingerprint
         estimate = ContextRecoveryEstimate(
             cache_source=CacheSource.MOONCAKE,
@@ -4636,18 +4804,9 @@ def test_live_prefill_ledger_retires_by_load_generation_and_releases_on_failure(
         assert lease.reserved_prefill_tokens == 80
         assert rebalancer.loads[target].reserved_prefill_tokens == 80
 
-        generation = rebalancer._load_generations[target]
-        rebalancer._update_load(
-            target,
-            {"loads": [{"num_waiting_reqs": 0}]},
-            now=time.monotonic(),
-        )
-        assert rebalancer._load_generations[target] == generation
+        rebalancer._advance_prefill_reservation_generation(target)
         assert rebalancer.loads[target].reserved_prefill_tokens == 80
-
-        rebalancer._update_load(target, live_payload, now=time.monotonic())
-        assert rebalancer.loads[target].reserved_prefill_tokens == 80
-        rebalancer._update_load(target, live_payload, now=time.monotonic())
+        rebalancer._advance_prefill_reservation_generation(target)
         assert rebalancer.loads[target].reserved_prefill_tokens == 0
         await rebalancer.fail(lease)
         assert rebalancer.loads[target].reserved_prefill_tokens == 0

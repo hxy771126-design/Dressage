@@ -1088,41 +1088,34 @@ class EngineRebalancer:
 
         async def inspect_worker(
             url: str,
-        ) -> tuple[str, dict[str, Any], EngineDeploymentInfo | None, bool]:
-            try:
-                load = await self.client.get_worker_loads(url)
-            except Exception:
-                logger.debug(
-                    "failed to read SGLang load metrics from %s", url, exc_info=True
-                )
-                load = {}
+        ) -> tuple[str, EngineDeploymentInfo | None, bool]:
             last_checked = self._deployment_checked_at.get(url, 0.0)
             refresh_deployment = (
                 url not in self.deployments
                 or inspection_started - last_checked >= self._deployment_refresh_seconds
             )
             if not refresh_deployment:
-                return url, load, None, False
+                return url, None, False
             info, version = await asyncio.gather(
                 self.client.get_server_info(url),
                 self.client.get_worker_weight_version(url),
                 return_exceptions=True,
             )
             if isinstance(info, Exception) or isinstance(version, Exception):
-                return url, load, None, False
+                return url, None, False
             deployment = EngineDeploymentInfo.from_worker(
                 worker_url=url,
                 server_info=info,
                 weight_version=version,
                 model_id=self.model_id,
             )
-            return url, load, deployment, True
+            return url, deployment, True
 
         inspected = await asyncio.gather(*(inspect_worker(url) for url in healthy))
         now = time.monotonic()
         new_plans: list[tuple[str, CalibrationPlan]] = []
         async with self._lock:
-            for url, load_payload, deployment, deployment_checked in inspected:
+            for url, deployment, deployment_checked in inspected:
                 if deployment is not None:
                     if sglang_rebalancing_supported(deployment.sglang_version):
                         self.deployments[url] = deployment
@@ -1135,7 +1128,7 @@ class EngineRebalancer:
                         )
                 if deployment_checked:
                     self._deployment_checked_at[url] = now
-                self._update_load(url, load_payload, now=now)
+                self.loads.setdefault(url, EngineLoad(worker_url=url))
             for url, load in self.loads.items():
                 load.healthy = url in healthy
 
@@ -1223,26 +1216,6 @@ class EngineRebalancer:
                     state.update(
                         self._pool_readiness(fingerprint, now=time.monotonic())
                     )
-
-    def _update_load(self, url: str, payload: Mapping[str, Any], *, now: float) -> None:
-        normalized = self._normalize_load(url, payload, now=now)
-        load = self.loads.setdefault(url, EngineLoad(worker_url=url))
-        if normalized is None:
-            load.healthy = True
-            return
-        reserved = (
-            load.reserved_requests,
-            load.reserved_tokens,
-            load.reserved_prefill_tokens,
-        )
-        load.__dict__.update(normalized.__dict__)
-        (
-            load.reserved_requests,
-            load.reserved_tokens,
-            load.reserved_prefill_tokens,
-        ) = reserved
-        if load.live_queue_metrics_available:
-            self._advance_prefill_reservation_generation(url)
 
     @staticmethod
     def _normalize_load(
@@ -1652,6 +1625,9 @@ class EngineRebalancer:
                 expected_output_tokens=budget.estimated_step_output_tokens or 0,
             )
         if not self.deployments:
+            calibration_task = self._calibration_task
+            if calibration_task is not None and not calibration_task.done():
+                await asyncio.shield(calibration_task)
             try:
                 await self.refresh()
             except Exception:
@@ -1817,6 +1793,12 @@ class EngineRebalancer:
                 self._synchronize_reserved_load(url)
                 if published.live_queue_metrics_available:
                     self._advance_prefill_reservation_generation(url)
+
+            readiness_now = time.monotonic()
+            for fingerprint, state in self.pools.items():
+                state.update(
+                    self._pool_readiness(fingerprint, now=readiness_now)
+                )
 
             successful_urls = tuple(
                 sorted(
@@ -2136,6 +2118,18 @@ class EngineRebalancer:
                 - baselines.keys()
             ):
                 cached = self.loads[url]
+                fingerprint = self.deployments[url].cache_fingerprint
+                compatible = [
+                    engine
+                    for engine in engines
+                    if self.deployments[engine.url].cache_fingerprint == fingerprint
+                ]
+                request_capacity = cached.request_capacity or max(
+                    [engine.request_capacity for engine in compatible] + [1]
+                )
+                token_capacity = cached.token_capacity or max(
+                    [engine.token_capacity for engine in compatible] + [1]
+                )
                 live_requests, live_tokens, live_prefill = (
                     self._live_reservation_totals(url)
                 )
@@ -2148,13 +2142,13 @@ class EngineRebalancer:
                             cached.waiting_uncached_tokens,
                             live_prefill,
                         ),
-                        request_capacity=cached.request_capacity,
-                        token_capacity=cached.token_capacity,
+                        request_capacity=request_capacity,
+                        token_capacity=token_capacity,
                         token_usage=cached.token_usage,
                         queue_pressure=cached.queued
                         / max(
                             1,
-                            cached.request_capacity,
+                            request_capacity,
                             max_successful_queued,
                         ),
                     )

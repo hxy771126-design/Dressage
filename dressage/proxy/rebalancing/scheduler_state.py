@@ -34,16 +34,14 @@ class EngineRebalancingConfig:
     min_load_improvement_ratio: float = 0.10
 
     def __post_init__(self) -> None:
-        self.metrics_stale_ms = max(
-            int(self.metrics_stale_ms),
-            4 * int(self.load_poll_interval_ms),
-        )
         if self.load_poll_interval_ms <= 0:
             raise ValueError("load_poll_interval_ms must be positive")
         if self.load_batch_coalescing_window_ms < 0:
             raise ValueError(
                 "load_batch_coalescing_window_ms must be non-negative"
             )
+        if self.metrics_stale_ms <= 0:
+            raise ValueError("metrics_stale_ms must be positive")
         if self.history_size <= 0:
             raise ValueError("history_size must be positive")
         if self.min_samples <= 0:

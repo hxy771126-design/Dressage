@@ -298,9 +298,12 @@ accepts `ENGINE_REBALANCING_LOAD_BATCH_COALESCING_WINDOW_MS`. Batches are
 strictly serialized from fetch through
 commit, so time spent waiting for the preceding batch counts toward the next
 batch's window and a later snapshot is taken only after the preceding batch
-reservations have been published. The periodic load refresh controlled by
-`load_poll_interval_ms` remains available for pool readiness and diagnostics,
-but assignment uses only the batch's on-demand snapshot.
+reservations have been published. The compatibility name
+`load_poll_interval_ms` now controls only background control-plane discovery:
+the Proxy polls `/workers` and periodically refreshes deployment and version
+metadata, but does not fetch `/v1/loads` in the background. Load freshness and
+pool readiness use the latest on-demand batch snapshot independently of that
+control-plane interval.
 
 For each batch the scheduler freezes the successful snapshots and live lease
 reservations, using `max(snapshot, live reservation)` independently for request,
@@ -364,8 +367,8 @@ and Mooncake transfer time before rollout Engines start. `READY` is published
 only after those actors exit and Ray reports the reserved GPU resources as
 available again. Calibration failure is performance-only and activates the
 full-prefill fallback. Router discovery does not run during machine
-calibration; load polling starts only after the terminal calibration snapshot
-has been written.
+calibration; control-plane polling starts only after the terminal calibration
+snapshot has been written.
 
 The calibration HTTP response remains offline-only. Runtime corrections are
 recorded exclusively in atomic files under
