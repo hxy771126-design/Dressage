@@ -13,6 +13,7 @@ PROMPT_EFFECTIVE="${BENCHMARK_ROOT}/prompts.deterministic.jsonl"
 BENCHMARK_SEED="${BENCHMARK_SEED:-20260806}"
 BENCHMARK_DRY_RUN="${BENCHMARK_DRY_RUN:-0}"
 ENGINE_REBALANCING_LOAD_BATCH_COALESCING_WINDOW_MS="${ENGINE_REBALANCING_LOAD_BATCH_COALESCING_WINDOW_MS:-125}"
+ENGINE_REBALANCING_MIN_LOAD_IMPROVEMENT_RATIO="${ENGINE_REBALANCING_MIN_LOAD_IMPROVEMENT_RATIO:-0.10}"
 
 # These values intentionally are not tunable in the A/B benchmark. Keeping the
 # workload fixed is part of the validity check.
@@ -49,6 +50,7 @@ print_plan() {
   echo "  Blackbox max steps: ${DRESSAGE_BLACKBOX_MAX_STEPS}"
   echo "  Mooncake size: ${MOONCAKE_GLOBAL_SEGMENT_SIZE}"
   echo "  load batch window: ${ENGINE_REBALANCING_LOAD_BATCH_COALESCING_WINDOW_MS} ms"
+  echo "  min load improvement ratio: ${ENGINE_REBALANCING_MIN_LOAD_IMPROVEMENT_RATIO}"
   echo "  fixed flags:   --seed ${BENCHMARK_SEED} --rollout-seed ${BENCHMARK_SEED}"
   echo "                 --sglang-enable-deterministic-inference"
   echo "                 --sglang-enable-cache-report"
@@ -69,6 +71,10 @@ if [[ "${BENCHMARK_DRY_RUN}" != "0" && "${BENCHMARK_DRY_RUN}" != "1" ]]; then
 fi
 if [[ ! "${ENGINE_REBALANCING_LOAD_BATCH_COALESCING_WINDOW_MS}" =~ ^[0-9]+$ ]]; then
   echo "ENGINE_REBALANCING_LOAD_BATCH_COALESCING_WINDOW_MS must be a non-negative integer" >&2
+  exit 2
+fi
+if [[ ! "${ENGINE_REBALANCING_MIN_LOAD_IMPROVEMENT_RATIO}" =~ ^(0([.][0-9]+)?|1([.]0+)?)$ ]]; then
+  echo "ENGINE_REBALANCING_MIN_LOAD_IMPROVEMENT_RATIO must be a number between 0 and 1" >&2
   exit 2
 fi
 
@@ -145,7 +151,8 @@ record_environment() {
     "${DRESSAGE_BLACKBOX_ACQUIRE_TIMEOUT_SEC}" \
     "${DRESSAGE_BLACKBOX_MAX_STEPS}" \
     "${MOONCAKE_GLOBAL_SEGMENT_SIZE}" \
-    "${ENGINE_REBALANCING_LOAD_BATCH_COALESCING_WINDOW_MS}" <<'PY'
+    "${ENGINE_REBALANCING_LOAD_BATCH_COALESCING_WINDOW_MS}" \
+    "${ENGINE_REBALANCING_MIN_LOAD_IMPROVEMENT_RATIO}" <<'PY'
 from __future__ import annotations
 
 import datetime as dt
@@ -177,6 +184,7 @@ from collections import Counter
     blackbox_max_steps,
     mooncake_global_segment_size,
     load_batch_coalescing_window_ms,
+    min_load_improvement_ratio,
 ) = sys.argv[1:]
 repo_path = pathlib.Path(repo)
 
@@ -289,6 +297,7 @@ values = {
     "blackbox_max_steps": blackbox_max_steps,
     "mooncake_global_segment_size": mooncake_global_segment_size,
     "load_batch_coalescing_window_ms": load_batch_coalescing_window_ms,
+    "min_load_improvement_ratio": min_load_improvement_ratio,
 }
 
 path = pathlib.Path(output)
@@ -334,6 +343,10 @@ coalescing_flag = (
     "  --engine-rebalancing-load-batch-coalescing-window-ms "
     '"${ENGINE_REBALANCING_LOAD_BATCH_COALESCING_WINDOW_MS}"\n'
 )
+improvement_flag = (
+    "  --engine-rebalancing-min-load-improvement-ratio "
+    '"${ENGINE_REBALANCING_MIN_LOAD_IMPROVEMENT_RATIO}"\n'
+)
 if mode == "off":
     if proxy_flag not in text:
         raise SystemExit("source recipe no longer contains the rebalancing flag")
@@ -341,7 +354,11 @@ if mode == "off":
 else:
     if text.count(proxy_flag) != 1:
         raise SystemExit("expected exactly one rebalancing flag in source recipe")
-    text = text.replace(proxy_flag, proxy_flag + coalescing_flag, 1)
+    text = text.replace(
+        proxy_flag,
+        proxy_flag + coalescing_flag + improvement_flag,
+        1,
+    )
 
 if '--rollout-seed "${BENCHMARK_SEED}"' not in text:
     marker = "  --rollout-shuffle\n"
@@ -874,6 +891,7 @@ run_one() {
     export DRESSAGE_BLACKBOX_MAX_STEPS
     export MOONCAKE_GLOBAL_SEGMENT_SIZE
     export ENGINE_REBALANCING_LOAD_BATCH_COALESCING_WINDOW_MS
+    export ENGINE_REBALANCING_MIN_LOAD_IMPROVEMENT_RATIO
 
     bash "${temporary_recipe}"
   ) 2>&1 | tee "${run_dir}/run.log"

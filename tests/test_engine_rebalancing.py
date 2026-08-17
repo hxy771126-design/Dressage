@@ -5666,6 +5666,7 @@ def test_engine_rebalancing_benchmark_defaults_to_one_off_on_pair(tmp_path):
     assert "slot timeout:  3600" in result.stdout
     assert "Mooncake size: 24gb" in result.stdout
     assert "load batch window: 125 ms" in result.stdout
+    assert "min load improvement ratio: 0.10" in result.stdout
     assert "dressage_dapo_prompts_step_balanced_300.jsonl" in result.stdout
     assert "warm-up" not in result.stdout
     assert "off-r2" not in result.stdout
@@ -5696,6 +5697,58 @@ def test_engine_rebalancing_benchmark_accepts_load_batch_window_override(tmp_pat
 
     assert result.returncode == 0, result.stderr
     assert "load batch window: 0 ms" in result.stdout
+    assert not (tmp_path / "benchmark").exists()
+
+
+def test_engine_rebalancing_benchmark_accepts_load_improvement_ratio_override(
+    tmp_path,
+):
+    path = Path(
+        "examples/scripts/benchmark_engine_rebalancing_qwen3.5_4b_sync_local_l3_hicache.sh"
+    )
+    result = subprocess.run(
+        ["bash", str(path)],
+        cwd=Path.cwd(),
+        env={
+            **os.environ,
+            "BENCHMARK_DRY_RUN": "1",
+            "BENCHMARK_ROOT": str(tmp_path / "benchmark"),
+            "ENGINE_REBALANCING_MIN_LOAD_IMPROVEMENT_RATIO": "0.05",
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "min load improvement ratio: 0.05" in result.stdout
+    assert not (tmp_path / "benchmark").exists()
+
+
+@pytest.mark.parametrize("value", ["-0.1", "1.1", "invalid"])
+def test_engine_rebalancing_benchmark_rejects_invalid_load_improvement_ratio(
+    tmp_path,
+    value,
+):
+    path = Path(
+        "examples/scripts/benchmark_engine_rebalancing_qwen3.5_4b_sync_local_l3_hicache.sh"
+    )
+    result = subprocess.run(
+        ["bash", str(path)],
+        cwd=Path.cwd(),
+        env={
+            **os.environ,
+            "BENCHMARK_DRY_RUN": "1",
+            "BENCHMARK_ROOT": str(tmp_path / "benchmark"),
+            "ENGINE_REBALANCING_MIN_LOAD_IMPROVEMENT_RATIO": value,
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 2
+    assert "must be a number between 0 and 1" in result.stderr
     assert not (tmp_path / "benchmark").exists()
 
 
@@ -6384,6 +6437,7 @@ def test_engine_rebalancing_benchmark_environment_records_prompt_fingerprints(
         "20",
         "16gb",
         "125",
+        "0.05",
         env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"},
     )
 
@@ -6407,15 +6461,21 @@ def test_engine_rebalancing_benchmark_environment_records_prompt_fingerprints(
     assert environment["sandbox_slots_per_node"] == "16"
     assert environment["sandbox_acquire_timeout_sec"] == "3600"
     assert environment["load_batch_coalescing_window_ms"] == "125"
+    assert environment["min_load_improvement_ratio"] == "0.05"
     assert "prompt_source_workload_distribution_json" in environment
     assert "prompt_effective_workload_distribution_json" in environment
 
 
-def test_engine_rebalancing_benchmark_injects_batch_window_only_for_on(tmp_path):
+def test_engine_rebalancing_benchmark_injects_rebalancing_settings_only_for_on(
+    tmp_path,
+):
     source_recipe = Path(
         "examples/scripts/run_blackbox_qwen3.5_4b_sync_local_l3_hicache.sh"
     )
-    flag = "--engine-rebalancing-load-batch-coalescing-window-ms"
+    flags = (
+        "--engine-rebalancing-load-batch-coalescing-window-ms",
+        "--engine-rebalancing-min-load-improvement-ratio",
+    )
 
     for mode in ("off", "on"):
         output = tmp_path / f"{mode}.sh"
@@ -6427,7 +6487,8 @@ def test_engine_rebalancing_benchmark_injects_batch_window_only_for_on(tmp_path)
         )
         assert result.returncode == 0, result.stderr
         generated = output.read_text(encoding="utf-8")
-        assert (flag in generated) is (mode == "on")
+        for flag in flags:
+            assert (flag in generated) is (mode == "on")
         syntax = subprocess.run(
             ["bash", "-n", str(output)],
             check=False,
