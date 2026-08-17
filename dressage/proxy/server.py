@@ -2761,6 +2761,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--engine-rebalancing-load-batch-coalescing-window-ms",
+        type=_non_negative_int,
+        default=125,
+        help=(
+            "Minimum milliseconds from the first waiting step to sealing an "
+            "on-demand load batch. 0 keeps the natural /v1/loads fetch window."
+        ),
+    )
+    parser.add_argument(
         "--stream-heartbeat-interval-seconds",
         type=_non_negative_finite_float,
         default=_DEFAULT_STREAM_HEARTBEAT_INTERVAL_SECONDS,
@@ -2805,6 +2814,9 @@ def main() -> None:
         enable_engine_rebalancing=args.enable_engine_rebalancing,
         engine_rebalancing_config=EngineRebalancingConfig(
             enabled=args.enable_engine_rebalancing,
+            load_batch_coalescing_window_ms=(
+                args.engine_rebalancing_load_batch_coalescing_window_ms
+            ),
             min_load_improvement_ratio=(
                 args.engine_rebalancing_min_load_improvement_ratio
             ),

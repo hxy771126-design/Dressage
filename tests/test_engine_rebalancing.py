@@ -274,6 +274,7 @@ def test_config_derives_metrics_staleness():
 def test_config_defaults_propagate_to_online_models():
     config = EngineRebalancingConfig(enabled=True)
     assert config.snapshot()["load_poll_interval_ms"] == 250
+    assert config.snapshot()["load_batch_coalescing_window_ms"] == 125
     assert config.snapshot()["history_size"] == 512
     assert config.snapshot()["min_samples"] == 16
     assert config.snapshot()["min_hold_turns"] == 2
@@ -297,6 +298,14 @@ def test_config_defaults_propagate_to_online_models():
 def test_config_rejects_out_of_range_load_improvement_ratio(value):
     with pytest.raises(ValueError, match="min_load_improvement_ratio"):
         EngineRebalancingConfig(min_load_improvement_ratio=value)
+
+
+def test_config_accepts_zero_and_rejects_negative_load_batch_window():
+    assert EngineRebalancingConfig(
+        load_batch_coalescing_window_ms=0
+    ).load_batch_coalescing_window_ms == 0
+    with pytest.raises(ValueError, match="load_batch_coalescing_window_ms"):
+        EngineRebalancingConfig(load_batch_coalescing_window_ms=-1)
 
 
 def test_load_score_uses_reservation_envelopes_and_adds_pending_step_once():
@@ -1385,11 +1394,212 @@ def test_batch_acquires_fetch_each_engine_once_and_publish_one_trace():
     run(scenario())
 
 
+def test_configured_load_batch_window_collects_step_after_fast_fetch():
+    client = ControlledBatchLoadClient()
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(
+            enabled=True,
+            min_samples=1,
+            load_batch_coalescing_window_ms=50,
+        ),
+        model_id="model",
+        model_config=simple_model_config(),
+    )
+
+    async def scenario():
+        await rebalancer.refresh()
+        client.control_batch_loads()
+        first_task = asyncio.create_task(
+            rebalancer.acquire(session_id="window-first", input_ids=[1] * 10)
+        )
+        await wait_for_condition(
+            lambda: sum(client.batch_load_calls.values()) == len(client.urls)
+        )
+        client.resolve_batch(0)
+        await asyncio.sleep(0.01)
+        second_task = asyncio.create_task(
+            rebalancer.acquire(session_id="window-second", input_ids=[2] * 10)
+        )
+
+        async def resolve_second_batch_if_started():
+            try:
+                await wait_for_condition(
+                    lambda: sum(client.batch_load_calls.values())
+                    == 2 * len(client.urls),
+                    timeout=0.2,
+                )
+            except AssertionError:
+                return
+            client.resolve_batch(1)
+
+        resolver = asyncio.create_task(resolve_second_batch_if_started())
+        first, second = await asyncio.gather(first_task, second_task)
+        resolver.cancel()
+        await asyncio.gather(resolver, return_exceptions=True)
+        trace = (await rebalancer.snapshot())["recent_load_batches"][0]
+
+        assert first.batch_id == second.batch_id
+        assert client.batch_load_calls == {url: 1 for url in client.urls}
+        assert trace["batch"]["registered_count"] == 2
+        assert trace["batch"]["collect_seconds"] >= 0.045
+        await rebalancer.fail(first)
+        await rebalancer.fail(second)
+
+    run(scenario())
+
+
+def test_slow_load_fetch_dominates_configured_batch_window():
+    client = ControlledBatchLoadClient()
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(
+            enabled=True,
+            min_samples=1,
+            load_batch_coalescing_window_ms=20,
+        ),
+        model_id="model",
+        model_config=simple_model_config(),
+    )
+
+    async def scenario():
+        await rebalancer.refresh()
+        client.control_batch_loads()
+        task = asyncio.create_task(
+            rebalancer.acquire(session_id="slow-fetch", input_ids=[1] * 10)
+        )
+        await wait_for_condition(
+            lambda: sum(client.batch_load_calls.values()) == len(client.urls)
+        )
+        await asyncio.sleep(0.04)
+        client.resolve_batch(0)
+        lease = await task
+        trace = (await rebalancer.snapshot())["recent_load_batches"][-1]["batch"]
+
+        assert trace["fetch_seconds"] >= 0.035
+        assert trace["collect_seconds"] >= trace["fetch_seconds"]
+        assert trace["collect_seconds"] - trace["fetch_seconds"] < 0.02
+        await rebalancer.fail(lease)
+
+    run(scenario())
+
+
+def test_queued_batch_window_starts_when_first_step_arrives(monkeypatch):
+    client = ControlledBatchLoadClient()
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(
+            enabled=True,
+            min_samples=1,
+            load_batch_coalescing_window_ms=40,
+        ),
+        model_id="model",
+        model_config=simple_model_config(),
+    )
+
+    async def scenario():
+        await rebalancer.refresh()
+        client.control_batch_loads()
+        first_commit_started = asyncio.Event()
+        allow_first_commit = asyncio.Event()
+        original_commit = rebalancer._commit_batch
+        commit_count = 0
+
+        async def controlled_commit(*args, **kwargs):
+            nonlocal commit_count
+            commit_count += 1
+            if commit_count == 1:
+                first_commit_started.set()
+                await allow_first_commit.wait()
+            return await original_commit(*args, **kwargs)
+
+        monkeypatch.setattr(rebalancer, "_commit_batch", controlled_commit)
+        first_task = asyncio.create_task(
+            rebalancer.acquire(session_id="queued-first", input_ids=[1] * 10)
+        )
+        await wait_for_condition(
+            lambda: sum(client.batch_load_calls.values()) == len(client.urls)
+        )
+        client.resolve_batch(0)
+        await first_commit_started.wait()
+
+        second_task = asyncio.create_task(
+            rebalancer.acquire(session_id="queued-second", input_ids=[2] * 10)
+        )
+        await asyncio.sleep(0.06)
+        assert client.batch_load_calls == {url: 1 for url in client.urls}
+        allow_first_commit.set()
+        first = await first_task
+        await wait_for_condition(
+            lambda: sum(client.batch_load_calls.values()) == 2 * len(client.urls)
+        )
+        client.resolve_batch(1)
+        second = await second_task
+        trace = next(
+            item
+            for item in (await rebalancer.snapshot())["recent_load_batches"]
+            if item["batch"]["id"] == second.batch_id
+        )["batch"]
+
+        assert second.batch_id == first.batch_id + 1
+        assert trace["wait_for_previous_seconds"] >= 0.055
+        assert (
+            trace["collect_seconds"]
+            - trace["wait_for_previous_seconds"]
+            - trace["fetch_seconds"]
+            < 0.02
+        )
+        await rebalancer.fail(first)
+        await rebalancer.fail(second)
+
+    run(scenario())
+
+
+def test_close_during_load_batch_window_publishes_one_failure_trace():
+    client = ControlledBatchLoadClient()
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(
+            enabled=True,
+            load_batch_coalescing_window_ms=200,
+        ),
+        model_id="model",
+        model_config=simple_model_config(),
+    )
+
+    async def scenario():
+        await rebalancer.refresh()
+        client.control_batch_loads()
+        task = asyncio.create_task(
+            rebalancer.acquire(session_id="close-during-window", input_ids=[1] * 10)
+        )
+        await wait_for_condition(
+            lambda: sum(client.batch_load_calls.values()) == len(client.urls)
+        )
+        client.resolve_batch(0)
+        await asyncio.sleep(0.01)
+        await rebalancer.close()
+
+        with pytest.raises(RuntimeError, match="engine rebalancer is closed"):
+            await task
+        snapshot = await rebalancer.snapshot()
+        assert len(snapshot["recent_load_batches"]) == 1
+        assert snapshot["recent_load_batches"][0]["batch"]["committed_count"] == 0
+        assert snapshot["recent_load_batches"][0]["batch"]["failed_count"] == 1
+        assert rebalancer._reservations == {}
+
+    run(scenario())
+
+
 def test_step_after_fetch_completion_waits_for_previous_batch_commit(monkeypatch):
     client = ControlledBatchLoadClient()
     rebalancer = EngineRebalancer(
         client,
-        config=EngineRebalancingConfig(enabled=True, min_samples=1),
+        config=EngineRebalancingConfig(
+            enabled=True,
+            min_samples=1,
+            load_batch_coalescing_window_ms=0,
+        ),
         model_id="model",
         model_config=simple_model_config(),
     )
@@ -1914,7 +2124,10 @@ def test_batch_collect_time_stops_at_atomic_seal(monkeypatch):
     client = ControlledBatchLoadClient()
     rebalancer = EngineRebalancer(
         client,
-        config=EngineRebalancingConfig(enabled=True),
+        config=EngineRebalancingConfig(
+            enabled=True,
+            load_batch_coalescing_window_ms=0,
+        ),
         model_id="model",
         model_config=simple_model_config(),
     )
@@ -5200,6 +5413,7 @@ def test_cli_exposes_single_rebalancing_switch(monkeypatch):
     args = parse_args()
     assert args.enable_engine_rebalancing is True
     assert args.engine_rebalancing_min_load_improvement_ratio == 0.10
+    assert args.engine_rebalancing_load_batch_coalescing_window_ms == 125
 
 
 def test_cli_accepts_load_improvement_ratio(monkeypatch):
@@ -5217,6 +5431,40 @@ def test_cli_accepts_load_improvement_ratio(monkeypatch):
     )
 
     assert parse_args().engine_rebalancing_min_load_improvement_ratio == 0.45
+
+
+def test_cli_accepts_zero_load_batch_coalescing_window(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "dressage-proxy",
+            "--tokenizer-path",
+            "model",
+            "--engine-rebalancing-load-batch-coalescing-window-ms",
+            "0",
+        ],
+    )
+
+    assert parse_args().engine_rebalancing_load_batch_coalescing_window_ms == 0
+
+
+def test_cli_rejects_negative_load_batch_coalescing_window(monkeypatch, capsys):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "dressage-proxy",
+            "--tokenizer-path",
+            "model",
+            "--engine-rebalancing-load-batch-coalescing-window-ms",
+            "-1",
+        ],
+    )
+
+    with pytest.raises(SystemExit):
+        parse_args()
+    assert "must be greater than or equal to 0" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("value", ["-0.01", "1.01"])
@@ -5278,6 +5526,9 @@ def test_enabled_proxy_places_first_request_directly_and_reports_state():
         assert loads["enabled"] is True
         assert loads["effective_config"]["metrics_stale_ms"] == 2_000
         assert loads["effective_config"]["load_poll_interval_ms"] == 250
+        assert (
+            loads["effective_config"]["load_batch_coalescing_window_ms"] == 125
+        )
         assert loads["effective_config"]["history_size"] == 512
         assert loads["effective_config"]["min_samples"] == 16
         assert loads["effective_config"]["min_hold_turns"] == 2
@@ -5414,6 +5665,7 @@ def test_engine_rebalancing_benchmark_defaults_to_one_off_on_pair(tmp_path):
     assert "sandbox slots: 24" in result.stdout
     assert "slot timeout:  3600" in result.stdout
     assert "Mooncake size: 24gb" in result.stdout
+    assert "load batch window: 125 ms" in result.stdout
     assert "dressage_dapo_prompts_step_balanced_300.jsonl" in result.stdout
     assert "warm-up" not in result.stdout
     assert "off-r2" not in result.stdout
@@ -5421,6 +5673,52 @@ def test_engine_rebalancing_benchmark_defaults_to_one_off_on_pair(tmp_path):
     assert "Valid measured pairs: `{len(valid_rows)}/1`" in source
     assert "Median rollout speedup" not in source
     assert "Warm-up" not in source
+    assert not (tmp_path / "benchmark").exists()
+
+
+def test_engine_rebalancing_benchmark_accepts_load_batch_window_override(tmp_path):
+    path = Path(
+        "examples/scripts/benchmark_engine_rebalancing_qwen3.5_4b_sync_local_l3_hicache.sh"
+    )
+    result = subprocess.run(
+        ["bash", str(path)],
+        cwd=Path.cwd(),
+        env={
+            **os.environ,
+            "BENCHMARK_DRY_RUN": "1",
+            "BENCHMARK_ROOT": str(tmp_path / "benchmark"),
+            "ENGINE_REBALANCING_LOAD_BATCH_COALESCING_WINDOW_MS": "0",
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "load batch window: 0 ms" in result.stdout
+    assert not (tmp_path / "benchmark").exists()
+
+
+def test_engine_rebalancing_benchmark_rejects_negative_load_batch_window(tmp_path):
+    path = Path(
+        "examples/scripts/benchmark_engine_rebalancing_qwen3.5_4b_sync_local_l3_hicache.sh"
+    )
+    result = subprocess.run(
+        ["bash", str(path)],
+        cwd=Path.cwd(),
+        env={
+            **os.environ,
+            "BENCHMARK_DRY_RUN": "1",
+            "BENCHMARK_ROOT": str(tmp_path / "benchmark"),
+            "ENGINE_REBALANCING_LOAD_BATCH_COALESCING_WINDOW_MS": "-1",
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 2
+    assert "must be a non-negative integer" in result.stderr
     assert not (tmp_path / "benchmark").exists()
 
 
@@ -6085,6 +6383,7 @@ def test_engine_rebalancing_benchmark_environment_records_prompt_fingerprints(
         "3600",
         "20",
         "16gb",
+        "125",
         env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"},
     )
 
@@ -6107,8 +6406,35 @@ def test_engine_rebalancing_benchmark_environment_records_prompt_fingerprints(
     assert environment["rollout_max_response_len"] == "12288"
     assert environment["sandbox_slots_per_node"] == "16"
     assert environment["sandbox_acquire_timeout_sec"] == "3600"
+    assert environment["load_batch_coalescing_window_ms"] == "125"
     assert "prompt_source_workload_distribution_json" in environment
     assert "prompt_effective_workload_distribution_json" in environment
+
+
+def test_engine_rebalancing_benchmark_injects_batch_window_only_for_on(tmp_path):
+    source_recipe = Path(
+        "examples/scripts/run_blackbox_qwen3.5_4b_sync_local_l3_hicache.sh"
+    )
+    flag = "--engine-rebalancing-load-batch-coalescing-window-ms"
+
+    for mode in ("off", "on"):
+        output = tmp_path / f"{mode}.sh"
+        result = _run_benchmark_heredoc(
+            "build_temporary_recipe",
+            str(source_recipe),
+            str(output),
+            mode,
+        )
+        assert result.returncode == 0, result.stderr
+        generated = output.read_text(encoding="utf-8")
+        assert (flag in generated) is (mode == "on")
+        syntax = subprocess.run(
+            ["bash", "-n", str(output)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert syntax.returncode == 0, syntax.stderr
 
 
 def test_engine_rebalancing_benchmark_collector_uses_sampling_seed_identity(tmp_path):

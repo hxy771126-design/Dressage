@@ -2292,6 +2292,9 @@ class EngineRebalancer:
 
     async def _run_batch(self, batch: _OpenBatch) -> None:
         wait_started = time.monotonic()
+        coalescing_deadline = batch.started_monotonic + (
+            self.config.load_batch_coalescing_window_ms / 1000.0
+        )
         fetch_results: tuple[_BatchFetchResult, ...] = ()
         frozen: _FrozenBatch | None = None
         try:
@@ -2314,6 +2317,9 @@ class EngineRebalancer:
                     )
                 )
                 fetch_finished = time.monotonic()
+                remaining = coalescing_deadline - fetch_finished
+                if remaining > 0:
+                    await asyncio.sleep(remaining)
                 async with self._batch_lock:
                     batch.sealed_monotonic = time.monotonic()
                     if self._open_batch is batch:

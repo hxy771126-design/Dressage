@@ -24,6 +24,7 @@ class SchedulerState(str, Enum):
 class EngineRebalancingConfig:
     enabled: bool = False
     load_poll_interval_ms: int = 250
+    load_batch_coalescing_window_ms: int = 125
     metrics_stale_ms: int = 2_000
     history_size: int = 512
     min_samples: int = 16
@@ -39,6 +40,10 @@ class EngineRebalancingConfig:
         )
         if self.load_poll_interval_ms <= 0:
             raise ValueError("load_poll_interval_ms must be positive")
+        if self.load_batch_coalescing_window_ms < 0:
+            raise ValueError(
+                "load_batch_coalescing_window_ms must be non-negative"
+            )
         if self.history_size <= 0:
             raise ValueError("history_size must be positive")
         if self.min_samples <= 0:

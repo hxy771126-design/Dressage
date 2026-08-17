@@ -288,13 +288,19 @@ queue, prefill, and at least one conservative candidate path are ready, and move
 rebalancing pool.
 
 The first waiting step creates a load batch and concurrently fetches one fresh
-`/v1/loads` snapshot from every healthy Engine. Steps arriving before that fetch
-finishes join the same batch; later steps form the next batch. Batches are
-strictly serialized from fetch through commit, so a later snapshot is taken
-only after the preceding batch reservations have been published. The periodic
-load refresh controlled by `load_poll_interval_ms` remains available for pool
-readiness and diagnostics, but assignment uses only the batch's on-demand
-snapshot.
+`/v1/loads` snapshot from every healthy Engine. The batch remains open until
+both that fetch and the configured `load_batch_coalescing_window_ms` deadline
+have completed, so its collection window is the greater of the natural fetch
+latency and the configured minimum. The default is 125 ms; zero restores the
+natural fetch-only window. It is exposed as
+`--engine-rebalancing-load-batch-coalescing-window-ms`; the benchmark wrapper
+accepts `ENGINE_REBALANCING_LOAD_BATCH_COALESCING_WINDOW_MS`. Batches are
+strictly serialized from fetch through
+commit, so time spent waiting for the preceding batch counts toward the next
+batch's window and a later snapshot is taken only after the preceding batch
+reservations have been published. The periodic load refresh controlled by
+`load_poll_interval_ms` remains available for pool readiness and diagnostics,
+but assignment uses only the batch's on-demand snapshot.
 
 For each batch the scheduler freezes the successful snapshots and live lease
 reservations, using `max(snapshot, live reservation)` independently for request,
@@ -345,7 +351,9 @@ exception tracebacks; it never feeds routing decisions.
 `collect_seconds` measures the full wall-clock interval from batch creation to
 its atomic seal. `wait_for_previous_seconds` and `fetch_seconds` are overlapping
 subintervals of that open window, so these values must not be added together or
-summed with `total_seconds`.
+summed with `total_seconds`. Batch membership, stable step order, and the
+configured window are available through `recent_load_batches` and
+`effective_config`; per-step arrival timestamps are not retained.
 
 An advanced deployment JSON can be supplied through
 `DRESSAGE_ENGINE_REBALANCING_DEPLOYMENT_CONFIG`; it is not a CLI switch. The

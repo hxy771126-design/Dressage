@@ -12,6 +12,7 @@ PROMPT_EFFECTIVE="${BENCHMARK_ROOT}/prompts.deterministic.jsonl"
 
 BENCHMARK_SEED="${BENCHMARK_SEED:-20260806}"
 BENCHMARK_DRY_RUN="${BENCHMARK_DRY_RUN:-0}"
+ENGINE_REBALANCING_LOAD_BATCH_COALESCING_WINDOW_MS="${ENGINE_REBALANCING_LOAD_BATCH_COALESCING_WINDOW_MS:-125}"
 
 # These values intentionally are not tunable in the A/B benchmark. Keeping the
 # workload fixed is part of the validity check.
@@ -47,6 +48,7 @@ print_plan() {
   echo "  slot timeout:  ${DRESSAGE_BLACKBOX_ACQUIRE_TIMEOUT_SEC}"
   echo "  Blackbox max steps: ${DRESSAGE_BLACKBOX_MAX_STEPS}"
   echo "  Mooncake size: ${MOONCAKE_GLOBAL_SEGMENT_SIZE}"
+  echo "  load batch window: ${ENGINE_REBALANCING_LOAD_BATCH_COALESCING_WINDOW_MS} ms"
   echo "  fixed flags:   --seed ${BENCHMARK_SEED} --rollout-seed ${BENCHMARK_SEED}"
   echo "                 --sglang-enable-deterministic-inference"
   echo "                 --sglang-enable-cache-report"
@@ -63,6 +65,10 @@ print_plan() {
 
 if [[ "${BENCHMARK_DRY_RUN}" != "0" && "${BENCHMARK_DRY_RUN}" != "1" ]]; then
   echo "BENCHMARK_DRY_RUN must be 0 or 1" >&2
+  exit 2
+fi
+if [[ ! "${ENGINE_REBALANCING_LOAD_BATCH_COALESCING_WINDOW_MS}" =~ ^[0-9]+$ ]]; then
+  echo "ENGINE_REBALANCING_LOAD_BATCH_COALESCING_WINDOW_MS must be a non-negative integer" >&2
   exit 2
 fi
 
@@ -138,7 +144,8 @@ record_environment() {
     "${DRESSAGE_BLACKBOX_SLOTS_PER_NODE}" \
     "${DRESSAGE_BLACKBOX_ACQUIRE_TIMEOUT_SEC}" \
     "${DRESSAGE_BLACKBOX_MAX_STEPS}" \
-    "${MOONCAKE_GLOBAL_SEGMENT_SIZE}" <<'PY'
+    "${MOONCAKE_GLOBAL_SEGMENT_SIZE}" \
+    "${ENGINE_REBALANCING_LOAD_BATCH_COALESCING_WINDOW_MS}" <<'PY'
 from __future__ import annotations
 
 import datetime as dt
@@ -169,6 +176,7 @@ from collections import Counter
     sandbox_acquire_timeout_sec,
     blackbox_max_steps,
     mooncake_global_segment_size,
+    load_batch_coalescing_window_ms,
 ) = sys.argv[1:]
 repo_path = pathlib.Path(repo)
 
@@ -280,6 +288,7 @@ values = {
     "sandbox_acquire_timeout_sec": sandbox_acquire_timeout_sec,
     "blackbox_max_steps": blackbox_max_steps,
     "mooncake_global_segment_size": mooncake_global_segment_size,
+    "load_batch_coalescing_window_ms": load_batch_coalescing_window_ms,
 }
 
 path = pathlib.Path(output)
@@ -321,12 +330,18 @@ if script_dir_line not in text:
 text = text.replace(script_dir_line, replacement, 1)
 
 proxy_flag = "  --enable-engine-rebalancing\n"
+coalescing_flag = (
+    "  --engine-rebalancing-load-batch-coalescing-window-ms "
+    '"${ENGINE_REBALANCING_LOAD_BATCH_COALESCING_WINDOW_MS}"\n'
+)
 if mode == "off":
     if proxy_flag not in text:
         raise SystemExit("source recipe no longer contains the rebalancing flag")
     text = text.replace(proxy_flag, "", 1)
-elif text.count(proxy_flag) != 1:
-    raise SystemExit("expected exactly one rebalancing flag in source recipe")
+else:
+    if text.count(proxy_flag) != 1:
+        raise SystemExit("expected exactly one rebalancing flag in source recipe")
+    text = text.replace(proxy_flag, proxy_flag + coalescing_flag, 1)
 
 if '--rollout-seed "${BENCHMARK_SEED}"' not in text:
     marker = "  --rollout-shuffle\n"
@@ -858,6 +873,7 @@ run_one() {
     export DRESSAGE_BLACKBOX_ACQUIRE_TIMEOUT_SEC
     export DRESSAGE_BLACKBOX_MAX_STEPS
     export MOONCAKE_GLOBAL_SEGMENT_SIZE
+    export ENGINE_REBALANCING_LOAD_BATCH_COALESCING_WINDOW_MS
 
     bash "${temporary_recipe}"
   ) 2>&1 | tee "${run_dir}/run.log"
