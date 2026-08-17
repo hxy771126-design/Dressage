@@ -6172,7 +6172,7 @@ def test_engine_rebalancing_benchmark_defaults_to_one_off_on_pair(tmp_path):
     assert "sandbox slots: 24" in result.stdout
     assert "slot timeout:  3600" in result.stdout
     assert "Mooncake size: 24gb" in result.stdout
-    assert "load batch window: 125 ms" in result.stdout
+    assert "load batch window: 60 ms" in result.stdout
     assert "min load improvement ratio: 0.10" in result.stdout
     assert "dressage_dapo_prompts_step_balanced_300.jsonl" in result.stdout
     assert "warm-up" not in result.stdout
