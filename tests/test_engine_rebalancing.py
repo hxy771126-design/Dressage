@@ -1516,6 +1516,43 @@ def test_batch_acquires_fetch_each_engine_once_and_publish_one_trace():
     run(scenario())
 
 
+def test_batch_freeze_resolves_step_budget_once_per_fingerprint(monkeypatch):
+    client = ControlledBatchLoadClient()
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(enabled=True),
+        model_id="model",
+        model_config=simple_model_config(),
+    )
+    original = rebalancer._resolve_step_budget
+    fingerprints = []
+
+    def record_budget_resolution(**kwargs):
+        fingerprints.append(kwargs["fingerprint"])
+        return original(**kwargs)
+
+    monkeypatch.setattr(rebalancer, "_resolve_step_budget", record_budget_resolution)
+
+    async def scenario():
+        await rebalancer.refresh()
+        fingerprint = rebalancer.deployments[client.urls[0]].cache_fingerprint
+        client.control_batch_loads()
+        task = asyncio.create_task(
+            rebalancer.acquire(session_id="budget-cache", input_ids=[1] * 10)
+        )
+        await wait_for_condition(
+            lambda: sum(client.batch_load_calls.values()) == len(client.urls)
+        )
+        client.resolve_batch(0)
+        lease = await task
+        try:
+            assert fingerprints == [fingerprint]
+        finally:
+            await rebalancer.fail(lease)
+
+    run(scenario())
+
+
 def test_batch_snapshot_refreshes_pool_readiness_after_control_only_polling():
     async def benchmark(task, payload):
         del task
@@ -2542,6 +2579,111 @@ def test_batch_target_solver_receives_hard_limit_and_lcp_cost(monkeypatch):
     run(scenario())
 
 
+def test_batch_skips_target_solver_when_baseline_already_exceeds_target(monkeypatch):
+    client = ControlledBatchLoadClient()
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(
+            enabled=True,
+            min_load_improvement_ratio=0.10,
+        ),
+        model_id="model",
+        model_config=simple_model_config(),
+    )
+    target_solver_called = False
+
+    def unexpected_target_solver(*args, **kwargs):
+        nonlocal target_solver_called
+        target_solver_called = True
+        raise RuntimeError("target solver should have been skipped")
+
+    monkeypatch.setattr(
+        "dressage.proxy.rebalancing.scheduler.solve_batch_for_target_load",
+        unexpected_target_solver,
+    )
+
+    async def scenario():
+        await rebalancer.refresh()
+        source, target = client.urls
+        fingerprint = rebalancer.deployments[source].cache_fingerprint
+        rebalancer.sessions["baseline-bound"] = SessionRoutingState(
+            owner_worker_url=source,
+            fingerprint=fingerprint,
+            previous_committed_tokens=[1] * 10,
+            seen_engines={source},
+        )
+        monkeypatch.setattr(
+            rebalancer,
+            "_candidate_path_readiness",
+            lambda *args: ContextPathReadiness(
+                source,
+                target,
+                CacheSource.MOONCAKE,
+                True,
+                True,
+            ),
+        )
+        client.control_batch_loads()
+        task = asyncio.create_task(
+            rebalancer.acquire(session_id="baseline-bound", input_ids=[1] * 10)
+        )
+        await wait_for_condition(
+            lambda: sum(client.batch_load_calls.values()) == len(client.urls)
+        )
+        client.resolve_url(source, 0, running=100)
+        client.resolve_url(target, 0, running=0)
+        lease = await task
+        try:
+            trace = (await rebalancer.snapshot())["recent_load_batches"][-1]
+            assert target_solver_called is False
+            assert trace["adopted_plan"] == "sticky"
+            assert trace["fallback_reason"] == "target_load_infeasible"
+        finally:
+            await rebalancer.fail(lease)
+
+    run(scenario())
+
+
+def test_batch_reservation_reuses_final_batch_projected_load(monkeypatch):
+    client = ControlledBatchLoadClient()
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(enabled=True),
+        model_id="model",
+        model_config=simple_model_config(),
+    )
+
+    def unexpected_recalculation(*args, **kwargs):
+        raise RuntimeError("batch projected load must not be recalculated")
+
+    monkeypatch.setattr(
+        rebalancer,
+        "_projected_load_score",
+        unexpected_recalculation,
+    )
+
+    async def scenario():
+        await rebalancer.refresh()
+        client.control_batch_loads()
+        task = asyncio.create_task(
+            rebalancer.acquire(session_id="projected-reuse", input_ids=[1] * 10)
+        )
+        await wait_for_condition(
+            lambda: sum(client.batch_load_calls.values()) == len(client.urls)
+        )
+        client.resolve_batch(0)
+        lease = await task
+        try:
+            assert lease.decision.target_projected_load is not None
+            assert lease.projected_load_score == pytest.approx(
+                lease.decision.target_projected_load.total
+            )
+        finally:
+            await rebalancer.fail(lease)
+
+    run(scenario())
+
+
 @pytest.mark.parametrize(
     ("mooncake_ready", "expected_worker", "expected_reason"),
     [
@@ -3221,6 +3363,18 @@ def test_batch_commit_failure_rolls_back_all_state_and_publishes_one_failure_tra
 
     async def scenario():
         await rebalancer.refresh()
+
+        class NoDeepcopyTokens(list):
+            def __deepcopy__(self, memo):
+                del memo
+                raise AssertionError("unrelated session must not be copied")
+
+        unrelated = SessionRoutingState(
+            previous_committed_tokens=NoDeepcopyTokens([9] * 10_000),
+        )
+        existing = SessionRoutingState(task_key="existing")
+        rebalancer.sessions["unrelated"] = unrelated
+        rebalancer.sessions["rollback-0"] = existing
         initial_decisions = list(rebalancer._decisions)
         initial_next_reservation_id = rebalancer._next_reservation_id
         initial_revision = rebalancer._reservation_revision
@@ -3256,7 +3410,13 @@ def test_batch_commit_failure_rolls_back_all_state_and_publishes_one_failure_tra
             isinstance(result, RuntimeError) and "commit injection" in str(result)
             for result in results
         )
-        assert rebalancer.sessions == {}
+        assert rebalancer.sessions["unrelated"] is unrelated
+        restored = rebalancer.sessions["rollback-0"]
+        assert restored.owner_worker_url is None
+        assert restored.pending_owner_worker_url is None
+        assert restored.fingerprint is None
+        assert restored.task_key == "existing"
+        assert set(rebalancer.sessions) == {"unrelated", "rollback-0"}
         assert rebalancer._reservations == {}
         assert rebalancer._pending_acquires == {}
         assert rebalancer._next_reservation_id == initial_next_reservation_id
@@ -5441,6 +5601,7 @@ def test_completion_pairs_actual_queue_with_the_selected_path_prediction():
                 output_tokens=1,
                 committed_tokens=[1] * 100,
             )
+            await rebalancer._drain_observation_tasks()
             observation = rebalancer._observations[-1]
             assert observation["predicted_queue_seconds"] == expected
             assert observation["actual_queue_seconds"] == actual
@@ -5449,6 +5610,192 @@ def test_completion_pairs_actual_queue_with_the_selected_path_prediction():
             )
 
     run(scenario())
+
+
+def test_complete_commits_session_before_background_observation(monkeypatch):
+    client = ControlPlaneClient()
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(
+            enabled=True,
+            load_batch_coalescing_window_ms=0,
+        ),
+        model_id="model",
+        model_config=simple_model_config(),
+    )
+    observation_started = asyncio.Event()
+    release_observation = asyncio.Event()
+    captured = []
+
+    async def blocked_observation(observation):
+        captured.append(observation)
+        observation_started.set()
+        await release_observation.wait()
+
+    monkeypatch.setattr(
+        rebalancer,
+        "_record_completion_observation",
+        blocked_observation,
+        raising=False,
+    )
+
+    async def scenario():
+        await rebalancer.refresh()
+        lease = await rebalancer.acquire(
+            session_id="background-observation",
+            input_ids=[1] * 10,
+        )
+        assert lease.reservation_id in rebalancer._reservations
+
+        await rebalancer.complete(
+            lease,
+            response_meta={
+                "queue_time": 0.0,
+                "e2e_latency": 1.0,
+                "cached_tokens": 0,
+                "decode_throughput": 10.0,
+            },
+            output_tokens=1,
+            committed_tokens=[1] * 11,
+        )
+        await wait_for_condition(observation_started.is_set)
+
+        session = rebalancer.sessions["background-observation"]
+        assert lease.reservation_id not in rebalancer._reservations
+        assert session.owner_worker_url == lease.worker_url
+        assert session.pending_owner_worker_url is None
+        assert session.previous_committed_tokens == [1] * 11
+        assert list(rebalancer._observations) == []
+        assert len(captured) == 1
+
+        release_observation.set()
+        await rebalancer._drain_observation_tasks()
+
+    run(scenario())
+
+
+def test_close_waits_for_background_completion_observation(monkeypatch):
+    client = ControlPlaneClient()
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(enabled=True),
+        model_id="model",
+        model_config=simple_model_config(),
+    )
+    observation_started = asyncio.Event()
+    release_observation = asyncio.Event()
+
+    async def blocked_observation(observation):
+        del observation
+        observation_started.set()
+        await release_observation.wait()
+
+    monkeypatch.setattr(
+        rebalancer,
+        "_record_completion_observation",
+        blocked_observation,
+        raising=False,
+    )
+
+    async def scenario():
+        await rebalancer.refresh()
+        worker = client.urls[0]
+        fingerprint = rebalancer.deployments[worker].cache_fingerprint
+        rebalancer.sessions["close-observation"] = SessionRoutingState(
+            owner_worker_url=worker,
+            fingerprint=fingerprint,
+            seen_engines={worker},
+        )
+        lease = RoutingLease(
+            decision=RoutingDecision(
+                session_id="close-observation",
+                source_worker_url=worker,
+                target_worker_url=worker,
+                cache_fingerprint=fingerprint,
+                state=SchedulerState.ACTIVE,
+                reason="test",
+            ),
+            worker_url=worker,
+            reserved_tokens=10,
+            base_tokens=0,
+            started_monotonic=time.monotonic(),
+            context_tokens=10,
+        )
+        await rebalancer.complete(
+            lease,
+            response_meta={},
+            output_tokens=1,
+            committed_tokens=[1] * 11,
+        )
+        await wait_for_condition(observation_started.is_set)
+
+        close_task = asyncio.create_task(rebalancer.close())
+        await asyncio.sleep(0)
+        assert close_task.done() is False
+        release_observation.set()
+        await close_task
+
+    run(scenario())
+
+
+def test_background_completion_observation_failure_is_logged(monkeypatch, caplog):
+    client = ControlPlaneClient()
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(enabled=True),
+        model_id="model",
+        model_config=simple_model_config(),
+    )
+
+    async def fail_observation(observation):
+        del observation
+        raise RuntimeError("observation injection")
+
+    monkeypatch.setattr(
+        rebalancer,
+        "_record_completion_observation",
+        fail_observation,
+    )
+
+    async def scenario():
+        await rebalancer.refresh()
+        worker = client.urls[0]
+        fingerprint = rebalancer.deployments[worker].cache_fingerprint
+        rebalancer.sessions["failed-observation"] = SessionRoutingState(
+            owner_worker_url=worker,
+            fingerprint=fingerprint,
+            seen_engines={worker},
+        )
+        lease = RoutingLease(
+            decision=RoutingDecision(
+                session_id="failed-observation",
+                source_worker_url=worker,
+                target_worker_url=worker,
+                cache_fingerprint=fingerprint,
+                state=SchedulerState.ACTIVE,
+                reason="test",
+            ),
+            worker_url=worker,
+            reserved_tokens=10,
+            base_tokens=0,
+            started_monotonic=time.monotonic(),
+            context_tokens=10,
+        )
+        await rebalancer.complete(
+            lease,
+            response_meta={},
+            output_tokens=1,
+            committed_tokens=[1] * 11,
+        )
+        await rebalancer._drain_observation_tasks()
+        assert rebalancer.sessions["failed-observation"].owner_worker_url == worker
+
+    with caplog.at_level(
+        logging.WARNING,
+        logger="dressage.proxy.rebalancing.scheduler",
+    ):
+        run(scenario())
+    assert "completion observation failed" in caplog.text
 
 
 def test_actual_mooncake_hit_overrides_full_prefill_prediction_classification():
@@ -5504,6 +5851,7 @@ def test_actual_mooncake_hit_overrides_full_prefill_prediction_classification():
             output_tokens=1,
             committed_tokens=[1] * 101,
         )
+        await rebalancer._drain_observation_tasks()
         assert rebalancer._observations[-1]["cache_source"] == "mooncake"
         assert rebalancer.performance.snapshot()["prefill_samples"] == 0
 

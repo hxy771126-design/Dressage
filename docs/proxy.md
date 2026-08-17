@@ -378,6 +378,11 @@ graceful Proxy shutdown. Each file contains the offline baseline and the
 per-path runtime restore P75, throughput P25, prediction-error P90, readiness,
 and effective model source.
 
+Successful completion commits the session owner, committed token prefix, and
+reservation release before returning to the caller. Performance, cache-hit,
+and runtime-recovery observations are then recorded by managed background tasks
+and may therefore appear in `/v1/engines/load` shortly after the response.
+
 The bundled `run_blackbox_qwen3.5_4b_sync_local_l3_hicache.sh` recipe generates
 that deployment JSON, starts Ray, waits for calibration to reach `READY` or
 `DEGRADED`, and only then submits the rollout job. Inspect both diagnostics
