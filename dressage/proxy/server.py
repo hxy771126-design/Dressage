@@ -190,6 +190,16 @@ def _non_negative_finite_float(value: str) -> float:
     return parsed
 
 
+def _optional_response_duration(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if math.isfinite(parsed) and parsed >= 0 else None
+
+
 def _unit_interval_float(value: str) -> float:
     try:
         parsed = float(value)
@@ -1121,6 +1131,10 @@ def create_app(
             "segment_reason": segment["segment_reason"],
             "segment_reasons": segment["segment_reasons"],
             "trajectory_num_segments": segment_count,
+            "request_e2e_latency_seconds": step.request_e2e_latency_seconds,
+            "request_queue_seconds": step.request_queue_seconds,
+            "rebalancing_batch_id": step.rebalancing_batch_id,
+            "rebalancing_moved": step.rebalancing_moved,
         }
         if invalid:
             extra_info["snapshot_logprobs_invalid"] = True
@@ -1230,6 +1244,18 @@ def create_app(
             "segment_reason": segment["segment_reason"],
             "segment_reasons": segment["segment_reasons"],
             "trajectory_num_segments": segment_count,
+            "request_metrics": [
+                {
+                    "step_id": step.step_id,
+                    "request_e2e_latency_seconds": (
+                        step.request_e2e_latency_seconds
+                    ),
+                    "request_queue_seconds": step.request_queue_seconds,
+                    "rebalancing_batch_id": step.rebalancing_batch_id,
+                    "rebalancing_moved": step.rebalancing_moved,
+                }
+                for step in steps
+            ],
         }
         if concat_logprobs_invalid:
             extra_info["tito_logprobs_invalid"] = True
@@ -2135,6 +2161,14 @@ def create_app(
                 finish_reason=finish_reason,
                 request_version=str(request_version),
                 response_version=str(response_version),
+                request_e2e_latency_seconds=_optional_response_duration(
+                    router_response.meta_info.get("e2e_latency")
+                ),
+                request_queue_seconds=_optional_response_duration(
+                    router_response.meta_info.get("queue_time")
+                ),
+                rebalancing_batch_id=routing_lease.batch_id,
+                rebalancing_moved=routing_lease.decision.moved,
             )
 
             if output_overflow:

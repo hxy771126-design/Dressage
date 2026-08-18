@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import resource
+import shlex
 import signal
 import subprocess
 import sys
@@ -6899,6 +6900,7 @@ def test_engine_rebalancing_benchmark_environment_records_prompt_fingerprints(
     assert environment["sandbox_acquire_timeout_sec"] == "3600"
     assert environment["load_batch_coalescing_window_ms"] == "125"
     assert environment["min_load_improvement_ratio"] == "0.05"
+    assert environment["engine_load_snapshot_interval_seconds"] == "5"
     assert "prompt_source_workload_distribution_json" in environment
     assert "prompt_effective_workload_distribution_json" in environment
 
@@ -6926,6 +6928,20 @@ def test_engine_rebalancing_benchmark_injects_rebalancing_settings_only_for_on(
         generated = output.read_text(encoding="utf-8")
         for flag in flags:
             assert (flag in generated) is (mode == "on")
+        assert ("engine_load_snapshots.jsonl" in generated) is (mode == "on")
+        assert ("_start_benchmark_engine_load_sampler\n" in generated) is (
+            mode == "on"
+        )
+        if mode == "on":
+            assert generated.index("_start_benchmark_engine_load_sampler\n") < generated.index(
+                "ray job submit"
+            )
+            cleanup = generated[
+                generated.index("cleanup() {") : generated.index("trap cleanup EXIT")
+            ]
+            assert cleanup.index("_stop_benchmark_engine_load_sampler") < cleanup.index(
+                "_capture_benchmark_snapshots"
+            )
         syntax = subprocess.run(
             ["bash", "-n", str(output)],
             check=False,
@@ -6933,6 +6949,71 @@ def test_engine_rebalancing_benchmark_injects_rebalancing_settings_only_for_on(
             text=True,
         )
         assert syntax.returncode == 0, syntax.stderr
+
+
+def test_engine_rebalancing_benchmark_sampler_stops_without_leaking_processes(
+    tmp_path,
+):
+    source_recipe = Path(
+        "examples/scripts/run_blackbox_qwen3.5_4b_sync_local_l3_hicache.sh"
+    )
+    generated_path = tmp_path / "on.sh"
+    generated_result = _run_benchmark_heredoc(
+        "build_temporary_recipe",
+        str(source_recipe),
+        str(generated_path),
+        "on",
+    )
+    assert generated_result.returncode == 0, generated_result.stderr
+    generated = generated_path.read_text(encoding="utf-8")
+    sampler = generated[
+        generated.index("_capture_benchmark_engine_load_history() {") : generated.index(
+            "cleanup() {"
+        )
+    ]
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    curl = bin_dir / "curl"
+    curl.write_text(
+        "#!/usr/bin/env bash\nprintf '%s\\n' '{\"recent_load_batches\":[]}'\n",
+        encoding="utf-8",
+    )
+    curl.chmod(0o755)
+    output_dir = tmp_path / "output"
+    shell = f"""
+set -Eeuo pipefail
+{sampler}
+export DRESSAGE_BENCHMARK_OUTPUT_DIR={shlex.quote(str(output_dir))}
+export DRESSAGE_PROXY_URL=http://proxy.test
+_start_benchmark_engine_load_sampler
+sampler_pid="${{BENCHMARK_ENGINE_LOAD_SAMPLER_PID}}"
+sleep 0.05
+child_pid="$(pgrep -P "${{sampler_pid}}" | head -n 1 || true)"
+_stop_benchmark_engine_load_sampler
+if kill -0 "${{sampler_pid}}" 2>/dev/null; then
+  exit 10
+fi
+if [[ -n "${{child_pid}}" ]] && kill -0 "${{child_pid}}" 2>/dev/null; then
+  exit 11
+fi
+"""
+    result = subprocess.run(
+        ["bash", "-c", shell],
+        env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"},
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    records = [
+        json.loads(line)
+        for line in output_dir.joinpath("engine_load_snapshots.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert [record["phase"] for record in records] == ["baseline", "final"]
 
 
 def test_engine_rebalancing_benchmark_collector_uses_sampling_seed_identity(tmp_path):
@@ -7005,6 +7086,285 @@ def test_engine_rebalancing_benchmark_collector_accepts_one_sample_per_prompt(tm
     assert result.returncode == 0, result.stderr
     metrics = json.loads((run_dir / "metrics.json").read_text(encoding="utf-8"))
     assert not any("sampling seed" in error for error in metrics["acceptance_errors"])
+
+
+def _write_tail_metric_fixture(
+    run_dir: Path,
+    *,
+    batch_ids: tuple[int, ...] = (41, 42, 43),
+) -> None:
+    _write_benchmark_sample(
+        run_dir / "runtime" / "traj_payload" / "run" / "samples" / "a.json",
+        instance_id="alpha",
+        sampling_seed=11,
+        segment_index=0,
+    )
+    session_dir = run_dir / "runtime" / "traj_payload" / "run" / "alpha"
+    session_dir.mkdir(parents=True, exist_ok=True)
+    session_dir.joinpath("session.json").write_text(
+        json.dumps(
+            {
+                "trajectory_id": "session-alpha",
+                "data": [
+                    {
+                        "extra_info": {
+                            "segment_view": "lineage",
+                            "request_metrics": [
+                                {
+                                    "step_id": f"step-{index}",
+                                    "request_e2e_latency_seconds": float(index),
+                                    "request_queue_seconds": index / 10.0,
+                                    "rebalancing_batch_id": 41 + index,
+                                    "rebalancing_moved": index % 2 == 1,
+                                }
+                                for index in range(5)
+                            ],
+                        }
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def trace(batch_id: int) -> dict:
+        value = float(batch_id - 40)
+        return {
+            "batch": {
+                "id": batch_id,
+                "registered_count": 1 if batch_id != 42 else 2,
+                "solved_count": 1,
+                "total_seconds": value,
+                "collect_seconds": value / 10.0,
+                "wait_for_previous_seconds": value / 100.0,
+                "fetch_seconds": value / 20.0,
+                "solve_seconds": value / 50.0,
+            },
+            "engines": [
+                {
+                    "fetch_status": "timeout" if batch_id == 43 else "ok",
+                    "fetch_duration_seconds": value / 25.0,
+                }
+            ],
+            "sticky": {"elapsed_seconds": value / 100.0},
+            "optimized": (
+                {"elapsed_seconds": value / 200.0} if batch_id == 42 else None
+            ),
+            "fallback_reason": (
+                "target_load_infeasible" if batch_id == 43 else None
+            ),
+            "adopted_plan": "optimized" if batch_id == 42 else "sticky",
+        }
+
+    snapshots = [
+        {
+            "captured_at": 1.0,
+            "phase": "baseline",
+            "payload": {"recent_load_batches": [trace(40)]},
+        },
+        {
+            "captured_at": 2.0,
+            "phase": "sample",
+            "payload": {
+                "recent_load_batches": [trace(batch_id) for batch_id in batch_ids[:2]]
+            },
+        },
+        {
+            "captured_at": 3.0,
+            "phase": "final",
+            "payload": {
+                "recent_load_batches": [trace(batch_id) for batch_id in batch_ids[1:]]
+            },
+        },
+    ]
+    run_dir.joinpath("engine_load_snapshots.jsonl").write_text(
+        "".join(json.dumps(snapshot) + "\n" for snapshot in snapshots),
+        encoding="utf-8",
+    )
+    run_dir.joinpath("engine_load.json").write_text(
+        json.dumps(snapshots[-1]["payload"]),
+        encoding="utf-8",
+    )
+    run_dir.joinpath("calibration.json").write_text(
+        json.dumps({"state": "READY"}),
+        encoding="utf-8",
+    )
+    run_dir.joinpath("environment.txt").write_text(
+        "gpu_count=8\nhostname=test\ngpu_inventory_sha256=gpu\ncode_fingerprint=code\n",
+        encoding="utf-8",
+    )
+
+
+def test_engine_rebalancing_benchmark_collects_type7_tail_metrics(tmp_path):
+    _write_tail_metric_fixture(tmp_path)
+
+    result = _run_benchmark_heredoc(
+        "collect_run", str(tmp_path), "run", "on", "0", "1", "2", "1"
+    )
+
+    assert result.returncode == 0, result.stderr
+    tail = json.loads((tmp_path / "metrics.json").read_text(encoding="utf-8"))[
+        "tail_metrics"
+    ]
+    assert tail["request"]["e2e_latency_seconds"] == {
+        "sample_count": 5,
+        "p50": 2.0,
+        "p90": 3.6,
+        "p95": 3.8,
+        "p99": 3.96,
+        "max": 4.0,
+    }
+    assert tail["batch"]["total_seconds"]["p95"] == pytest.approx(2.9)
+    assert tail["batch"]["registered_count"]["sample_count"] == 3
+    assert tail["batch"]["singleton_ratio"] == pytest.approx(2 / 3)
+    assert tail["load_fetch"]["status_counts"] == {
+        "ok": 2,
+        "timeout": 1,
+        "error": 0,
+        "invalid": 0,
+    }
+    assert tail["milp"]["optimized_elapsed_seconds"]["sample_count"] == 1
+    assert tail["milp"]["fallback_counts"]["target_load_infeasible"] == 1
+    assert tail["coverage"]["batch_ids"] == [41, 42, 43]
+    assert tail["coverage"]["missing_batch_ids"] == []
+    assert tail["coverage"]["complete"] is True
+
+
+def test_engine_rebalancing_benchmark_marks_batch_history_gaps_incomplete(tmp_path):
+    _write_tail_metric_fixture(tmp_path, batch_ids=(41, 43))
+
+    result = _run_benchmark_heredoc(
+        "collect_run", str(tmp_path), "run", "on", "0", "1", "2", "1"
+    )
+
+    assert result.returncode == 0, result.stderr
+    coverage = json.loads(
+        (tmp_path / "metrics.json").read_text(encoding="utf-8")
+    )["tail_metrics"]["coverage"]
+    assert coverage["batch_ids"] == [41, 43]
+    assert coverage["missing_batch_ids"] == [42]
+    assert coverage["complete"] is False
+    assert "missing load batch IDs: 42" in coverage["incomplete_reasons"]
+
+
+def test_engine_rebalancing_benchmark_requires_final_load_snapshot(tmp_path):
+    _write_tail_metric_fixture(tmp_path)
+    snapshot_path = tmp_path / "engine_load_snapshots.jsonl"
+    records = [
+        json.loads(line)
+        for line in snapshot_path.read_text(encoding="utf-8").splitlines()
+    ]
+    snapshot_path.write_text(
+        "".join(
+            json.dumps(record) + "\n"
+            for record in records
+            if record.get("phase") != "final"
+        ),
+        encoding="utf-8",
+    )
+
+    result = _run_benchmark_heredoc(
+        "collect_run", str(tmp_path), "run", "on", "0", "1", "2", "1"
+    )
+
+    assert result.returncode == 0, result.stderr
+    coverage = json.loads(
+        (tmp_path / "metrics.json").read_text(encoding="utf-8")
+    )["tail_metrics"]["coverage"]
+    assert coverage["complete"] is False
+    assert "missing final load snapshot" in coverage["incomplete_reasons"]
+
+
+def test_engine_rebalancing_benchmark_counts_all_executed_solver_timings(tmp_path):
+    _write_tail_metric_fixture(tmp_path)
+    snapshot_path = tmp_path / "engine_load_snapshots.jsonl"
+    records = [
+        json.loads(line)
+        for line in snapshot_path.read_text(encoding="utf-8").splitlines()
+    ]
+    for record in records:
+        for trace in record.get("payload", {}).get("recent_load_batches", []):
+            batch_id = trace.get("batch", {}).get("id")
+            if batch_id == 42:
+                trace["adopted_plan"] = "sticky"
+            elif batch_id == 43:
+                trace["sticky"] = None
+                trace["fallback_reason"] = "sticky_solver_failure"
+                trace["batch"]["solve_seconds"] = 0.25
+    snapshot_path.write_text(
+        "".join(json.dumps(record) + "\n" for record in records),
+        encoding="utf-8",
+    )
+
+    result = _run_benchmark_heredoc(
+        "collect_run", str(tmp_path), "run", "on", "0", "1", "2", "1"
+    )
+
+    assert result.returncode == 0, result.stderr
+    milp = json.loads(
+        (tmp_path / "metrics.json").read_text(encoding="utf-8")
+    )["tail_metrics"]["milp"]
+    assert milp["solve_seconds"]["sample_count"] == 3
+    assert milp["optimized_elapsed_seconds"]["sample_count"] == 1
+
+
+def test_engine_rebalancing_benchmark_tail_metrics_filter_invalid_values(tmp_path):
+    _write_benchmark_sample(
+        tmp_path / "runtime" / "traj_payload" / "run" / "samples" / "a.json",
+        instance_id="alpha",
+        sampling_seed=11,
+        segment_index=0,
+    )
+    session_dir = tmp_path / "runtime" / "traj_payload" / "run" / "alpha"
+    session_dir.mkdir(parents=True, exist_ok=True)
+    session_dir.joinpath("session.json").write_text(
+        json.dumps(
+            {
+                "trajectory_id": "session-alpha",
+                "data": [
+                    {
+                        "extra_info": {
+                            "segment_view": "timeline",
+                            "step_id": "valid",
+                            "request_e2e_latency_seconds": 1.0,
+                            "request_queue_seconds": "invalid",
+                            "rebalancing_moved": False,
+                        }
+                    },
+                    {
+                        "extra_info": {
+                            "segment_view": "timeline",
+                            "step_id": "negative",
+                            "request_e2e_latency_seconds": -1.0,
+                            "request_queue_seconds": True,
+                            "rebalancing_moved": True,
+                        }
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = _run_benchmark_heredoc(
+        "collect_run", str(tmp_path), "run", "off", "0", "1", "2", "1"
+    )
+
+    assert result.returncode == 0, result.stderr
+    tail = json.loads((tmp_path / "metrics.json").read_text(encoding="utf-8"))[
+        "tail_metrics"
+    ]
+    assert tail["request"]["e2e_latency_seconds"] == {
+        "sample_count": 1,
+        "p50": 1.0,
+        "p90": 1.0,
+        "p95": 1.0,
+        "p99": 1.0,
+        "max": 1.0,
+    }
+    assert tail["request"]["queue_seconds"]["sample_count"] == 0
+    assert tail["request"]["queue_seconds"]["p99"] is None
+    assert tail["coverage"]["complete"] is False
 
 
 def _write_benchmark_sample(
@@ -7144,6 +7504,101 @@ def test_engine_rebalancing_benchmark_trajectory_hash_uses_seed_not_file_order(
 
     assert first_hash == second_hash
     assert changed_seed_hash != first_hash
+
+
+def test_engine_rebalancing_benchmark_summary_reports_tail_metrics(tmp_path):
+    def metric(p50, p95, p99):
+        return {
+            "sample_count": 10,
+            "p50": p50,
+            "p90": None if p95 is None else p95 - 0.1,
+            "p95": p95,
+            "p99": p99,
+            "max": None if p99 is None else p99 + 0.1,
+        }
+
+    for mode in ("off", "on"):
+        run_name = f"seed42-{mode}-r1"
+        run_dir = tmp_path / run_name
+        run_dir.mkdir()
+        tail = {
+            "request": {
+                "e2e_latency_seconds": metric(
+                    1.0,
+                    2.0 if mode == "off" else 1.8,
+                    3.0,
+                ),
+                "queue_seconds": metric(0.1, 0.2, 0.3),
+                "moved_e2e_latency_seconds": (
+                    metric(1.1, 2.1, 3.1)
+                    if mode == "on"
+                    else metric(None, None, None)
+                ),
+                "sticky_e2e_latency_seconds": metric(0.9, 1.9, 2.9),
+            },
+            "batch": {
+                "total_seconds": metric(0.06, 0.08, 0.1),
+                "registered_count": metric(2.0, 4.0, 5.0),
+                "singleton_ratio": 0.25,
+            },
+            "load_fetch": {"batch_fetch_seconds": metric(0.01, 0.02, 0.03)},
+            "milp": {"solve_seconds": metric(0.005, 0.01, 0.02)},
+            "coverage": {"complete": True},
+        }
+        payload = {
+            "run_name": run_name,
+            "valid_run": True,
+            "acceptance_errors": [],
+            "hostname": "host",
+            "gpu_inventory_sha256": "gpu",
+            "code_fingerprint": "code",
+            "effective_token_total": 100,
+            "trajectory_hash": "trajectory",
+            "calibration_state": "READY" if mode == "on" else "OFF",
+            "rollout_time_seconds": 10.0,
+            "effective_tokens_per_gpu_per_sec": 20.0,
+            "tail_metrics": tail,
+            "kv_migration_evidence": mode == "on",
+        }
+        run_dir.joinpath("metrics.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    result = _run_benchmark_heredoc("write_summary", str(tmp_path), "42")
+
+    assert result.returncode == 0, result.stderr
+    summary = json.loads((tmp_path / "summary.json").read_text(encoding="utf-8"))
+    row = summary["pairs"][0]
+    assert summary["tail_metrics_by_run"]["seed42-on-r1"]["request"][
+        "e2e_latency_seconds"
+    ]["p90"] == 1.7
+    assert row["off_request_e2e_p95"] == 2.0
+    assert row["on_request_e2e_p95"] == 1.8
+    assert row["on_moved_e2e_p99"] == 3.1
+    assert row["on_moved_e2e_count"] == 10
+    assert row["on_batch_total_p95"] == 0.08
+    assert row["on_batch_count"] == 10
+    assert row["on_batch_fetch_p99"] == 0.03
+    assert row["on_solve_p99"] == 0.02
+    assert row["on_batch_size_p50"] == 2.0
+    assert row["on_batch_singleton_ratio"] == 0.25
+    assert row["on_tail_metrics_complete"] is True
+    markdown = (tmp_path / "summary.md").read_text(encoding="utf-8")
+    assert "## Tail latency" in markdown
+    assert "Request E2E" in markdown
+    assert "Batch total" in markdown
+    assert "| Metric | OFF N | OFF P95 | OFF P99 | ON N | ON P95 | ON P99 |" in markdown
+
+    on_metrics_path = tmp_path / "seed42-on-r1" / "metrics.json"
+    on_metrics = json.loads(on_metrics_path.read_text(encoding="utf-8"))
+    on_metrics["tail_metrics"]["coverage"]["complete"] = False
+    on_metrics_path.write_text(json.dumps(on_metrics), encoding="utf-8")
+    incomplete_result = _run_benchmark_heredoc("write_summary", str(tmp_path), "42")
+    assert incomplete_result.returncode == 0, incomplete_result.stderr
+    incomplete_row = json.loads(
+        (tmp_path / "summary.json").read_text(encoding="utf-8")
+    )["pairs"][0]
+    assert incomplete_row["on_request_e2e_p95"] is None
+    assert incomplete_row["on_batch_total_p95"] is None
+    assert incomplete_row["on_tail_metrics_complete"] is False
 
 
 def test_sync_local_script_gracefully_stops_proxy_before_ray():

@@ -298,6 +298,7 @@ values = {
     "mooncake_global_segment_size": mooncake_global_segment_size,
     "load_batch_coalescing_window_ms": load_batch_coalescing_window_ms,
     "min_load_improvement_ratio": min_load_improvement_ratio,
+    "engine_load_snapshot_interval_seconds": 5,
 }
 
 path = pathlib.Path(output)
@@ -462,16 +463,95 @@ _capture_benchmark_snapshots() {
 }
 
 '''
+sampler_function = ""
+sampler_cleanup = ""
+sampler_start = ""
+if mode == "on":
+    sampler_function = r'''_capture_benchmark_engine_load_history() {
+  local phase="$1"
+  local output_path="${DRESSAGE_BENCHMARK_OUTPUT_DIR}/engine_load_snapshots.jsonl"
+  local temporary_path="${output_path}.tmp"
+
+  if curl -sf --max-time 2 "${DRESSAGE_PROXY_URL}/v1/engines/load" \
+      >"${temporary_path}"; then
+    python3 - "${phase}" "${temporary_path}" >>"${output_path}" <<'PY_SNAPSHOT'
+import json
+import pathlib
+import sys
+import time
+
+phase, path = sys.argv[1:]
+payload = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+print(
+    json.dumps(
+        {"captured_at": time.time(), "phase": phase, "payload": payload},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+)
+PY_SNAPSHOT
+  fi
+  rm -f -- "${temporary_path}"
+}
+
+_start_benchmark_engine_load_sampler() {
+  if [[ -z "${DRESSAGE_BENCHMARK_OUTPUT_DIR:-}" ]]; then
+    return
+  fi
+  mkdir -p "${DRESSAGE_BENCHMARK_OUTPUT_DIR}"
+  : >"${DRESSAGE_BENCHMARK_OUTPUT_DIR}/engine_load_snapshots.jsonl"
+  BENCHMARK_ENGINE_LOAD_SAMPLER_STOP_PATH="${DRESSAGE_BENCHMARK_OUTPUT_DIR}/.engine_load_sampler.stop"
+  rm -f -- "${BENCHMARK_ENGINE_LOAD_SAMPLER_STOP_PATH}"
+  _capture_benchmark_engine_load_history baseline
+  (
+    while [[ ! -e "${BENCHMARK_ENGINE_LOAD_SAMPLER_STOP_PATH}" ]]; do
+      for _ in $(seq 1 50); do
+        if [[ -e "${BENCHMARK_ENGINE_LOAD_SAMPLER_STOP_PATH}" ]]; then
+          exit 0
+        fi
+        sleep 0.1
+      done
+      if [[ -e "${BENCHMARK_ENGINE_LOAD_SAMPLER_STOP_PATH}" ]]; then
+        exit 0
+      fi
+      _capture_benchmark_engine_load_history sample
+    done
+  ) &
+  BENCHMARK_ENGINE_LOAD_SAMPLER_PID=$!
+}
+
+_stop_benchmark_engine_load_sampler() {
+  local pid="${BENCHMARK_ENGINE_LOAD_SAMPLER_PID:-}"
+  if [[ -n "${pid}" ]]; then
+    touch "${BENCHMARK_ENGINE_LOAD_SAMPLER_STOP_PATH}"
+    wait "${pid}" 2>/dev/null || true
+    BENCHMARK_ENGINE_LOAD_SAMPLER_PID=""
+    rm -f -- "${BENCHMARK_ENGINE_LOAD_SAMPLER_STOP_PATH}"
+  fi
+  _capture_benchmark_engine_load_history final
+}
+
+'''
+    sampler_cleanup = "  _stop_benchmark_engine_load_sampler\n"
+    sampler_start = "_start_benchmark_engine_load_sampler\n\n"
 cleanup_marker = "cleanup() {\n  status=$?\n  set +e\n"
 if cleanup_marker not in text:
     raise SystemExit("source recipe cleanup marker changed")
 text = text.replace(
     cleanup_marker,
     capture_function
+    + sampler_function
     + "cleanup() {\n  status=$?\n  set +e\n\n"
+    + sampler_cleanup
     + "  _capture_benchmark_snapshots\n",
     1,
 )
+
+if mode == "on":
+    rollout_marker = "ray job submit \\\n"
+    if rollout_marker not in text:
+        raise SystemExit("source recipe rollout launch marker changed")
+    text = text.replace(rollout_marker, sampler_start + rollout_marker, 1)
 
 pathlib.Path(output).write_text(text, encoding="utf-8")
 PY
@@ -502,6 +582,7 @@ import csv
 import datetime as dt
 import hashlib
 import json
+import math
 import pathlib
 import re
 import sys
@@ -527,6 +608,42 @@ def load_json(path: pathlib.Path) -> dict:
         return value if isinstance(value, dict) else {"value": value}
     except (OSError, json.JSONDecodeError) as exc:
         return {"error": str(exc)}
+
+
+def non_negative_number(value) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    parsed = float(value)
+    return parsed if math.isfinite(parsed) and parsed >= 0 else None
+
+
+def distribution(values) -> dict[str, float | int | None]:
+    ordered = sorted(
+        parsed
+        for value in values
+        if (parsed := non_negative_number(value)) is not None
+    )
+
+    def percentile(fraction: float) -> float | None:
+        if not ordered:
+            return None
+        position = (len(ordered) - 1) * fraction
+        lower = math.floor(position)
+        upper = math.ceil(position)
+        if lower == upper:
+            return ordered[lower]
+        return ordered[lower] + (ordered[upper] - ordered[lower]) * (
+            position - lower
+        )
+
+    return {
+        "sample_count": len(ordered),
+        "p50": percentile(0.50),
+        "p90": percentile(0.90),
+        "p95": percentile(0.95),
+        "p99": percentile(0.99),
+        "max": ordered[-1] if ordered else None,
+    }
 
 
 def parse_environment(path: pathlib.Path) -> dict[str, str]:
@@ -717,6 +834,245 @@ matched_mooncake_observations = [
     if (str(item.get("session_id")), str(item.get("engine_url"))) in moved_sessions
 ]
 
+request_steps: dict[tuple[str, str], dict] = {}
+for session_path in sorted(trajectory_root.glob("**/session.json")):
+    session_payload = load_json(session_path)
+    trajectory_id = str(
+        session_payload.get("trajectory_id")
+        or session_payload.get("session_id")
+        or session_path.parent
+    )
+    segments = session_payload.get("data")
+    if not isinstance(segments, list):
+        continue
+    for segment_index, segment in enumerate(segments):
+        if not isinstance(segment, dict):
+            continue
+        extra = segment.get("extra_info")
+        if not isinstance(extra, dict):
+            continue
+        if extra.get("segment_view") == "timeline":
+            step_id = str(extra.get("step_id") or f"segment-{segment_index}")
+            request_steps[(trajectory_id, step_id)] = extra
+            continue
+        if extra.get("segment_view") != "lineage":
+            continue
+        for metric_index, metric in enumerate(extra.get("request_metrics") or []):
+            if not isinstance(metric, dict):
+                continue
+            step_id = str(
+                metric.get("step_id")
+                or f"segment-{segment_index}-request-{metric_index}"
+            )
+            request_steps[(trajectory_id, step_id)] = metric
+
+request_e2e_values = [
+    extra.get("request_e2e_latency_seconds") for extra in request_steps.values()
+]
+request_queue_values = [
+    extra.get("request_queue_seconds") for extra in request_steps.values()
+]
+moved_e2e_values = [
+    extra.get("request_e2e_latency_seconds")
+    for extra in request_steps.values()
+    if extra.get("rebalancing_moved") is True
+]
+sticky_e2e_values = [
+    extra.get("request_e2e_latency_seconds")
+    for extra in request_steps.values()
+    if extra.get("rebalancing_moved") is not True
+]
+
+snapshot_records: list[dict] = []
+snapshot_path = run_dir / "engine_load_snapshots.jsonl"
+if snapshot_path.exists():
+    for line in snapshot_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(record, dict):
+            snapshot_records.append(record)
+
+baseline_batch_id = None
+for record in snapshot_records:
+    if record.get("phase") != "baseline":
+        continue
+    payload = record.get("payload")
+    traces = payload.get("recent_load_batches") if isinstance(payload, dict) else None
+    if not isinstance(traces, list):
+        continue
+    baseline_ids = [
+        trace.get("batch", {}).get("id")
+        for trace in traces
+        if isinstance(trace, dict) and isinstance(trace.get("batch"), dict)
+    ]
+    baseline_ids = [value for value in baseline_ids if isinstance(value, int)]
+    baseline_batch_id = max(baseline_ids, default=0)
+    break
+
+batch_traces: dict[int, dict] = {}
+for record in snapshot_records:
+    if record.get("phase") == "baseline":
+        continue
+    payload = record.get("payload")
+    traces = payload.get("recent_load_batches") if isinstance(payload, dict) else None
+    if not isinstance(traces, list):
+        continue
+    for trace in traces:
+        batch = trace.get("batch") if isinstance(trace, dict) else None
+        batch_id = batch.get("id") if isinstance(batch, dict) else None
+        if not isinstance(batch_id, int):
+            continue
+        if baseline_batch_id is None or batch_id > baseline_batch_id:
+            batch_traces[batch_id] = trace
+
+ordered_batch_ids = sorted(batch_traces)
+ordered_traces = [batch_traces[batch_id] for batch_id in ordered_batch_ids]
+registered_counts = [trace.get("batch", {}).get("registered_count") for trace in ordered_traces]
+batch_total_values = [trace.get("batch", {}).get("total_seconds") for trace in ordered_traces]
+batch_collect_values = [trace.get("batch", {}).get("collect_seconds") for trace in ordered_traces]
+batch_wait_values = [
+    trace.get("batch", {}).get("wait_for_previous_seconds") for trace in ordered_traces
+]
+batch_fetch_values = [trace.get("batch", {}).get("fetch_seconds") for trace in ordered_traces]
+solve_values = [
+    trace.get("batch", {}).get("solve_seconds")
+    for trace in ordered_traces
+    if isinstance(trace.get("sticky"), dict)
+    or trace.get("fallback_reason") == "sticky_solver_failure"
+]
+sticky_values = [
+    trace["sticky"].get("elapsed_seconds")
+    for trace in ordered_traces
+    if isinstance(trace.get("sticky"), dict)
+]
+optimized_values = [
+    trace["optimized"].get("elapsed_seconds")
+    for trace in ordered_traces
+    if isinstance(trace.get("optimized"), dict)
+]
+
+fetch_status_counts = {status: 0 for status in ("ok", "timeout", "error", "invalid")}
+engine_fetch_values: list[float] = []
+for trace in ordered_traces:
+    for engine in trace.get("engines") or []:
+        if not isinstance(engine, dict):
+            continue
+        status = engine.get("fetch_status")
+        if status in fetch_status_counts:
+            fetch_status_counts[status] += 1
+        duration = non_negative_number(engine.get("fetch_duration_seconds"))
+        if duration is not None:
+            engine_fetch_values.append(duration)
+fetch_attempts = sum(fetch_status_counts.values())
+fetch_status_rates = {
+    status: (count / fetch_attempts if fetch_attempts else None)
+    for status, count in fetch_status_counts.items()
+}
+
+fallback_counts = {
+    reason: 0
+    for reason in (
+        "target_load_infeasible",
+        "target_solver_deadline",
+        "target_solver_failure",
+        "frozen_state_changed",
+    )
+}
+for trace in ordered_traces:
+    reason = trace.get("fallback_reason")
+    if reason in fallback_counts:
+        fallback_counts[reason] += 1
+fallback_rates = {
+    reason: (count / len(ordered_traces) if ordered_traces else None)
+    for reason, count in fallback_counts.items()
+}
+
+incomplete_reasons: list[str] = []
+request_e2e_count = distribution(request_e2e_values)["sample_count"]
+request_queue_count = distribution(request_queue_values)["sample_count"]
+if not request_steps:
+    incomplete_reasons.append("no trajectory request metrics")
+if request_e2e_count != len(request_steps):
+    incomplete_reasons.append(
+        f"request E2E coverage is {request_e2e_count}/{len(request_steps)}"
+    )
+if request_queue_count != len(request_steps):
+    incomplete_reasons.append(
+        f"request queue coverage is {request_queue_count}/{len(request_steps)}"
+    )
+missing_batch_ids: list[int] = []
+if mode == "on":
+    if not any(record.get("phase") == "final" for record in snapshot_records):
+        incomplete_reasons.append("missing final load snapshot")
+    if baseline_batch_id is None:
+        incomplete_reasons.append("missing baseline load snapshot")
+    elif ordered_batch_ids:
+        missing_batch_ids = sorted(
+            set(range(baseline_batch_id + 1, ordered_batch_ids[-1] + 1))
+            - set(ordered_batch_ids)
+        )
+        if missing_batch_ids:
+            incomplete_reasons.append(
+                "missing load batch IDs: "
+                + ",".join(str(batch_id) for batch_id in missing_batch_ids)
+            )
+    else:
+        incomplete_reasons.append("no load batches captured")
+
+valid_registered_counts = [
+    value
+    for value in registered_counts
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0
+]
+tail_metrics = {
+    "request": {
+        "e2e_latency_seconds": distribution(request_e2e_values),
+        "queue_seconds": distribution(request_queue_values),
+        "moved_e2e_latency_seconds": distribution(moved_e2e_values),
+        "sticky_e2e_latency_seconds": distribution(sticky_e2e_values),
+    },
+    "batch": {
+        "total_seconds": distribution(batch_total_values),
+        "collect_seconds": distribution(batch_collect_values),
+        "wait_for_previous_seconds": distribution(batch_wait_values),
+        "registered_count": distribution(registered_counts),
+        "singleton_ratio": (
+            sum(value == 1 for value in valid_registered_counts)
+            / len(valid_registered_counts)
+            if valid_registered_counts
+            else None
+        ),
+    },
+    "load_fetch": {
+        "batch_fetch_seconds": distribution(batch_fetch_values),
+        "engine_fetch_duration_seconds": distribution(engine_fetch_values),
+        "status_counts": fetch_status_counts,
+        "status_rates": fetch_status_rates,
+    },
+    "milp": {
+        "solve_seconds": distribution(solve_values),
+        "sticky_elapsed_seconds": distribution(sticky_values),
+        "optimized_elapsed_seconds": distribution(optimized_values),
+        "fallback_counts": fallback_counts,
+        "fallback_rates": fallback_rates,
+    },
+    "coverage": {
+        "trajectory_step_count": len(request_steps),
+        "request_e2e_count": request_e2e_count,
+        "request_queue_count": request_queue_count,
+        "baseline_batch_id": baseline_batch_id,
+        "batch_count": len(ordered_batch_ids),
+        "first_batch_id": ordered_batch_ids[0] if ordered_batch_ids else None,
+        "last_batch_id": ordered_batch_ids[-1] if ordered_batch_ids else None,
+        "batch_ids": ordered_batch_ids,
+        "missing_batch_ids": missing_batch_ids,
+        "complete": not incomplete_reasons,
+        "incomplete_reasons": incomplete_reasons,
+    },
+}
+
 patterns = {
     "rollout_retry": re.compile(
         r"resubmitting rollout group for retry|returned group[^\n]*to rollout buffer for retry|"
@@ -822,6 +1178,7 @@ metrics = {
     "recent_mooncake_cached_observations": len(mooncake_observations),
     "matched_mooncake_migrations": len(matched_mooncake_observations),
     "kv_migration_evidence": bool(matched_mooncake_observations),
+    "tail_metrics": tail_metrics,
     "hostname": environment.get("hostname"),
     "gpu_inventory_sha256": environment.get("gpu_inventory_sha256"),
     "code_fingerprint": environment.get("code_fingerprint"),
@@ -940,10 +1297,27 @@ pairs = [
     (1, f"seed{seed}-off-r1", f"seed{seed}-on-r1"),
 ]
 
+
+def tail_value(run: dict, *path):
+    value = run.get("tail_metrics")
+    if path != ("coverage", "complete"):
+        coverage = value.get("coverage") if isinstance(value, dict) else None
+        if not isinstance(coverage, dict) or coverage.get("complete") is not True:
+            return None
+    for key in path:
+        if not isinstance(value, dict):
+            return None
+        value = value.get(key)
+    return value
+
+
 rows: list[dict] = []
+tail_metrics_by_run: dict[str, dict | None] = {}
 for pair_number, off_name, on_name in pairs:
     off = load(off_name)
     on = load(on_name)
+    tail_metrics_by_run[off_name] = off.get("tail_metrics")
+    tail_metrics_by_run[on_name] = on.get("tail_metrics")
     reasons: list[str] = []
     if not off.get("valid_run"):
         reasons.append("OFF invalid: " + "; ".join(off.get("acceptance_errors", [])))
@@ -1001,6 +1375,98 @@ for pair_number, off_name, on_name in pairs:
             "on_gpu_utilization": on.get("gpu_rollout_average_utilization_percent"),
             "off_gpu_spread": off.get("gpu_rollout_spread_percent"),
             "on_gpu_spread": on.get("gpu_rollout_spread_percent"),
+            "off_request_e2e_p95": tail_value(
+                off, "request", "e2e_latency_seconds", "p95"
+            ),
+            "off_request_e2e_count": tail_value(
+                off, "request", "e2e_latency_seconds", "sample_count"
+            ),
+            "off_request_e2e_p99": tail_value(
+                off, "request", "e2e_latency_seconds", "p99"
+            ),
+            "on_request_e2e_p95": tail_value(
+                on, "request", "e2e_latency_seconds", "p95"
+            ),
+            "on_request_e2e_count": tail_value(
+                on, "request", "e2e_latency_seconds", "sample_count"
+            ),
+            "on_request_e2e_p99": tail_value(
+                on, "request", "e2e_latency_seconds", "p99"
+            ),
+            "off_request_queue_p95": tail_value(
+                off, "request", "queue_seconds", "p95"
+            ),
+            "off_request_queue_count": tail_value(
+                off, "request", "queue_seconds", "sample_count"
+            ),
+            "off_request_queue_p99": tail_value(
+                off, "request", "queue_seconds", "p99"
+            ),
+            "on_request_queue_p95": tail_value(
+                on, "request", "queue_seconds", "p95"
+            ),
+            "on_request_queue_count": tail_value(
+                on, "request", "queue_seconds", "sample_count"
+            ),
+            "on_request_queue_p99": tail_value(
+                on, "request", "queue_seconds", "p99"
+            ),
+            "on_moved_e2e_p95": tail_value(
+                on, "request", "moved_e2e_latency_seconds", "p95"
+            ),
+            "on_moved_e2e_count": tail_value(
+                on, "request", "moved_e2e_latency_seconds", "sample_count"
+            ),
+            "on_moved_e2e_p99": tail_value(
+                on, "request", "moved_e2e_latency_seconds", "p99"
+            ),
+            "on_sticky_e2e_p95": tail_value(
+                on, "request", "sticky_e2e_latency_seconds", "p95"
+            ),
+            "on_sticky_e2e_count": tail_value(
+                on, "request", "sticky_e2e_latency_seconds", "sample_count"
+            ),
+            "on_sticky_e2e_p99": tail_value(
+                on, "request", "sticky_e2e_latency_seconds", "p99"
+            ),
+            "on_batch_total_p95": tail_value(
+                on, "batch", "total_seconds", "p95"
+            ),
+            "on_batch_count": tail_value(
+                on, "batch", "total_seconds", "sample_count"
+            ),
+            "on_batch_total_p99": tail_value(
+                on, "batch", "total_seconds", "p99"
+            ),
+            "on_batch_fetch_p95": tail_value(
+                on, "load_fetch", "batch_fetch_seconds", "p95"
+            ),
+            "on_batch_fetch_count": tail_value(
+                on, "load_fetch", "batch_fetch_seconds", "sample_count"
+            ),
+            "on_batch_fetch_p99": tail_value(
+                on, "load_fetch", "batch_fetch_seconds", "p99"
+            ),
+            "on_solve_p95": tail_value(
+                on, "milp", "solve_seconds", "p95"
+            ),
+            "on_solve_count": tail_value(
+                on, "milp", "solve_seconds", "sample_count"
+            ),
+            "on_solve_p99": tail_value(
+                on, "milp", "solve_seconds", "p99"
+            ),
+            "on_batch_size_p50": tail_value(
+                on, "batch", "registered_count", "p50"
+            ),
+            "on_batch_size_p95": tail_value(
+                on, "batch", "registered_count", "p95"
+            ),
+            "on_batch_singleton_ratio": tail_value(
+                on, "batch", "singleton_ratio"
+            ),
+            "off_tail_metrics_complete": tail_value(off, "coverage", "complete"),
+            "on_tail_metrics_complete": tail_value(on, "coverage", "complete"),
             "environment_equal": environment_equal,
             "effective_tokens_equal": token_total_equal,
             "trajectory_hash_equal": trajectory_hash_equal,
@@ -1029,6 +1495,10 @@ def fmt(value, *, percent: bool = False) -> str:
     if not isinstance(value, (int, float)):
         return "N/A"
     return f"{value * 100:.2f}%" if percent else f"{value:.4f}"
+
+
+def fmt_count(value) -> str:
+    return str(value) if isinstance(value, int) and not isinstance(value, bool) else "N/A"
 
 
 status = "PASS"
@@ -1063,6 +1533,63 @@ for row in rows:
         f"{'yes' if row['kv_migration_evidence'] else 'no'} |"
     )
 
+lines.extend(
+    [
+        "",
+        "## Tail latency",
+        "",
+        "| Pair | Metric | OFF N | OFF P95 | OFF P99 | ON N | ON P95 | ON P99 |",
+        "|---:|:---|---:|---:|---:|---:|---:|---:|",
+    ]
+)
+for row in rows:
+    lines.extend(
+        [
+            f"| {row['pair']} | Request E2E | "
+            f"{fmt_count(row['off_request_e2e_count'])} | "
+            f"{fmt(row['off_request_e2e_p95'])} | "
+            f"{fmt(row['off_request_e2e_p99'])} | "
+            f"{fmt_count(row['on_request_e2e_count'])} | "
+            f"{fmt(row['on_request_e2e_p95'])} | "
+            f"{fmt(row['on_request_e2e_p99'])} |",
+            f"| {row['pair']} | Request queue | "
+            f"{fmt_count(row['off_request_queue_count'])} | "
+            f"{fmt(row['off_request_queue_p95'])} | "
+            f"{fmt(row['off_request_queue_p99'])} | "
+            f"{fmt_count(row['on_request_queue_count'])} | "
+            f"{fmt(row['on_request_queue_p95'])} | "
+            f"{fmt(row['on_request_queue_p99'])} |",
+            f"| {row['pair']} | ON moved E2E | N/A | N/A | N/A | "
+            f"{fmt_count(row['on_moved_e2e_count'])} | "
+            f"{fmt(row['on_moved_e2e_p95'])} | "
+            f"{fmt(row['on_moved_e2e_p99'])} |",
+            f"| {row['pair']} | ON sticky E2E | N/A | N/A | N/A | "
+            f"{fmt_count(row['on_sticky_e2e_count'])} | "
+            f"{fmt(row['on_sticky_e2e_p95'])} | "
+            f"{fmt(row['on_sticky_e2e_p99'])} |",
+            f"| {row['pair']} | Batch total | N/A | N/A | N/A | "
+            f"{fmt_count(row['on_batch_count'])} | "
+            f"{fmt(row['on_batch_total_p95'])} | "
+            f"{fmt(row['on_batch_total_p99'])} |",
+            f"| {row['pair']} | /v1/loads fetch | N/A | N/A | N/A | "
+            f"{fmt_count(row['on_batch_fetch_count'])} | "
+            f"{fmt(row['on_batch_fetch_p95'])} | "
+            f"{fmt(row['on_batch_fetch_p99'])} |",
+            f"| {row['pair']} | MILP solve | N/A | N/A | N/A | "
+            f"{fmt_count(row['on_solve_count'])} | "
+            f"{fmt(row['on_solve_p95'])} | "
+            f"{fmt(row['on_solve_p99'])} |",
+            "",
+            f"- Pair {row['pair']} ON batch size P50/P95: "
+            f"`{fmt(row['on_batch_size_p50'])}` / "
+            f"`{fmt(row['on_batch_size_p95'])}`; singleton ratio: "
+            f"`{fmt(row['on_batch_singleton_ratio'], percent=True)}`.",
+            f"- Pair {row['pair']} tail metrics complete: "
+            f"OFF=`{'yes' if row['off_tail_metrics_complete'] else 'no'}`, "
+            f"ON=`{'yes' if row['on_tail_metrics_complete'] else 'no'}`.",
+        ]
+    )
+
 invalid = [row for row in rows if not row["valid"]]
 if invalid or not kv_evidence:
     lines.extend(["", "## Acceptance notes", ""])
@@ -1074,6 +1601,24 @@ if invalid or not kv_evidence:
             "`actual_cached_tokens>0` was observed; do not claim a KV-migration result."
         )
 
+(root / "summary.json").write_text(
+    json.dumps(
+        {
+            "status": status,
+            "seed": seed,
+            "valid_pair_count": len(valid_rows),
+            "rollout_speedup": rollout_speedup,
+            "throughput_gain": throughput_gain,
+            "pairs": rows,
+            "tail_metrics_by_run": tail_metrics_by_run,
+        },
+        ensure_ascii=False,
+        indent=2,
+        sort_keys=True,
+    )
+    + "\n",
+    encoding="utf-8",
+)
 (root / "summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 print(f"summary: {root / 'summary.md'}")
 print(f"status: {status}")

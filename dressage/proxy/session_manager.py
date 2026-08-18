@@ -140,6 +140,10 @@ class StepRecord:
     finish_reason: str = "stop"
     request_version: str | None = None
     response_version: str | None = None
+    request_e2e_latency_seconds: float | None = None
+    request_queue_seconds: float | None = None
+    rebalancing_batch_id: int | None = None
+    rebalancing_moved: bool = False
     timestamp: float = field(default_factory=time.time)
 
 
@@ -456,6 +460,10 @@ class SessionManager:
         finish_reason: str = "stop",
         request_version: str | None = None,
         response_version: str | None = None,
+        request_e2e_latency_seconds: float | None = None,
+        request_queue_seconds: float | None = None,
+        rebalancing_batch_id: int | None = None,
+        rebalancing_moved: bool = False,
     ) -> StepRecord | None:
         with self._lock:
             session = self._sessions.get(session_id)
@@ -530,6 +538,10 @@ class SessionManager:
                 finish_reason=finish_reason,
                 request_version=request_version,
                 response_version=response_version,
+                request_e2e_latency_seconds=request_e2e_latency_seconds,
+                request_queue_seconds=request_queue_seconds,
+                rebalancing_batch_id=rebalancing_batch_id,
+                rebalancing_moved=rebalancing_moved,
             )
             session.steps.append(step)
             session.steps_by_id[step.step_id] = step

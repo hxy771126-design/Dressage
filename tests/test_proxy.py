@@ -7,6 +7,7 @@ import logging
 import re
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from fastapi.testclient import TestClient
@@ -1281,6 +1282,87 @@ def test_finalize_is_idempotent_and_marks_complete_segment_set():
         segment["extra_info"]["finalization_id"]
         == first.json()["finalization_id"]
     )
+
+
+def test_finalize_records_request_latency_and_rebalancing_identity(monkeypatch):
+    response = make_response("done")
+    response.meta_info.update({"e2e_latency": 1.25, "queue_time": 0.125})
+    client, _, trajectory_store, _ = make_client(response, token_build_mode="tito")
+    rebalancer = client.app.state.engine_rebalancer
+
+    async def acquire(**_kwargs):
+        return SimpleNamespace(
+            worker_url=None,
+            batch_id=17,
+            decision=SimpleNamespace(moved=True),
+        )
+
+    async def complete(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(rebalancer, "acquire", acquire)
+    monkeypatch.setattr(rebalancer, "complete", complete)
+
+    generated = client.post(
+        "/v1/chat/completions",
+        headers={"X-Session-Id": "request-metrics", "X-Instance-Id": "instance"},
+        json={"model": "fake-model", "messages": [{"role": "user", "content": "go"}]},
+    )
+    assert generated.status_code == 200
+    finalized = client.post(
+        "/session/finalize",
+        json={"session_id": "request-metrics", "instance_id": "instance"},
+    )
+    assert finalized.status_code == 200
+
+    timeline = trajectory_store.read_trajectory(
+        "request-metrics",
+        segment_view="timeline",
+    )
+    assert len(timeline) == 1
+    assert timeline[0]["extra_info"] | {
+        "request_e2e_latency_seconds": 1.25,
+        "request_queue_seconds": 0.125,
+        "rebalancing_batch_id": 17,
+        "rebalancing_moved": True,
+    } == timeline[0]["extra_info"]
+    lineage = trajectory_store.read_trajectory("request-metrics")
+    assert lineage[0]["extra_info"]["request_metrics"] == [
+        {
+            "step_id": timeline[0]["extra_info"]["step_id"],
+            "request_e2e_latency_seconds": 1.25,
+            "request_queue_seconds": 0.125,
+            "rebalancing_batch_id": 17,
+            "rebalancing_moved": True,
+        }
+    ]
+
+
+def test_finalize_records_request_latency_when_rebalancing_is_off():
+    response = make_response("done")
+    response.meta_info.update({"e2e_latency": 0.75, "queue_time": 0.05})
+    client, _, trajectory_store, _ = make_client(response, token_build_mode="tito")
+
+    generated = client.post(
+        "/v1/chat/completions",
+        headers={"X-Session-Id": "off-request-metrics", "X-Instance-Id": "instance"},
+        json={"model": "fake-model", "messages": [{"role": "user", "content": "go"}]},
+    )
+    assert generated.status_code == 200
+    finalized = client.post(
+        "/session/finalize",
+        json={"session_id": "off-request-metrics", "instance_id": "instance"},
+    )
+    assert finalized.status_code == 200
+
+    extra = trajectory_store.read_trajectory(
+        "off-request-metrics",
+        segment_view="timeline",
+    )[0]["extra_info"]
+    assert extra["request_e2e_latency_seconds"] == 0.75
+    assert extra["request_queue_seconds"] == 0.05
+    assert extra["rebalancing_batch_id"] is None
+    assert extra["rebalancing_moved"] is False
 
 
 def test_finalize_write_failure_preserves_active_session_and_empty_store():
