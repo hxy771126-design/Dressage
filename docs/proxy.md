@@ -328,6 +328,20 @@ weight-version, Mooncake readiness, and step capability checks still define
 migration eligibility. Mandatory failover is never blocked by the voluntary
 migration target or cost.
 
+Normalized Engine pressure combines request, token/KV, queue, prefill, and the
+current batch's predicted decode work. For a step with estimated output
+`O_hat`, the incremental decode pressure on Engine `i` is
+`O_hat / token_capacity_i * (median_positive_gen_throughput / gen_throughput_i)`.
+The rate ratio falls back to one when the Engine rate is non-positive or
+non-finite, and all Engines use one when no positive rate exists. This uses
+SGLang `v0.5.15.post1`'s existing `/v1/loads.gen_throughput`; it does not depend
+on `decode_moments`. The output estimate also remains in token pressure because
+that term represents eventual KV occupancy, while decode pressure represents
+compute work. Decode pressure is only a marginal estimate for steps in the
+current load batch, not a reconstruction of existing Engines' remaining decode
+backlog. The target improvement ratio is evaluated against the resulting
+combined pressure.
+
 The prefill delta is separate from that optimization cost. An owner stay uses
 the exact uncached suffix after the LCP. A Mooncake-ready voluntary migration
 rounds the LCP down to the target Engine's KV page size and counts only the

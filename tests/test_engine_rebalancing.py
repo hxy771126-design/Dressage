@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import resource
@@ -221,7 +222,14 @@ class ControlledBatchLoadClient(ControlPlaneClient):
         self.batch_load_started.put_nowait((url, index))
         return await future
 
-    def resolve_batch(self, index, *, running=0, waiting_uncached=None):
+    def resolve_batch(
+        self,
+        index,
+        *,
+        running=0,
+        waiting_uncached=None,
+        gen_throughput=0.0,
+    ):
         payload = {
             "loads": [
                 {
@@ -231,6 +239,7 @@ class ControlledBatchLoadClient(ControlPlaneClient):
                     "max_total_num_tokens": 100_000,
                     "max_running_requests": 100,
                     "token_usage": 0.0,
+                    "gen_throughput": gen_throughput,
                 }
             ]
         }
@@ -239,7 +248,7 @@ class ControlledBatchLoadClient(ControlPlaneClient):
         for url in self.urls:
             self.batch_load_futures[url][index].set_result(payload)
 
-    def resolve_url(self, url, index, *, running=0):
+    def resolve_url(self, url, index, *, running=0, gen_throughput=0.0):
         self.batch_load_futures[url][index].set_result(
             {
                 "loads": [
@@ -250,6 +259,7 @@ class ControlledBatchLoadClient(ControlPlaneClient):
                         "max_total_num_tokens": 100_000,
                         "max_running_requests": 100,
                         "token_usage": 0.0,
+                        "gen_throughput": gen_throughput,
                     }
                 ]
             }
@@ -2474,6 +2484,10 @@ def test_batch_target_solver_receives_hard_limit_and_lcp_cost(monkeypatch):
             edge.engine_url: edge.prefill_increment
             for edge in problem.edges_by_session["target"]
         }
+        captured["decode_pressures"] = {
+            edge.engine_url: edge.decode_pressure_increment
+            for edge in problem.edges_by_session["target"]
+        }
         source, target = client.urls
         return BatchSolution(
             status=SolverStatus.OPTIMAL,
@@ -2531,12 +2545,14 @@ def test_batch_target_solver_receives_hard_limit_and_lcp_cost(monkeypatch):
             rebalancer.acquire(
                 session_id="target",
                 input_ids=[1] * 7 + [2] * 3,
+                step_max_new_tokens=10_000,
             )
         )
         await wait_for_condition(
             lambda: sum(client.batch_load_calls.values()) == len(client.urls)
         )
-        client.resolve_batch(0)
+        client.resolve_url(source, 0, gen_throughput=240.0)
+        client.resolve_url(target, 0, gen_throughput=120.0)
         lease = await task
         trace = (await rebalancer.snapshot())["recent_load_batches"][-1]
 
@@ -2545,6 +2561,10 @@ def test_batch_target_solver_receives_hard_limit_and_lcp_cost(monkeypatch):
             "limit": pytest.approx(0.8),
             "costs": {source: 0, target: 7},
             "prefills": {source: 3, target: 6},
+            "decode_pressures": {
+                source: pytest.approx(0.075),
+                target: pytest.approx(0.15),
+            },
         }
         assert lease.reserved_prefill_tokens == 6
         assert rebalancer.loads[target].reserved_prefill_tokens == 6
@@ -2573,9 +2593,141 @@ def test_batch_target_solver_receives_hard_limit_and_lcp_cost(monkeypatch):
             source: 0,
             target: 7,
         }
+        assert trace["steps"][0]["candidate_decode_pressure"] == {
+            source: pytest.approx(0.075),
+            target: pytest.approx(0.15),
+        }
+        assert trace["steps"][0]["decode_pressure_increment"] == pytest.approx(
+            0.15
+        )
         assert trace["steps"][0]["migration_cost_tokens"] == 7
         assert trace["steps"][0]["prefill_increment"] == 6
+        assert lease.decision.target_projected_load is not None
+        assert lease.decision.target_projected_load.decode_pressure == pytest.approx(
+            0.15
+        )
+        assert lease.reserved_tokens == 10_010
+        assert rebalancer._reservations[lease.reservation_id].token_increment == 10_010
+        engines = {engine["url"]: engine for engine in trace["engines"]}
+        assert engines[source]["gen_throughput"] == pytest.approx(240.0)
+        assert engines[source]["decode_rate_ratio"] == pytest.approx(0.75)
+        assert engines[target]["gen_throughput"] == pytest.approx(120.0)
+        assert engines[target]["decode_rate_ratio"] == pytest.approx(1.5)
         await rebalancer.fail(lease)
+
+    run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("rates", "expected_ratios", "expected_trace_rates"),
+    [
+        ((0.0, 0.0), (1.0, 1.0), (0.0, 0.0)),
+        ((0.0, 240.0), (1.0, 1.0), (0.0, 240.0)),
+        ((-1.0, 240.0), (1.0, 1.0), (-1.0, 240.0)),
+        ((math.nan, 240.0), (1.0, 1.0), (None, 240.0)),
+    ],
+)
+def test_batch_decode_pressure_falls_back_when_throughput_is_unavailable(
+    rates,
+    expected_ratios,
+    expected_trace_rates,
+):
+    client = ControlledBatchLoadClient()
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(enabled=True),
+        model_id="model",
+        model_config=simple_model_config(),
+    )
+
+    async def scenario():
+        await rebalancer.refresh()
+        client.control_batch_loads()
+        task = asyncio.create_task(
+            rebalancer.acquire(
+                session_id="decode-fallback",
+                input_ids=[1] * 10,
+                step_max_new_tokens=10_000,
+            )
+        )
+        await wait_for_condition(
+            lambda: sum(client.batch_load_calls.values()) == len(client.urls)
+        )
+        for url, rate in zip(client.urls, rates):
+            client.resolve_url(url, 0, gen_throughput=rate)
+        lease = await task
+        trace = (await rebalancer.snapshot())["recent_load_batches"][-1]
+
+        assert trace["steps"][0]["candidate_decode_pressure"] == {
+            url: pytest.approx(0.1) for url in client.urls
+        }
+        engines = {engine["url"]: engine for engine in trace["engines"]}
+        assert tuple(
+            engines[url]["decode_rate_ratio"] for url in client.urls
+        ) == pytest.approx(expected_ratios)
+        assert tuple(engines[url]["gen_throughput"] for url in client.urls) == (
+            expected_trace_rates
+        )
+        json.dumps(trace, allow_nan=False)
+        assert math.isfinite(lease.decision.target_projected_load.decode_pressure)
+        await rebalancer.fail(lease)
+
+    run(scenario())
+
+
+def test_batch_decode_pressure_scales_with_estimated_output_and_allows_zero():
+    client = ControlledBatchLoadClient()
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(enabled=True),
+        model_id="model",
+        model_config=simple_model_config(),
+    )
+
+    async def scenario():
+        await rebalancer.refresh()
+        client.control_batch_loads()
+        tasks = [
+            asyncio.create_task(
+                rebalancer.acquire(
+                    session_id="decode-short",
+                    input_ids=[1] * 10,
+                    step_max_new_tokens=5_000,
+                )
+            ),
+            asyncio.create_task(
+                rebalancer.acquire(
+                    session_id="decode-long",
+                    input_ids=[1] * 10,
+                    step_max_new_tokens=10_000,
+                )
+            ),
+            asyncio.create_task(
+                rebalancer.acquire(
+                    session_id="decode-unknown",
+                    input_ids=[1] * 10,
+                )
+            ),
+        ]
+        await wait_for_condition(
+            lambda: sum(client.batch_load_calls.values()) == len(client.urls)
+        )
+        client.resolve_batch(0, gen_throughput=200.0)
+        leases = await asyncio.gather(*tasks)
+        trace = (await rebalancer.snapshot())["recent_load_batches"][-1]
+        steps = {step["session_id"]: step for step in trace["steps"]}
+
+        assert list(
+            steps["decode-short"]["candidate_decode_pressure"].values()
+        ) == pytest.approx([0.05, 0.05])
+        assert list(
+            steps["decode-long"]["candidate_decode_pressure"].values()
+        ) == pytest.approx([0.1, 0.1])
+        assert list(
+            steps["decode-unknown"]["candidate_decode_pressure"].values()
+        ) == pytest.approx([0.0, 0.0])
+        for lease in leases:
+            await rebalancer.fail(lease)
 
     run(scenario())
 
@@ -2953,6 +3105,12 @@ def test_batch_failed_healthy_owner_snapshot_fixes_step_to_owner():
         assert lease.decision.target_projected_load.prefill_pressure == pytest.approx(
             0.0
         )
+        assert lease.decision.target_projected_load.decode_pressure == pytest.approx(
+            0.0
+        )
+        trace = (await rebalancer.snapshot())["recent_load_batches"][-1]
+        assert trace["steps"][0]["candidate_decode_pressure"] == {source: 0.0}
+        assert trace["steps"][0]["decode_pressure_increment"] == pytest.approx(0.0)
         await rebalancer.fail(lease)
 
     run(scenario())
@@ -3646,6 +3804,8 @@ def test_batch_trace_is_normalized_complete_immutable_and_contains_no_token_cont
             "request_increment",
             "token_increment",
             "prefill_increment",
+            "candidate_decode_pressure",
+            "decode_pressure_increment",
         }.issubset(trace["steps"][0])
         for engine in trace["engines"]:
             assert {
@@ -3661,6 +3821,8 @@ def test_batch_trace_is_normalized_complete_immutable_and_contains_no_token_cont
                 "request_capacity",
                 "token_capacity",
                 "token_usage",
+                "gen_throughput",
+                "decode_rate_ratio",
                 "queued",
                 "queue_pressure",
                 "waiting_uncached_tokens",

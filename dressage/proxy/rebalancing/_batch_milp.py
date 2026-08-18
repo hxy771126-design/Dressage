@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import time
 from dataclasses import dataclass
 from enum import Enum
@@ -41,6 +42,7 @@ class FeasibleEdge:
     prefill_increment: float
     voluntary_migration: bool
     migration_cost_tokens: int = 0
+    decode_pressure_increment: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -84,6 +86,13 @@ class BatchProblem:
                     )
                 if edge.migration_cost_tokens < 0:
                     raise ValueError("migration cost tokens must be non-negative")
+                if (
+                    not math.isfinite(edge.decode_pressure_increment)
+                    or edge.decode_pressure_increment < 0
+                ):
+                    raise ValueError(
+                        "decode pressure increment must be finite and non-negative"
+                    )
                 seen_engines.add(edge.engine_url)
         object.__setattr__(self, "engines", frozen_engines)
         object.__setattr__(
@@ -192,6 +201,7 @@ def _build_model(problem: BatchProblem) -> _Model:
         load_matrix[engine_index, edge_index] = (
             edge.request_increment / engine.request_capacity
             + edge.prefill_increment / engine.token_capacity
+            + edge.decode_pressure_increment
         )
 
     lower_bounds = np.zeros(variable_count)
@@ -289,7 +299,8 @@ def _engine_loads(
             engine.base_prefill
             + sum(edge.prefill_increment for edge in assigned)
         ) / engine.token_capacity
-        loads.append(request + token + engine.queue_pressure + prefill)
+        decode = sum(edge.decode_pressure_increment for edge in assigned)
+        loads.append(request + token + engine.queue_pressure + prefill + decode)
     return tuple(loads)
 
 
