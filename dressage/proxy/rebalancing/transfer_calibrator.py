@@ -323,49 +323,6 @@ class TransferCalibrator:
         if self.active_plan_fingerprint is not None:
             self._result_plan_fingerprints[result_key] = self.active_plan_fingerprint
 
-    def estimate(
-        self,
-        *,
-        source_node: str,
-        target_node: str,
-        required_links: tuple[str, ...],
-        payload_bytes: int,
-    ) -> float | None:
-        total = 0.0
-        for link in required_links:
-            candidates = [
-                (bucket, sample)
-                for (source, target, link_type, bucket), sample in self._results.items()
-                if source == source_node and target == target_node and link_type == link
-            ]
-            if not candidates:
-                return None
-            # Turn noisy measurements into a monotonic upper envelope.  For an
-            # in-range payload use the first measured bucket not smaller than
-            # the request; never select a lower nearest-neighbour that could
-            # underestimate a large transfer.
-            envelope: list[tuple[int, float]] = []
-            maximum = 0.0
-            for bucket, sample in sorted(candidates, key=lambda item: item[0]):
-                maximum = max(maximum, sample.elapsed_seconds_p75)
-                envelope.append((bucket, maximum))
-            selected = next(
-                (
-                    elapsed
-                    for bucket, elapsed in envelope
-                    if bucket >= max(0, int(payload_bytes))
-                ),
-                None,
-            )
-            if selected is None:
-                largest_bucket, largest_elapsed = envelope[-1]
-                selected = largest_elapsed * max(
-                    1.0,
-                    max(0, int(payload_bytes)) / max(1, largest_bucket),
-                )
-            total += selected
-        return total
-
     def completed_links(self, source_node: str, target_node: str) -> set[str]:
         return {
             link

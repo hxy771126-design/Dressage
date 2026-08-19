@@ -20,16 +20,12 @@ from fastapi.testclient import TestClient
 
 from dressage.proxy.rebalancing import EngineRebalancer, EngineRebalancingConfig
 from dressage.proxy.rebalancing.cache_hit_estimator import (
-    CacheHitEstimator,
     CacheSource,
     ContextRecoveryEstimate,
     context_bucket,
     longest_common_prefix_length,
 )
-from dressage.proxy.rebalancing.context_recovery_model import (
-    ContextRecoveryModel,
-    PerformanceHistory,
-)
+from dressage.proxy.rebalancing.context_recovery_model import PerformanceHistory
 from dressage.proxy.rebalancing.model_cache_profile import ModelCacheProfile
 from dressage.proxy.rebalancing.scheduler import (
     EngineDeploymentInfo,
@@ -64,6 +60,15 @@ from tests.test_proxy import FakeTokenizer
 
 def run(coro):
     return asyncio.run(coro)
+
+
+async def wait_for_condition(predicate, *, timeout: float = 1.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        await asyncio.sleep(0)
+    raise AssertionError("condition not met")
 
 
 def simple_model_config():
@@ -250,12 +255,14 @@ def test_load_score_uses_reservation_envelopes_and_adds_pending_step_once():
         assert base.token_pressure == pytest.approx(0.01)
         assert base.queue_pressure == pytest.approx(0.03)
         assert base.prefill_pressure == pytest.approx(0.0008)
+        assert base.decode_pressure == 0.0
         assert base.total == pytest.approx(0.0608)
         assert projected.request_pressure == pytest.approx(0.03)
         assert projected.token_pressure == pytest.approx(0.0115)
         assert projected.queue_pressure == base.queue_pressure
         assert projected.prefill_pressure == base.prefill_pressure
-        assert projected.total == pytest.approx(0.0723)
+        assert projected.decode_pressure == pytest.approx(0.0005)
+        assert projected.total == pytest.approx(0.0728)
 
         load.running = 1
         load.reserved_requests = 3
@@ -271,6 +278,7 @@ def test_load_score_uses_reservation_envelopes_and_adds_pending_step_once():
         assert reservation_dominates.request_pressure == pytest.approx(0.03)
         assert reservation_dominates.token_pressure == pytest.approx(0.012)
         assert reservation_dominates.prefill_pressure == pytest.approx(0.0008)
+        assert reservation_dominates.decode_pressure == 0.0
 
         load.running = 4
         load.reserved_requests = 2
@@ -286,6 +294,200 @@ def test_load_score_uses_reservation_envelopes_and_adds_pending_step_once():
         assert scheduler_load_dominates.request_pressure == pytest.approx(0.04)
         assert scheduler_load_dominates.token_pressure == pytest.approx(0.014)
         assert scheduler_load_dominates.prefill_pressure == pytest.approx(0.001)
+        assert scheduler_load_dominates.decode_pressure == 0.0
+
+    run(scenario())
+
+
+def test_projected_decode_pressure_uses_bounded_candidate_throughput_ratios():
+    client = ControlPlaneClient()
+    client.urls.extend(["http://node-c:30000", "http://node-d:30000"])
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(enabled=True),
+        model_id="model",
+    )
+
+    async def scenario():
+        await rebalancer.refresh()
+        fast, tiny, zero, non_finite = client.urls
+        for url in client.urls:
+            rebalancer.loads[url].token_capacity = 100
+        rebalancer.loads[fast].gen_throughput = 100.0
+        rebalancer.loads[tiny].gen_throughput = 1e-9
+        rebalancer.loads[zero].gen_throughput = 0.0
+        rebalancer.loads[non_finite].gen_throughput = float("nan")
+        budget = StepGenerationBudget("request_or_proxy", 100, None, None, 100)
+        forward = rebalancer._load_scores(
+            client.urls,
+            prompt_tokens=0,
+            budgets={url: budget for url in client.urls},
+            include_pending_request=True,
+        )
+        backward = rebalancer._load_scores(
+            list(reversed(client.urls)),
+            prompt_tokens=0,
+            budgets={url: budget for url in client.urls},
+            include_pending_request=True,
+        )
+
+        assert forward[fast].decode_pressure == pytest.approx(0.5)
+        assert forward[tiny].decode_pressure == pytest.approx(2.0)
+        assert forward[zero].decode_pressure == pytest.approx(1.0)
+        assert forward[non_finite].decode_pressure == pytest.approx(1.0)
+        assert {url: score.decode_pressure for url, score in forward.items()} == {
+            url: score.decode_pressure for url, score in backward.items()
+        }
+
+        rebalancer.loads[fast].gen_throughput = 10.0
+        rebalancer.loads[tiny].gen_throughput = 10.0
+        symmetric = rebalancer._load_scores(
+            [fast, tiny],
+            prompt_tokens=0,
+            budgets={fast: budget, tiny: budget},
+            include_pending_request=True,
+        )
+        assert symmetric[fast].decode_pressure == pytest.approx(1.0)
+        assert symmetric[tiny].decode_pressure == pytest.approx(1.0)
+
+        rebalancer.loads[fast].gen_throughput = float("inf")
+        rebalancer.loads[tiny].gen_throughput = 0.0
+        invalid = rebalancer._load_scores(
+            [fast, tiny],
+            prompt_tokens=0,
+            budgets={fast: budget, tiny: budget},
+            include_pending_request=True,
+        )
+        assert invalid[fast].decode_pressure == pytest.approx(1.0)
+        assert invalid[tiny].decode_pressure == pytest.approx(1.0)
+
+    run(scenario())
+
+
+def test_new_session_chooses_faster_decoder_regardless_of_candidate_order():
+    client = ControlPlaneClient()
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(enabled=True),
+        model_id="model",
+    )
+
+    async def scenario():
+        await rebalancer.refresh()
+        fast, slow = client.urls
+        for url, throughput in ((fast, 100.0), (slow, 1.0)):
+            rebalancer.loads[url].token_capacity = 100
+            rebalancer.loads[url].gen_throughput = throughput
+
+        lease = await rebalancer.acquire(
+            session_id="new-decode",
+            input_ids=[],
+            step_max_new_tokens=100,
+        )
+        try:
+            assert lease.worker_url == fast
+            assert lease.decision.target_projected_load.decode_pressure == pytest.approx(
+                0.505
+            )
+            assert lease.reserved_tokens == 100
+            assert rebalancer.loads[fast].reserved_tokens == 100
+            assert rebalancer.loads[fast].reserved_prefill_tokens == 0
+        finally:
+            await rebalancer.fail(lease)
+
+    run(scenario())
+
+
+def test_healthy_owner_uses_projected_decode_load_for_improvement_ratio():
+    client = ControlPlaneClient(shared_l3=True)
+
+    async def benchmark(task, payload):
+        del task
+        return CalibrationSample(
+            latency_seconds=0.01,
+            bandwidth_bytes_per_second=max(1, payload * 10),
+        )
+
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(enabled=True, min_hold_turns=1),
+        model_id="model",
+        model_config=simple_model_config(),
+        calibration_benchmark=benchmark,
+    )
+
+    async def scenario():
+        await rebalancer.refresh()
+        source, target = client.urls
+        for url, running, throughput in ((source, 100, 100.0), (target, 50, 1.0)):
+            rebalancer.loads[url].running = running
+            rebalancer.loads[url].token_capacity = 100
+            rebalancer.loads[url].gen_throughput = throughput
+        fingerprint = rebalancer.deployments[source].cache_fingerprint
+        rebalancer.sessions["projected-improvement"] = SessionRoutingState(
+            owner_worker_url=source,
+            fingerprint=fingerprint,
+            previous_committed_tokens=[],
+            seen_engines={source},
+            owner_turns=2,
+        )
+
+        lease = await rebalancer.acquire(
+            session_id="projected-improvement",
+            input_ids=[],
+            step_max_new_tokens=100,
+        )
+        try:
+            assert lease.worker_url == source
+            assert lease.decision.load_improvement_ratio == 0.0
+            assert lease.decision.source_projected_load.decode_pressure == pytest.approx(
+                0.505
+            )
+            assert lease.decision.target_projected_load.decode_pressure == pytest.approx(
+                2.0
+            )
+        finally:
+            await rebalancer.fail(lease)
+
+    run(scenario())
+
+
+def test_unhealthy_owner_failover_chooses_faster_decoder():
+    client = ControlPlaneClient()
+    client.urls.append("http://node-c:30000")
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(enabled=True),
+        model_id="model",
+    )
+
+    async def scenario():
+        await rebalancer.refresh()
+        source, fast, slow = client.urls
+        for url, throughput in ((fast, 100.0), (slow, 1.0)):
+            rebalancer.loads[url].token_capacity = 100
+            rebalancer.loads[url].gen_throughput = throughput
+        rebalancer.loads[source].healthy = False
+        rebalancer.sessions["failed-decode-owner"] = SessionRoutingState(
+            owner_worker_url=source,
+            fingerprint=rebalancer.deployments[source].cache_fingerprint,
+            previous_committed_tokens=[],
+            seen_engines={source},
+            owner_turns=2,
+        )
+
+        lease = await rebalancer.acquire(
+            session_id="failed-decode-owner",
+            input_ids=[],
+            step_max_new_tokens=100,
+        )
+        try:
+            assert lease.worker_url == fast
+            assert lease.decision.target_projected_load.decode_pressure == pytest.approx(
+                0.505
+            )
+        finally:
+            await rebalancer.fail(lease)
 
     run(scenario())
 
@@ -404,78 +606,8 @@ def test_qwen35_cache_profile_regression_uses_one_tail_state_slot():
     assert profile.estimate_bytes(56 * 1024) == 1_930_559_488
 
 
-def test_cache_hit_estimator_uses_lcp_and_cold_start():
-    estimator = CacheHitEstimator(min_samples=2, cold_start_probability=0.1)
+def test_longest_common_prefix_length():
     assert longest_common_prefix_length([1, 2, 3], [1, 2, 9]) == 2
-    assert (
-        estimator.estimate_probability(
-            fingerprint="fp",
-            engine_url="worker",
-            cache_source=CacheSource.MOONCAKE,
-            context_tokens=100,
-        )
-        == 0.1
-    )
-    assert (
-        estimator.estimate_probability(
-            fingerprint="fp",
-            engine_url="worker",
-            cache_source=CacheSource.NONE,
-            context_tokens=100,
-        )
-        == 0.0
-    )
-    assert (
-        estimator.estimate_probability(
-            fingerprint="fp",
-            engine_url="worker",
-            cache_source=CacheSource.LOCAL,
-            context_tokens=100,
-        )
-        == 1.0
-    )
-
-
-def test_default_mooncake_prior_switches_to_observed_p25_at_16_samples():
-    config = EngineRebalancingConfig()
-    estimator = CacheHitEstimator(
-        history_size=config.history_size,
-        min_samples=config.min_samples,
-        cold_start_probability=config.cold_start_hit_probability,
-    )
-
-    def probability(source: CacheSource) -> float:
-        return estimator.estimate_probability(
-            fingerprint="fp",
-            engine_url="worker",
-            cache_source=source,
-            context_tokens=100,
-        )
-
-    assert probability(CacheSource.NONE) == 0.0
-    assert probability(CacheSource.LOCAL) == 1.0
-    assert probability(CacheSource.MOONCAKE) == 1.0
-
-    for _ in range(15):
-        estimator.observe(
-            fingerprint="fp",
-            engine_url="worker",
-            cache_source=CacheSource.MOONCAKE,
-            estimated_base_tokens=100,
-            actual_cached_tokens=50,
-            context_tokens=100,
-        )
-    assert probability(CacheSource.MOONCAKE) == 1.0
-
-    estimator.observe(
-        fingerprint="fp",
-        engine_url="worker",
-        cache_source=CacheSource.MOONCAKE,
-        estimated_base_tokens=100,
-        actual_cached_tokens=50,
-        context_tokens=100,
-    )
-    assert probability(CacheSource.MOONCAKE) == 0.5
 
 
 def test_group_remaining_length_uses_group_then_task_history():
@@ -538,66 +670,6 @@ def test_old_sglang_versions_are_not_rebalancing_compatible():
     assert sglang_rebalancing_supported("0.5.16")
 
 
-def test_context_model_none_is_full_prefill():
-    performance = PerformanceHistory(min_samples=1)
-    performance.observe(
-        fingerprint="fp",
-        engine_url="worker",
-        running=1,
-        context_tokens=100,
-        queue_seconds=0,
-        context_seconds=2,
-        cached_tokens=0,
-        output_tokens=1,
-        decode_throughput=10,
-    )
-    estimate = ContextRecoveryModel(performance).estimate(
-        fingerprint="fp",
-        engine_url="worker",
-        cache_source=CacheSource.NONE,
-        context_tokens=100,
-        base_tokens=80,
-        hit_probability=0.9,
-        restore_seconds=None,
-    )
-    assert estimate is not None
-    assert estimate.cache_source is CacheSource.NONE
-    assert estimate.expected_cached_tokens == 0
-    assert estimate.expected_prefill_tokens == 100
-    assert estimate.estimated_seconds == 2.0
-
-
-def test_context_model_mooncake_is_expected_restore_plus_prefill():
-    performance = PerformanceHistory(min_samples=1)
-    performance.observe(
-        fingerprint="fp",
-        engine_url="worker",
-        running=1,
-        context_tokens=100,
-        queue_seconds=0,
-        context_seconds=2,
-        cached_tokens=0,
-        output_tokens=1,
-        decode_throughput=10,
-        cache_source=CacheSource.NONE,
-    )
-    estimate = ContextRecoveryModel(performance).estimate(
-        fingerprint="fp",
-        engine_url="worker",
-        cache_source=CacheSource.MOONCAKE,
-        context_tokens=100,
-        base_tokens=80,
-        hit_probability=0.5,
-        restore_seconds=1.0,
-    )
-    assert estimate is not None
-    assert estimate.cache_source is CacheSource.MOONCAKE
-    assert estimate.expected_cached_tokens == 40
-    assert estimate.expected_prefill_tokens == 60
-    # hit: 1.0 restore + 20 / 50 prefill; miss: 100 / 50 prefill.
-    assert estimate.estimated_seconds == 1.7
-
-
 def test_missing_sglang_queue_timing_does_not_make_models_ready():
     performance = PerformanceHistory(min_samples=1)
     performance.observe(
@@ -642,14 +714,6 @@ def test_default_queue_and_prefill_models_become_ready_at_16_samples():
     assert not performance.queue_ready("fp")
     assert not performance.prefill_ready("fp")
     assert (
-        performance.queue_seconds(
-            fingerprint="fp",
-            engine_url="worker",
-            projected_running=1,
-        )
-        is None
-    )
-    assert (
         performance.prefill_throughput(
             fingerprint="fp",
             engine_url="worker",
@@ -662,156 +726,12 @@ def test_default_queue_and_prefill_models_become_ready_at_16_samples():
     assert performance.queue_ready("fp")
     assert performance.prefill_ready("fp")
     assert (
-        performance.queue_seconds(
-            fingerprint="fp",
-            engine_url="worker",
-            projected_running=1,
-        )
-        == 0.5
-    )
-    assert (
         performance.prefill_throughput(
             fingerprint="fp",
             engine_url="worker",
             context_tokens=100,
         )
         == 100.0
-    )
-
-
-def test_queue_prediction_error_uses_p90_and_homogeneous_pool_fallback():
-    history = PerformanceHistory(history_size=8, min_samples=2)
-    for actual, predicted in ((1.0, 0.0), (5.0, 1.0)):
-        history.observe(
-            fingerprint="fp",
-            engine_url="engine-a",
-            running=3,
-            projected_load_score=0.6,
-            context_tokens=100,
-            queue_seconds=actual,
-            predicted_queue_seconds=predicted,
-            context_seconds=1.0,
-            cached_tokens=0,
-            output_tokens=1,
-            decode_throughput=10,
-        )
-
-    # P90 of the two absolute errors (1s and 4s) is 4s. Engine B has no
-    # samples of its own, so it uses the compatible-pool history.
-    assert (
-        history.queue_risk_seconds(
-            fingerprint="fp",
-            engine_url="engine-a",
-            projected_running=3,
-            projected_load_score=0.6,
-        )
-        == 4.0
-    )
-    assert (
-        history.queue_risk_seconds(
-            fingerprint="fp",
-            engine_url="engine-b",
-            projected_running=3,
-            projected_load_score=0.6,
-        )
-        == 4.0
-    )
-
-    samples_before = history.snapshot()["queue_error_samples"]
-    history.observe(
-        fingerprint="fp",
-        engine_url="engine-a",
-        running=3,
-        projected_load_score=0.6,
-        context_tokens=100,
-        queue_seconds=2.0,
-        predicted_queue_seconds=None,
-        context_seconds=1.0,
-        cached_tokens=0,
-        output_tokens=1,
-        decode_throughput=10,
-    )
-    assert history.snapshot()["queue_error_samples"] == samples_before
-
-
-def test_context_prediction_risk_waits_for_minimum_samples():
-    history = PerformanceHistory(history_size=8, min_samples=2)
-    history.observe(
-        fingerprint="fp",
-        engine_url="engine-a",
-        running=1,
-        context_tokens=100,
-        queue_seconds=0.0,
-        context_seconds=1.0,
-        cached_tokens=0,
-        output_tokens=1,
-        decode_throughput=10,
-        estimated_context_seconds=3.0,
-        cache_source=CacheSource.NONE,
-    )
-    assert (
-        history.risk_seconds(
-            fingerprint="fp",
-            source=CacheSource.NONE,
-            context_tokens=100,
-            minimum_seconds=0.0,
-        )
-        == 0.0
-    )
-
-    history.observe(
-        fingerprint="fp",
-        engine_url="engine-a",
-        running=1,
-        context_tokens=100,
-        queue_seconds=0.0,
-        context_seconds=1.0,
-        cached_tokens=0,
-        output_tokens=1,
-        decode_throughput=10,
-        estimated_context_seconds=4.0,
-        cache_source=CacheSource.NONE,
-    )
-    assert (
-        history.risk_seconds(
-            fingerprint="fp",
-            source=CacheSource.NONE,
-            context_tokens=100,
-            minimum_seconds=0.0,
-        )
-        == 3.0
-    )
-
-
-def test_tpot_history_is_partitioned_by_engine_load_bucket():
-    history = PerformanceHistory(history_size=8, min_samples=1)
-    for engine, running, throughput in (("a", 1, 10.0), ("b", 8, 5.0)):
-        history.observe(
-            fingerprint="fp",
-            engine_url=engine,
-            running=running,
-            context_tokens=100,
-            queue_seconds=0.0,
-            context_seconds=1.0,
-            cached_tokens=0,
-            output_tokens=10,
-            decode_throughput=throughput,
-        )
-    assert (
-        history.tpot_seconds(
-            fingerprint="fp",
-            engine_url="a",
-            projected_running=1,
-        )
-        == 0.1
-    )
-    assert (
-        history.tpot_seconds(
-            fingerprint="fp",
-            engine_url="b",
-            projected_running=8,
-        )
-        == 0.2
     )
 
 
@@ -886,39 +806,6 @@ def test_calibration_plan_matches_host_tcp_rdma_and_gpudirect_paths():
     )
     assert {task.link_type for task in gpudirect_plan.tasks} == {"mooncake_gpudirect"}
     assert gpudirect_plan.skipped_links["h2d"] == "GPUDirect restore path"
-
-
-def test_transfer_estimate_uses_complete_p75_without_bandwidth_double_count():
-    calibrator = TransferCalibrator()
-    for payload, elapsed in ((100, 1.0), (200, 3.0)):
-        calibrator.observe(
-            source_node="a",
-            target_node="b",
-            link_type="mooncake_tcp",
-            payload_bytes=payload,
-            elapsed_seconds_p75=elapsed,
-            bandwidth_bytes_per_second_p25=1.0,
-        )
-    # 150 bytes uses the 200-byte upper bucket. A nearest lower bucket plus
-    # bytes/BW would produce a much larger and incorrect value.
-    assert (
-        calibrator.estimate(
-            source_node="a",
-            target_node="b",
-            required_links=("mooncake_tcp",),
-            payload_bytes=150,
-        )
-        == 3.0
-    )
-    assert (
-        calibrator.estimate(
-            source_node="a",
-            target_node="b",
-            required_links=("mooncake_tcp",),
-            payload_bytes=400,
-        )
-        == 6.0
-    )
 
 
 def test_calibration_releases_task_buffers_after_sample_failures():
@@ -1035,47 +922,6 @@ def test_single_node_loopback_engine_maps_to_routable_calibration_node():
         "10.0.0.7": "10.0.0.7",
     }
     assert rebalancer._calibration_node_for(deployment) == "10.0.0.7"
-
-
-def test_remote_context_risk_switches_from_transport_margin_to_path_error_p90():
-    rebalancer = EngineRebalancer(
-        ControlPlaneClient(),
-        config=EngineRebalancingConfig(enabled=True, min_samples=2),
-        model_id="model",
-        model_config=simple_model_config(),
-    )
-    estimate = ContextRecoveryEstimate(
-        cache_source=CacheSource.MOONCAKE,
-        expected_cached_tokens=100,
-        expected_prefill_tokens=0,
-        estimated_seconds=4.0,
-        hit_probability=1.0,
-        restore_seconds=4.0,
-        restore_sample_source="offline",
-    )
-    assert (
-        rebalancer._context_prediction_risk(
-            fingerprint="fp",
-            source_engine="a",
-            target_engine="b",
-            estimate=estimate,
-            context_tokens=100,
-        )
-        == 0.2
-    )
-    rebalancer._runtime_restore_errors[("fp", "a", "b", context_bucket(100))].extend(
-        [0.2, 0.3]
-    )
-    assert (
-        rebalancer._context_prediction_risk(
-            fingerprint="fp",
-            source_engine="a",
-            target_engine="b",
-            estimate=estimate,
-            context_tokens=100,
-        )
-        == 0.3
-    )
 
 
 def test_default_runtime_restore_model_becomes_ready_at_16_samples():
@@ -1473,14 +1319,18 @@ def test_completion_parses_response_metadata_before_taking_scheduler_lock(tmp_pa
         calibration_snapshot_interval_requests=1,
     )
 
-    class LockAwareMetadata(dict):
-        def __init__(self, values):
-            super().__init__(values)
+    class LockAwareNumber:
+        def __init__(self, value):
+            self.value = value
             self.lock_states = []
 
-        def get(self, key, default=None):
+        def __float__(self):
             self.lock_states.append(rebalancer._lock.locked())
-            return super().get(key, default)
+            return float(self.value)
+
+        def __int__(self):
+            self.lock_states.append(rebalancer._lock.locked())
+            return int(self.value)
 
     async def scenario():
         await rebalancer.refresh()
@@ -1489,14 +1339,12 @@ def test_completion_parses_response_metadata_before_taking_scheduler_lock(tmp_pa
             input_ids=[1, 2, 3],
             step_max_new_tokens=4,
         )
-        metadata = LockAwareMetadata(
-            {
-                "queue_time": 0.1,
-                "decode_throughput": 10.0,
-                "e2e_latency": 0.5,
-                "cached_tokens": 2,
-            }
-        )
+        metadata = {
+            "queue_time": LockAwareNumber(0.1),
+            "decode_throughput": LockAwareNumber(10.0),
+            "e2e_latency": LockAwareNumber(0.5),
+            "cached_tokens": LockAwareNumber(2),
+        }
         await rebalancer.complete(
             lease,
             response_meta=metadata,
@@ -1504,8 +1352,14 @@ def test_completion_parses_response_metadata_before_taking_scheduler_lock(tmp_pa
             committed_tokens=[1, 2, 3, 4, 5],
         )
 
-        assert metadata.lock_states
-        assert not any(metadata.lock_states)
+        assert not any(value.lock_states for value in metadata.values())
+        await rebalancer._drain_observation_tasks()
+        assert all(value.lock_states for value in metadata.values())
+        assert not any(
+            lock_state
+            for value in metadata.values()
+            for lock_state in value.lock_states
+        )
         assert rebalancer.sessions["metadata-lock"].owner_worker_url == lease.worker_url
         assert rebalancer.loads[lease.worker_url].reserved_requests == 0
         assert len(rebalancer._observations) == 1
@@ -1555,6 +1409,9 @@ def test_periodic_snapshot_capture_runs_after_completion_returns(
         )
 
         assert captured == []
+        assert rebalancer._online_request_count == 0
+        assert len(rebalancer._observations) == 0
+        await rebalancer._drain_observation_tasks()
         assert rebalancer._online_request_count == 1
         assert len(rebalancer._observations) == 1
         await rebalancer._drain_snapshot_tasks()
@@ -1641,6 +1498,7 @@ def test_periodic_snapshot_capture_failure_does_not_affect_completed_request(
             assert rebalancer.sessions["snapshot-failure"].owner_worker_url == (
                 lease.worker_url
             )
+            await rebalancer._drain_observation_tasks()
             assert len(rebalancer._observations) == 1
             await rebalancer._drain_snapshot_tasks()
 
@@ -1832,8 +1690,8 @@ def test_reservations_spread_simultaneous_new_sessions():
             0,
             0,
             0,
-            "target",
-            "no_backlog_load_improvement_threshold_met",
+            "source",
+            "no_backlog_load_improvement_below_threshold",
             0.40,
         ),
         (
@@ -1843,8 +1701,8 @@ def test_reservations_spread_simultaneous_new_sessions():
             0,
             0,
             0,
-            "target",
-            "no_backlog_load_improvement_threshold_met",
+            "source",
+            "no_backlog_load_improvement_below_threshold",
             0.40,
         ),
         (
@@ -2047,7 +1905,7 @@ def test_existing_session_selects_lowest_load_target_without_backlog_advantage()
     ),
     [
         (71, 0.30, "source", "load_improvement_below_threshold"),
-        (70, 0.30, "target", "load_improvement_threshold_met"),
+        (70, 0.30, "source", "load_improvement_below_threshold"),
         (69, 0.30, "target", "load_improvement_threshold_met"),
         (65, 0.40, "source", "load_improvement_below_threshold"),
     ],
@@ -2104,10 +1962,10 @@ def test_existing_session_uses_base_load_improvement_threshold(
             assert lease.decision.target_base_load is not None
             assert lease.decision.load_improvement_ratio == pytest.approx(
                 (
-                    lease.decision.source_base_load.total
-                    - lease.decision.target_base_load.total
+                    lease.decision.source_projected_load.total
+                    - lease.decision.target_projected_load.total
                 )
-                / lease.decision.source_base_load.total
+                / lease.decision.source_projected_load.total
             )
             assert lease.decision.required_load_improvement_ratio == minimum_ratio
             assert lease.decision.source_context is None
@@ -2129,9 +1987,9 @@ def test_existing_session_uses_base_load_improvement_threshold(
     ),
     [
         (1, 50, 1, "source", "return_hysteresis_below_threshold", 0.60),
-        (1, 40, 1, "target", "load_improvement_threshold_met", 0.60),
+        (1, 40, 1, "source", "return_hysteresis_below_threshold", 0.60),
         (2, 50, 2, "source", "return_hysteresis_below_threshold", 0.60),
-        (2, 40, 2, "target", "load_improvement_threshold_met", 0.60),
+        (2, 40, 2, "source", "return_hysteresis_below_threshold", 0.60),
         (2, 50, 3, "target", "load_improvement_threshold_met", 0.30),
     ],
 )
@@ -2289,7 +2147,9 @@ def test_min_hold_turns_blocks_otherwise_beneficial_migration():
         try:
             assert lease.worker_url == source
             assert lease.decision.reason == "min_hold_turns_not_met"
-            assert lease.decision.load_improvement_ratio == pytest.approx(0.5)
+            assert lease.decision.load_improvement_ratio == pytest.approx(
+                0.4945598417408506
+            )
         finally:
             await rebalancer.fail(lease)
 
@@ -2451,14 +2311,15 @@ def test_existing_session_rejects_move_when_projected_target_is_busier():
         )
         try:
             assert lease.worker_url == source
-            assert lease.decision.reason == "projected_load_safety_check_failed"
+            assert lease.decision.reason == "no_backlog_load_improvement_below_threshold"
             assert lease.decision.required_load_improvement_ratio == 0.40
             assert lease.decision.load_improvement_ratio == pytest.approx(
-                (
-                    lease.decision.source_base_load.total
-                    - lease.decision.target_base_load.total
+                max(
+                    0.0,
+                    lease.decision.source_projected_load.total
+                    - lease.decision.target_projected_load.total
                 )
-                / lease.decision.source_base_load.total
+                / lease.decision.source_projected_load.total
             )
             assert (
                 lease.decision.target_projected_load.total
@@ -2733,7 +2594,7 @@ def test_reservation_reuses_selected_decision_projected_load(
         def score(total):
             if total is None:
                 return None
-            return LoadScore(0.0, 0.0, 0.0, 0.0, total)
+            return LoadScore(0.0, 0.0, 0.0, 0.0, 0.0, total)
 
         decision = RoutingDecision(
             session_id="reuse-projected",
@@ -2902,97 +2763,6 @@ def test_load_snapshot_aggregates_live_queue_fields_across_dp_ranks():
     assert load.queue_retracted == 7
     assert load.queue_grammar == 5
     assert load.live_queue_metrics_available is True
-
-
-def test_live_queue_seconds_uses_prefill_p25_and_falls_back_when_unavailable():
-    rebalancer = EngineRebalancer(
-        ControlPlaneClient(),
-        config=EngineRebalancingConfig(enabled=True, min_samples=1),
-        model_id="model",
-    )
-    fingerprint = "fp"
-    engine = "worker"
-    rebalancer.performance.observe(
-        fingerprint=fingerprint,
-        engine_url=engine,
-        running=1,
-        context_tokens=8_000,
-        queue_seconds=0.1,
-        context_seconds=2.0,
-        cached_tokens=0,
-        output_tokens=1,
-        decode_throughput=10.0,
-        cache_source=CacheSource.NONE,
-    )
-    rebalancer.loads[engine] = EngineLoad(
-        worker_url=engine,
-        metrics_timestamp=10.0,
-        waiting_uncached_tokens=8_000,
-        live_queue_metrics_available=True,
-    )
-
-    assert (
-        rebalancer._live_queue_seconds(
-            fingerprint=fingerprint,
-            engine_url=engine,
-            context_tokens=8_000,
-            now=10.0,
-        )
-        == 2.0
-    )
-    rebalancer.loads[engine].reserved_prefill_tokens = 2_000
-    assert (
-        rebalancer._live_queue_seconds(
-            fingerprint=fingerprint,
-            engine_url=engine,
-            context_tokens=8_000,
-            now=10.0,
-        )
-        == 2.5
-    )
-
-    rebalancer.loads[engine].metrics_timestamp = 1.0
-    assert (
-        rebalancer._live_queue_seconds(
-            fingerprint=fingerprint,
-            engine_url=engine,
-            context_tokens=8_000,
-            now=10.0,
-        )
-        is None
-    )
-    rebalancer.loads[engine].metrics_timestamp = 10.0
-    rebalancer.loads[engine].live_queue_metrics_available = False
-    assert (
-        rebalancer._live_queue_seconds(
-            fingerprint=fingerprint,
-            engine_url=engine,
-            context_tokens=8_000,
-            now=10.0,
-        )
-        is None
-    )
-
-    empty_history = EngineRebalancer(
-        ControlPlaneClient(),
-        config=EngineRebalancingConfig(enabled=True, min_samples=1),
-        model_id="model",
-    )
-    empty_history.loads[engine] = EngineLoad(
-        worker_url=engine,
-        metrics_timestamp=10.0,
-        waiting_uncached_tokens=8_000,
-        live_queue_metrics_available=True,
-    )
-    assert (
-        empty_history._live_queue_seconds(
-            fingerprint=fingerprint,
-            engine_url=engine,
-            context_tokens=8_000,
-            now=10.0,
-        )
-        is None
-    )
 
 
 def test_prefill_reservations_expire_by_load_generation_and_release_on_failure():
@@ -3687,6 +3457,7 @@ def test_completion_pairs_actual_queue_with_the_selected_path_prediction():
                 output_tokens=1,
                 committed_tokens=[1] * 100,
             )
+            await rebalancer._drain_observation_tasks()
             observation = rebalancer._observations[-1]
             assert observation["predicted_queue_seconds"] == expected
             assert observation["actual_queue_seconds"] == actual
@@ -3695,6 +3466,431 @@ def test_completion_pairs_actual_queue_with_the_selected_path_prediction():
             )
 
     run(scenario())
+
+
+def test_complete_commits_session_before_background_observation(monkeypatch):
+    client = ControlPlaneClient()
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(enabled=True, min_samples=1),
+        model_id="model",
+        model_config=simple_model_config(),
+    )
+    observation_started = asyncio.Event()
+    release_observation = asyncio.Event()
+
+    async def blocked_observation(observation):
+        observation_started.set()
+        await release_observation.wait()
+
+    monkeypatch.setattr(
+        rebalancer,
+        "_record_completion_observation",
+        blocked_observation,
+        raising=False,
+    )
+
+    async def scenario():
+        await rebalancer.refresh()
+        lease = await rebalancer.acquire(
+            session_id="background-observation",
+            input_ids=[1] * 10,
+            step_max_new_tokens=4,
+        )
+        load = rebalancer.loads[lease.worker_url]
+        assert load.reserved_requests == 1
+        assert load.reserved_tokens > 0
+        assert load.reserved_prefill_tokens > 0
+
+        await rebalancer.complete(
+            lease,
+            response_meta={
+                "queue_time": 0.0,
+                "e2e_latency": 1.0,
+                "cached_tokens": 0,
+                "decode_throughput": 10.0,
+            },
+            output_tokens=2,
+            committed_tokens=[1] * 12,
+        )
+        await wait_for_condition(observation_started.is_set)
+
+        session = rebalancer.sessions["background-observation"]
+        assert load.reserved_requests == 0
+        assert load.reserved_tokens == 0
+        assert load.reserved_prefill_tokens == 0
+        assert session.owner_worker_url == lease.worker_url
+        assert session.previous_owner_worker_url is None
+        assert session.owner_turns == 1
+        assert session.pending_owner_worker_url is None
+        assert session.previous_committed_tokens == [1] * 12
+        assert session.generated_tokens == 2
+        assert rebalancer.step_lengths.p75(
+            fingerprint=session.fingerprint,
+            task_key=session.task_key,
+            max_tokens=lease.decision.effective_step_max_tokens,
+        ) == 2
+        assert list(rebalancer._observations) == []
+        assert rebalancer._online_request_count == 0
+
+        release_observation.set()
+        await rebalancer._drain_observation_tasks()
+
+    run(scenario())
+
+
+def test_completion_observation_uses_frozen_state_after_owner_changes(
+    monkeypatch,
+):
+    client = ControlPlaneClient(shared_l3=True)
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(enabled=True, min_samples=1),
+        model_id="model",
+        model_config=simple_model_config(),
+    )
+    observation_started = asyncio.Event()
+    release_observation = asyncio.Event()
+
+    async def blocked_observation(observation):
+        observation_started.set()
+        await release_observation.wait()
+        await original_observation(observation)
+
+    async def scenario():
+        await rebalancer.refresh()
+        source, target = client.urls
+        fingerprint = rebalancer.deployments[source].cache_fingerprint
+        rebalancer.sessions["frozen-observation"] = SessionRoutingState(
+            owner_worker_url=source,
+            fingerprint=fingerprint,
+            previous_committed_tokens=[1] * 10,
+            seen_engines={source},
+            owner_turns=3,
+        )
+        lease = RoutingLease(
+            decision=RoutingDecision(
+                session_id="frozen-observation",
+                source_worker_url=source,
+                target_worker_url=target,
+                cache_fingerprint=fingerprint,
+                state=SchedulerState.ACTIVE,
+                reason="test",
+                target_queue_seconds=1.0,
+                moved=True,
+            ),
+            worker_url=target,
+            reserved_tokens=10,
+            base_tokens=0,
+            started_monotonic=time.monotonic(),
+            context_tokens=10,
+        )
+        await rebalancer.complete(
+            lease,
+            response_meta={
+                "queue_time": 4.0,
+                "e2e_latency": 5.0,
+                "cached_tokens": 3,
+                "decode_throughput": 10.0,
+            },
+            output_tokens=1,
+            committed_tokens=[2] * 11,
+        )
+        await wait_for_condition(observation_started.is_set)
+        session = rebalancer.sessions["frozen-observation"]
+        assert session.owner_worker_url == target
+        assert session.previous_owner_worker_url == source
+        assert session.owner_turns == 1
+
+        session.owner_worker_url = source
+        session.seen_engines.add(target)
+        release_observation.set()
+        await rebalancer._drain_observation_tasks()
+
+        observation = rebalancer._observations[-1]
+        assert observation["engine_url"] == target
+        assert observation["cache_source"] == "mooncake"
+        assert observation["actual_cached_tokens"] == 3
+
+    original_observation = rebalancer._record_completion_observation
+    monkeypatch.setattr(
+        rebalancer,
+        "_record_completion_observation",
+        blocked_observation,
+    )
+    run(scenario())
+
+
+def test_failed_and_missing_session_settles_create_no_completion_observation(
+    monkeypatch,
+):
+    client = ControlPlaneClient()
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(enabled=True, min_samples=1),
+        model_id="model",
+        model_config=simple_model_config(),
+    )
+    scheduled = []
+
+    def capture_schedule(observation):
+        scheduled.append(observation)
+
+    monkeypatch.setattr(
+        rebalancer,
+        "_schedule_completion_observation",
+        capture_schedule,
+        raising=False,
+    )
+
+    async def scenario():
+        await rebalancer.refresh()
+        failed = await rebalancer.acquire(
+            session_id="failed-observation",
+            input_ids=[1] * 10,
+        )
+        failed_load = rebalancer.loads[failed.worker_url]
+        await rebalancer.fail(failed)
+        assert failed_load.reserved_requests == 0
+        assert failed_load.reserved_tokens == 0
+        assert failed_load.reserved_prefill_tokens == 0
+        assert (
+            rebalancer.sessions["failed-observation"].pending_owner_worker_url is None
+        )
+
+        missing = await rebalancer.acquire(
+            session_id="missing-observation",
+            input_ids=[2] * 10,
+        )
+        missing_load = rebalancer.loads[missing.worker_url]
+        await rebalancer.discard_session_context("missing-observation")
+        await rebalancer.complete(
+            missing,
+            response_meta={
+                "queue_time": 0.0,
+                "e2e_latency": 1.0,
+                "cached_tokens": 0,
+                "decode_throughput": 10.0,
+            },
+            output_tokens=1,
+            committed_tokens=[2] * 11,
+        )
+
+        assert "missing-observation" not in rebalancer.sessions
+        assert missing_load.reserved_requests == 0
+        assert missing_load.reserved_tokens == 0
+        assert missing_load.reserved_prefill_tokens == 0
+        assert scheduled == []
+        assert list(rebalancer._observations) == []
+        assert not rebalancer._observation_tasks
+
+    run(scenario())
+
+
+def test_close_waits_for_background_completion_observation(monkeypatch):
+    client = ControlPlaneClient()
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(enabled=True),
+        model_id="model",
+        model_config=simple_model_config(),
+    )
+    observation_started = asyncio.Event()
+    release_observation = asyncio.Event()
+
+    async def blocked_observation(observation):
+        del observation
+        observation_started.set()
+        await release_observation.wait()
+
+    monkeypatch.setattr(
+        rebalancer,
+        "_record_completion_observation",
+        blocked_observation,
+        raising=False,
+    )
+
+    async def scenario():
+        await rebalancer.refresh()
+        lease = await rebalancer.acquire(
+            session_id="close-observation",
+            input_ids=[1] * 10,
+        )
+        await rebalancer.complete(
+            lease,
+            response_meta={},
+            output_tokens=1,
+            committed_tokens=[1] * 11,
+        )
+        await wait_for_condition(observation_started.is_set)
+
+        close_task = asyncio.create_task(rebalancer.close())
+        await asyncio.sleep(0)
+        assert close_task.done() is False
+        release_observation.set()
+        await close_task
+        assert not rebalancer._observation_tasks
+
+    run(scenario())
+
+
+def test_close_waits_for_completion_already_waiting_on_scheduler_lock(
+    tmp_path, monkeypatch
+):
+    client = ControlPlaneClient(shared_l3=True)
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(enabled=True),
+        model_id="model",
+        model_config=simple_model_config(),
+        calibration_snapshot_root=tmp_path,
+    )
+    observation_started = asyncio.Event()
+    release_observation = asyncio.Event()
+    final_snapshots = []
+    original_observation = rebalancer._record_completion_observation
+
+    async def blocked_observation(observation):
+        observation_started.set()
+        await release_observation.wait()
+        await original_observation(observation)
+
+    async def capture_snapshot(kind, online_request_count):
+        final_snapshots.append(
+            {
+                "kind": kind,
+                "online_request_count": online_request_count,
+                "payload": rebalancer._capture_file_snapshot(kind),
+            }
+        )
+
+    monkeypatch.setattr(
+        rebalancer,
+        "_record_completion_observation",
+        blocked_observation,
+    )
+    monkeypatch.setattr(rebalancer, "_persist_current_snapshot", capture_snapshot)
+
+    async def scenario():
+        await rebalancer.refresh()
+        source, target = client.urls
+        fingerprint = rebalancer.deployments[source].cache_fingerprint
+        rebalancer.sessions["close-waiting-completion"] = SessionRoutingState(
+            owner_worker_url=source,
+            fingerprint=fingerprint,
+            seen_engines={source},
+            owner_turns=2,
+        )
+        lease = RoutingLease(
+            decision=RoutingDecision(
+                session_id="close-waiting-completion",
+                source_worker_url=source,
+                target_worker_url=target,
+                cache_fingerprint=fingerprint,
+                state=SchedulerState.ACTIVE,
+                reason="test",
+                target_context=ContextRecoveryEstimate(
+                    cache_source=CacheSource.MOONCAKE,
+                    expected_cached_tokens=5,
+                    expected_prefill_tokens=5,
+                    estimated_seconds=2.0,
+                    hit_probability=1.0,
+                ),
+                moved=True,
+            ),
+            worker_url=target,
+            reserved_tokens=10,
+            base_tokens=5,
+            started_monotonic=time.monotonic(),
+            context_tokens=10,
+        )
+
+        await rebalancer._lock.acquire()
+        complete_task = asyncio.create_task(
+            rebalancer.complete(
+                lease,
+                response_meta={
+                    "queue_time": 0.0,
+                    "e2e_latency": 1.0,
+                    "cached_tokens": 5,
+                    "decode_throughput": 10.0,
+                },
+                output_tokens=1,
+                committed_tokens=[1] * 11,
+            )
+        )
+        await asyncio.sleep(0)
+        close_task = asyncio.create_task(rebalancer.close())
+        await asyncio.sleep(0)
+        close_finished_before_release = close_task.done()
+
+        rebalancer._lock.release()
+        await observation_started.wait()
+        close_finished_while_observation_blocked = close_task.done()
+        release_observation.set()
+        await complete_task
+        await close_task
+
+        assert close_finished_before_release is False
+        assert close_finished_while_observation_blocked is False
+        assert len(rebalancer._observations) == 1
+        assert len(final_snapshots) == 1
+        final = final_snapshots[0]
+        assert final["kind"] == "final"
+        assert final["online_request_count"] == 1
+        runtime_results = final["payload"]["runtime_calibration"]["results"]
+        assert len(runtime_results) == 1
+        assert runtime_results[0]["source_engine"] == source
+        assert runtime_results[0]["target_engine"] == target
+        assert runtime_results[0]["prediction_error_sample_count"] == 1
+
+    run(scenario())
+
+
+def test_background_completion_observation_failure_is_logged(monkeypatch, caplog):
+    client = ControlPlaneClient()
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(enabled=True),
+        model_id="model",
+        model_config=simple_model_config(),
+    )
+
+    async def fail_observation(observation):
+        del observation
+        raise RuntimeError("observation injection")
+
+    monkeypatch.setattr(
+        rebalancer,
+        "_record_completion_observation",
+        fail_observation,
+        raising=False,
+    )
+
+    async def scenario():
+        await rebalancer.refresh()
+        lease = await rebalancer.acquire(
+            session_id="failed-observation",
+            input_ids=[1] * 10,
+        )
+        await rebalancer.complete(
+            lease,
+            response_meta={},
+            output_tokens=1,
+            committed_tokens=[1] * 11,
+        )
+        await rebalancer._drain_observation_tasks()
+        assert rebalancer.sessions["failed-observation"].owner_worker_url == (
+            lease.worker_url
+        )
+
+    with caplog.at_level(
+        logging.WARNING,
+        logger="dressage.proxy.rebalancing.scheduler",
+    ):
+        run(scenario())
+
+    assert "completion observation failed" in caplog.text
 
 
 def test_actual_mooncake_hit_overrides_full_prefill_prediction_classification():
@@ -3750,6 +3946,7 @@ def test_actual_mooncake_hit_overrides_full_prefill_prediction_classification():
             output_tokens=1,
             committed_tokens=[1] * 101,
         )
+        await rebalancer._drain_observation_tasks()
         assert rebalancer._observations[-1]["cache_source"] == "mooncake"
         assert rebalancer.performance.snapshot()["prefill_samples"] == 0
 
@@ -3929,6 +4126,10 @@ def test_enabled_proxy_places_first_request_directly_and_reports_state():
         assert loads["recent_decisions"][0]["effective_step_max_tokens"] == 8192
         assert loads["recent_decisions"][0]["estimated_step_output_tokens"] == 8192
         assert loads["recent_decisions"][0]["target_projected_load"] is not None
+        assert (
+            "decode_pressure"
+            in loads["recent_decisions"][0]["target_projected_load"]
+        )
         assert "target_queue_history_seconds" in loads["recent_decisions"][0]
         assert "target_queue_live_seconds" in loads["recent_decisions"][0]
 

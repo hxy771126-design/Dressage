@@ -23,7 +23,7 @@ from .cache_hit_estimator import (
     context_bucket,
     longest_common_prefix_length,
 )
-from .context_recovery_model import ContextRecoveryModel, PerformanceHistory, percentile
+from .context_recovery_model import PerformanceHistory, percentile
 from .model_cache_profile import ModelCacheProfile, canonical_fingerprint
 from .ray_calibration import (
     MachineCalibrationConfig,
@@ -296,25 +296,8 @@ class LoadScore:
     token_pressure: float
     queue_pressure: float
     prefill_pressure: float
+    decode_pressure: float
     total: float
-
-
-@dataclass(frozen=True)
-class EngineStepEstimate:
-    engine_url: str
-    context: ContextRecoveryEstimate
-    queue_seconds: float
-    queue_history_seconds: float
-    queue_live_seconds: float | None
-    projected_running: int
-    projected_load_score: float
-    tpot_seconds: float | None
-    prefill_throughput: float | None
-    decode_seconds: float | None
-
-    @property
-    def context_queue_seconds(self) -> float:
-        return self.queue_seconds + self.context.estimated_seconds
 
 
 @dataclass(frozen=True)
@@ -379,6 +362,21 @@ class RoutingLease:
     expected_output_tokens: int = 0
     reserved_prefill_tokens: int = 0
     prefill_reservation_generation: int | None = None
+
+
+@dataclass(frozen=True)
+class _CompletionObservation:
+    lease: RoutingLease
+    engine_url: str
+    fingerprint: str
+    shared_l3: bool
+    old_owner: str | None
+    target_seen_before: bool
+    running: int
+    context_tokens: int
+    response_meta: Mapping[str, Any]
+    output_tokens: int
+    elapsed_seconds: float
 
 
 class GroupLengthEstimator:
@@ -512,7 +510,6 @@ class EngineRebalancer:
             min_samples=config.min_samples,
             cold_start_probability=config.cold_start_hit_probability,
         )
-        self.context_model = ContextRecoveryModel(self.performance)
         self.calibrator = TransferCalibrator()
         self.group_lengths = GroupLengthEstimator(history_size=config.history_size)
         self.step_lengths = StepLengthEstimator(
@@ -550,6 +547,7 @@ class EngineRebalancer:
             else None
         )
         self._snapshot_tasks: set[asyncio.Task[None]] = set()
+        self._observation_tasks: set[asyncio.Task[None]] = set()
         self._final_snapshot_written = False
         self._lock = asyncio.Lock()
         self._refresh_lock = asyncio.Lock()
@@ -599,6 +597,9 @@ class EngineRebalancer:
 
     async def close(self) -> None:
         self._stopping = True
+        # Completion registers its observation immediately after releasing this lock.
+        async with self._lock:
+            pass
         if self._calibration_task is not None:
             self._calibration_task.cancel()
             try:
@@ -616,6 +617,7 @@ class EngineRebalancer:
             except asyncio.CancelledError:
                 pass
             self._poll_task = None
+        await self._drain_observation_tasks()
         await self._drain_snapshot_tasks()
         if self._snapshot_store is not None and not self._final_snapshot_written:
             self._final_snapshot_written = True
@@ -703,6 +705,34 @@ class EngineRebalancer:
     async def _drain_snapshot_tasks(self) -> None:
         while self._snapshot_tasks:
             tasks = tuple(self._snapshot_tasks)
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    def _schedule_completion_observation(
+        self, observation: _CompletionObservation
+    ) -> None:
+        task = asyncio.create_task(
+            self._run_completion_observation(observation),
+            name="engine-rebalancing-completion-observation",
+        )
+        self._observation_tasks.add(task)
+        task.add_done_callback(self._observation_tasks.discard)
+
+    async def _run_completion_observation(
+        self, observation: _CompletionObservation
+    ) -> None:
+        try:
+            await self._record_completion_observation(observation)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning(
+                "engine rebalancing completion observation failed",
+                exc_info=True,
+            )
+
+    async def _drain_observation_tasks(self) -> None:
+        while self._observation_tasks:
+            tasks = tuple(self._observation_tasks)
             await asyncio.gather(*tasks, return_exceptions=True)
 
     def _record_successful_online_request(self) -> None:
@@ -1791,7 +1821,7 @@ class EngineRebalancer:
         target = min(
             eligible_targets,
             key=lambda url: (
-                base_scores[url].total,
+                projected_scores[url].total,
                 hashlib.sha256(f"{session_id}\0{url}".encode()).hexdigest(),
             ),
         )
@@ -1814,15 +1844,21 @@ class EngineRebalancer:
                 target = min(
                     backlog_targets,
                     key=lambda url: (
-                        base_scores[url].total,
+                        projected_scores[url].total,
                         hashlib.sha256(f"{session_id}\0{url}".encode()).hexdigest(),
                     ),
                 )
         source_base = base_scores[source]
         target_base = base_scores[target]
+        source_projected = projected_scores[source]
+        target_projected = projected_scores[target]
         improvement = (
-            max(0.0, (source_base.total - target_base.total) / source_base.total)
-            if source_base.total > 0.0
+            max(
+                0.0,
+                (source_projected.total - target_projected.total)
+                / source_projected.total,
+            )
+            if source_projected.total > 0.0
             else 0.0
         )
         required_ratio = self.config.min_load_improvement_ratio
@@ -1850,7 +1886,7 @@ class EngineRebalancer:
                     else "no_backlog_load_improvement_below_threshold"
                 )
             )
-        elif projected_scores[target].total > projected_scores[source].total:
+        elif target_projected.total > source_projected.total:
             reason = "projected_load_safety_check_failed"
         else:
             reason = (
@@ -1872,8 +1908,8 @@ class EngineRebalancer:
                 reason=reason,
                 source_base_load=source_base,
                 target_base_load=target_base,
-                source_projected_load=projected_scores[source],
-                target_projected_load=projected_scores[target],
+                source_projected_load=source_projected,
+                target_projected_load=target_projected,
                 load_improvement_ratio=improvement,
                 required_load_improvement_ratio=required_ratio,
                 moved=moved,
@@ -1881,287 +1917,6 @@ class EngineRebalancer:
             ),
             base_tokens,
             selected_budget,
-        )
-
-    def _live_queue_seconds(
-        self,
-        *,
-        fingerprint: str,
-        engine_url: str,
-        context_tokens: int,
-        now: float | None = None,
-    ) -> float | None:
-        load = self.loads.get(engine_url)
-        if load is None or not load.live_queue_metrics_available:
-            return None
-        observed_at = time.monotonic() if now is None else now
-        if not load.fresh(
-            now=observed_at,
-            stale_seconds=self.config.metrics_stale_ms / 1000.0,
-        ):
-            return None
-        prefill_throughput = self.performance.prefill_throughput(
-            fingerprint=fingerprint,
-            engine_url=engine_url,
-            context_tokens=context_tokens,
-        )
-        if prefill_throughput is None or prefill_throughput <= 0:
-            return None
-        backlog_tokens = max(0, load.waiting_uncached_tokens) + max(
-            0, load.reserved_prefill_tokens
-        )
-        return backlog_tokens / prefill_throughput
-
-    def _estimate_step_candidate(
-        self,
-        *,
-        session: SessionRoutingState,
-        source_engine: str | None,
-        target_engine: str,
-        input_ids: list[int],
-        base_tokens: int,
-        budget: StepGenerationBudget,
-        cache_source: CacheSource,
-    ) -> EngineStepEstimate | None:
-        fingerprint = self.deployments[target_engine].cache_fingerprint
-        context = self._estimate_context(
-            session=session,
-            source_engine=source_engine,
-            target_engine=target_engine,
-            context_tokens=len(input_ids),
-            base_tokens=base_tokens,
-            cache_source=cache_source,
-        )
-        projected_running = (
-            self.loads[target_engine].running
-            + self.loads[target_engine].reserved_requests
-            + 1
-        )
-        projected_score = self._projected_load_score(
-            target_engine,
-            prompt_tokens=len(input_ids),
-            expected_output_tokens=budget.estimated_step_output_tokens or 0,
-        )
-        history_queue = self.performance.queue_seconds(
-            fingerprint=fingerprint,
-            engine_url=target_engine,
-            projected_running=projected_running,
-            projected_load_score=projected_score,
-        )
-        if context is None or history_queue is None:
-            return None
-        live_queue = self._live_queue_seconds(
-            fingerprint=fingerprint,
-            engine_url=target_engine,
-            context_tokens=len(input_ids),
-        )
-        queue = max(history_queue, live_queue or 0.0)
-        tpot = self.performance.tpot_seconds(
-            fingerprint=fingerprint,
-            engine_url=target_engine,
-            projected_running=projected_running,
-            projected_load_score=projected_score,
-        )
-        prefill = self.performance.prefill_throughput(
-            fingerprint=fingerprint,
-            engine_url=target_engine,
-            context_tokens=len(input_ids),
-        )
-        decode = (
-            None
-            if tpot is None or budget.estimated_step_output_tokens is None
-            else budget.estimated_step_output_tokens * tpot
-        )
-        return EngineStepEstimate(
-            engine_url=target_engine,
-            context=context,
-            queue_seconds=queue,
-            queue_history_seconds=history_queue,
-            queue_live_seconds=live_queue,
-            projected_running=projected_running,
-            projected_load_score=projected_score,
-            tpot_seconds=tpot,
-            prefill_throughput=prefill,
-            decode_seconds=decode,
-        )
-
-    def _projected_load_selection(
-        self,
-        *,
-        session_id: str,
-        session: SessionRoutingState,
-        source: str | None,
-        candidates: list[str],
-        input_ids: list[int],
-        step_max_new_tokens: int | None,
-        context_remaining_tokens: int | None,
-        reason: str,
-        base_tokens: int = 0,
-    ) -> tuple[RoutingDecision, int, StepGenerationBudget]:
-        target, budget = self._least_load(
-            candidates,
-            session_id=session_id,
-            session=session,
-            prompt_tokens=len(input_ids),
-            step_max_new_tokens=step_max_new_tokens,
-            context_remaining_tokens=context_remaining_tokens,
-        )
-        fingerprint = self.deployments[target].cache_fingerprint
-        return (
-            RoutingDecision(
-                session_id=session_id,
-                source_worker_url=source,
-                target_worker_url=target,
-                cache_fingerprint=fingerprint,
-                state=self.pools[fingerprint].state,
-                reason=reason,
-                moved=source is not None and target != source,
-                **budget.snapshot(),
-            ),
-            base_tokens,
-            budget,
-        )
-
-    @classmethod
-    def _step_estimates_homogeneous(
-        cls,
-        estimates: list[EngineStepEstimate],
-    ) -> bool:
-        reference = estimates[0]
-        return all(
-            cls._within_ten_percent(
-                reference.tpot_seconds,
-                estimate.tpot_seconds,
-            )
-            and cls._within_ten_percent(
-                reference.prefill_throughput,
-                estimate.prefill_throughput,
-            )
-            for estimate in estimates[1:]
-        )
-
-    @staticmethod
-    def _step_total_seconds(
-        estimate: EngineStepEstimate,
-        *,
-        include_decode: bool,
-    ) -> float:
-        total = estimate.context_queue_seconds
-        if include_decode and estimate.decode_seconds is not None:
-            total += estimate.decode_seconds
-        return total
-
-    @staticmethod
-    def _within_ten_percent(left: float | None, right: float | None) -> bool:
-        if left is None or right is None:
-            return True
-        denominator = max(abs(left), abs(right), 1e-9)
-        return abs(left - right) / denominator <= 0.10
-
-    def _estimate_context(
-        self,
-        *,
-        session: SessionRoutingState,
-        source_engine: str | None,
-        target_engine: str,
-        context_tokens: int,
-        base_tokens: int,
-        cache_source: CacheSource | None = None,
-    ) -> ContextRecoveryEstimate | None:
-        deployment = self.deployments[target_engine]
-        if cache_source is None:
-            if (
-                target_engine == session.owner_worker_url
-                or target_engine in session.seen_engines
-            ):
-                cache_source = CacheSource.LOCAL
-            elif deployment.shared_l3:
-                cache_source = CacheSource.MOONCAKE
-            else:
-                cache_source = CacheSource.NONE
-        probability = self.cache_hits.estimate_probability(
-            fingerprint=deployment.cache_fingerprint,
-            engine_url=target_engine,
-            cache_source=cache_source,
-            context_tokens=context_tokens,
-        )
-        restore_seconds: float | None = 0.0
-        restore_sample_source = "none"
-        if cache_source is CacheSource.MOONCAKE:
-            if source_engine is None:
-                return None
-            readiness = self._path_readiness(source_engine, target_engine)
-            profile = self.profiles.get(deployment.cache_fingerprint)
-            if profile is None:
-                return None
-            source_deployment = self.deployments[source_engine]
-            source_node = self._calibration_node_for(source_deployment)
-            target_node = self._calibration_node_for(deployment)
-            if source_node is None or target_node is None:
-                return None
-            restore_seconds = self.calibrator.estimate(
-                source_node=source_node,
-                target_node=target_node,
-                required_links=readiness.required_links,
-                payload_bytes=profile.estimate_bytes(base_tokens),
-            )
-            restore_sample_source = "offline"
-        if cache_source is not CacheSource.NONE:
-            runtime_samples = list(
-                self._runtime_restore_seconds.get(
-                    (
-                        deployment.cache_fingerprint,
-                        source_engine,
-                        target_engine,
-                        context_bucket(context_tokens),
-                    ),
-                    (),
-                )
-            )
-            if len(runtime_samples) >= self.config.min_samples:
-                restore_seconds = percentile(runtime_samples, 0.75)
-                restore_sample_source = "runtime"
-        return self.context_model.estimate(
-            fingerprint=deployment.cache_fingerprint,
-            engine_url=target_engine,
-            cache_source=cache_source,
-            context_tokens=context_tokens,
-            base_tokens=base_tokens,
-            hit_probability=probability,
-            restore_seconds=restore_seconds,
-            restore_sample_source=restore_sample_source,
-        )
-
-    def _context_prediction_risk(
-        self,
-        *,
-        fingerprint: str,
-        source_engine: str,
-        target_engine: str,
-        estimate: ContextRecoveryEstimate,
-        context_tokens: int,
-    ) -> float:
-        if estimate.cache_source is CacheSource.MOONCAKE:
-            errors = list(
-                self._runtime_restore_errors.get(
-                    (
-                        fingerprint,
-                        source_engine,
-                        target_engine,
-                        context_bucket(context_tokens),
-                    ),
-                    (),
-                )
-            )
-            if len(errors) >= self.config.min_samples:
-                return percentile(errors, 0.90)
-            if estimate.restore_sample_source == "offline":
-                return 0.05 * estimate.restore_seconds
-        return self.performance.risk_seconds(
-            fingerprint=fingerprint,
-            source=estimate.cache_source,
-            context_tokens=context_tokens,
-            minimum_seconds=0.0,
         )
 
     def _healthy_urls(self, *, now: float) -> list[str]:
@@ -2184,10 +1939,6 @@ class EngineRebalancer:
     ) -> tuple[str, StepGenerationBudget]:
         if not urls:
             raise RuntimeError("no compatible healthy engine")
-        max_running = max([self.loads[url].request_capacity for url in urls] + [1])
-        max_tokens = max([self.loads[url].token_capacity for url in urls] + [1])
-        max_queue = max([self.loads[url].queued for url in urls] + [1])
-
         budgets_by_fingerprint: dict[str, StepGenerationBudget] = {}
         budgets: dict[str, StepGenerationBudget] = {}
         for url in urls:
@@ -2203,15 +1954,16 @@ class EngineRebalancer:
                 budgets_by_fingerprint[fingerprint] = budget
             budgets[url] = budget
 
+        scores = self._load_scores(
+            urls,
+            prompt_tokens=prompt_tokens,
+            budgets=budgets,
+            include_pending_request=True,
+        )
+
         def key(url: str) -> tuple[float, str]:
-            score = self._projected_load_score(
-                url,
-                prompt_tokens=prompt_tokens,
-                expected_output_tokens=(budgets[url].estimated_step_output_tokens or 0),
-                capacity_fallback=(max_running, max_tokens, max_queue),
-            )
             tie = hashlib.sha256(f"{session_id}\0{url}".encode()).hexdigest()
-            return score, tie
+            return scores[url].total, tie
 
         target = min(urls, key=key)
         return target, budgets[target]
@@ -2228,6 +1980,7 @@ class EngineRebalancer:
         max_tokens = max([self.loads[url].token_capacity for url in urls] + [1])
         max_queue = max([self.loads[url].queued for url in urls] + [1])
         fallback = (max_running, max_tokens, max_queue)
+        decode_rate_ratios = self._decode_rate_ratios(urls)
         return {
             url: self._load_score(
                 url,
@@ -2237,6 +1990,32 @@ class EngineRebalancer:
                 ),
                 include_pending_request=include_pending_request,
                 capacity_fallback=fallback,
+                decode_rate_ratio=decode_rate_ratios[url],
+            )
+            for url in urls
+        }
+
+    def _decode_rate_ratios(self, urls: list[str]) -> dict[str, float]:
+        positive_rates = sorted(
+            load.gen_throughput
+            for url in urls
+            if (load := self.loads[url]).gen_throughput > 0
+            and math.isfinite(load.gen_throughput)
+        )
+        if not positive_rates:
+            return {url: 1.0 for url in urls}
+        middle = len(positive_rates) // 2
+        reference_rate = (
+            positive_rates[middle]
+            if len(positive_rates) % 2
+            else (positive_rates[middle - 1] + positive_rates[middle]) / 2.0
+        )
+        return {
+            url: (
+                min(2.0, max(0.5, reference_rate / load.gen_throughput))
+                if (load := self.loads[url]).gen_throughput > 0
+                and math.isfinite(load.gen_throughput)
+                else 1.0
             )
             for url in urls
         }
@@ -2265,6 +2044,7 @@ class EngineRebalancer:
         expected_output_tokens: int = 0,
         include_pending_request: bool,
         capacity_fallback: tuple[int, int, int] | None = None,
+        decode_rate_ratio: float | None = None,
     ) -> LoadScore:
         load = self.loads[url]
         if capacity_fallback is None:
@@ -2282,8 +2062,11 @@ class EngineRebalancer:
                 [self.loads[item].token_capacity for item in compatible] + [1]
             )
             max_queue = max([self.loads[item].queued for item in compatible] + [1])
+            decode_rate_ratio = self._decode_rate_ratios(compatible)[url]
         else:
             max_running, max_tokens, max_queue = capacity_fallback
+        if decode_rate_ratio is None:
+            decode_rate_ratio = 1.0
         req_capacity = load.request_capacity or max_running
         token_capacity = load.token_capacity or max_tokens
         queue_capacity = max(max_queue, req_capacity)
@@ -2308,16 +2091,25 @@ class EngineRebalancer:
             load.waiting_uncached_tokens,
             load.reserved_prefill_tokens,
         ) / max(1, token_capacity)
+        decode_pressure = (
+            max(0, int(expected_output_tokens))
+            / max(1, token_capacity)
+            * decode_rate_ratio
+            if include_pending_request
+            else 0.0
+        )
         return LoadScore(
             request_pressure=request_pressure,
             token_pressure=token_pressure,
             queue_pressure=queue_pressure,
             prefill_pressure=prefill_pressure,
+            decode_pressure=decode_pressure,
             total=(
                 request_pressure
                 + token_pressure
                 + queue_pressure
                 + prefill_pressure
+                + decode_pressure
             ),
         )
 
@@ -2397,6 +2189,205 @@ class EngineRebalancer:
             prefill_reservation_generation=prefill_reservation_generation,
         )
 
+    async def _record_completion_observation(
+        self, completion: _CompletionObservation
+    ) -> None:
+        lease = completion.lease
+        queue_raw = completion.response_meta.get("queue_time")
+        try:
+            queue_seconds = (
+                None if queue_raw is None else max(0.0, float(queue_raw))
+            )
+        except (TypeError, ValueError):
+            queue_seconds = None
+        decode_throughput_raw = completion.response_meta.get("decode_throughput")
+        try:
+            decode_throughput = float(decode_throughput_raw)
+        except (TypeError, ValueError):
+            decode_throughput = None
+        decode_seconds = (
+            max(0, completion.output_tokens - 1) / decode_throughput
+            if decode_throughput is not None and decode_throughput > 0
+            else 0.0
+        )
+        e2e_raw = completion.response_meta.get("e2e_latency")
+        try:
+            e2e_seconds = float(e2e_raw)
+        except (TypeError, ValueError):
+            e2e_seconds = completion.elapsed_seconds
+        cached_raw = completion.response_meta.get("cached_tokens") or 0
+        try:
+            cached_tokens = int(cached_raw)
+        except (TypeError, ValueError):
+            cached_tokens = 0
+        context_seconds = (
+            None
+            if queue_seconds is None
+            else max(0.0, e2e_seconds - queue_seconds - decode_seconds)
+        )
+        if completion.engine_url == lease.decision.source_worker_url:
+            estimate = lease.decision.source_context
+            predicted_queue_seconds = lease.decision.source_queue_seconds
+        elif completion.engine_url == lease.decision.target_worker_url:
+            estimate = lease.decision.target_context
+            predicted_queue_seconds = lease.decision.target_queue_seconds
+        else:
+            estimate = None
+            predicted_queue_seconds = None
+        if cached_tokens <= 0:
+            source = CacheSource.NONE
+        elif (
+            completion.old_owner == completion.engine_url
+            or completion.target_seen_before
+        ):
+            source = CacheSource.LOCAL
+        elif completion.shared_l3:
+            source = CacheSource.MOONCAKE
+        else:
+            source = CacheSource.LOCAL
+
+        async with self._lock:
+            observation = self.performance.observe(
+                fingerprint=completion.fingerprint,
+                engine_url=completion.engine_url,
+                running=completion.running,
+                context_tokens=completion.context_tokens,
+                queue_seconds=queue_seconds,
+                context_seconds=context_seconds,
+                cached_tokens=cached_tokens,
+                output_tokens=completion.output_tokens,
+                decode_throughput=decode_throughput,
+                projected_load_score=lease.projected_load_score,
+                predicted_queue_seconds=predicted_queue_seconds,
+                estimated_context_seconds=(
+                    None if estimate is None else estimate.estimated_seconds
+                ),
+                cache_source=source,
+            )
+            runtime_key = (
+                None
+                if completion.old_owner is None
+                else (
+                    completion.fingerprint,
+                    completion.old_owner,
+                    completion.engine_url,
+                    context_bucket(completion.context_tokens),
+                )
+            )
+            if (
+                estimate is not None
+                and estimate.cache_source is CacheSource.MOONCAKE
+                and observation.context_seconds is not None
+                and runtime_key is not None
+            ):
+                self._runtime_restore_errors[runtime_key].append(
+                    abs(estimate.estimated_seconds - observation.context_seconds)
+                )
+            self.cache_hits.observe(
+                fingerprint=completion.fingerprint,
+                engine_url=completion.engine_url,
+                cache_source=source,
+                estimated_base_tokens=lease.base_tokens,
+                actual_cached_tokens=observation.cached_tokens,
+                context_tokens=completion.context_tokens,
+            )
+            prefill_throughput = self.performance.prefill_throughput(
+                fingerprint=completion.fingerprint,
+                engine_url=completion.engine_url,
+                context_tokens=completion.context_tokens,
+            )
+            actual_prefill_tokens = max(
+                0, completion.context_tokens - observation.cached_tokens
+            )
+            restore_seconds_actual = None
+            restore_throughput = None
+            if (
+                source is not CacheSource.NONE
+                and runtime_key is not None
+                and observation.cached_tokens > 0
+                and observation.context_seconds is not None
+                and prefill_throughput is not None
+            ):
+                restore_seconds_actual = max(
+                    0.0,
+                    observation.context_seconds
+                    - actual_prefill_tokens / prefill_throughput,
+                )
+                self._runtime_restore_seconds[runtime_key].append(
+                    restore_seconds_actual
+                )
+                profile = self.profiles.get(completion.fingerprint)
+                if profile is not None and restore_seconds_actual > 0:
+                    restore_throughput = (
+                        profile.estimate_bytes(observation.cached_tokens)
+                        / restore_seconds_actual
+                    )
+                    self._runtime_restore_throughputs[runtime_key].append(
+                        restore_throughput
+                    )
+            self._observations.append(
+                {
+                    "session_id": lease.decision.session_id,
+                    "engine_url": completion.engine_url,
+                    "cache_source": source.value,
+                    "expected_cached_tokens": (
+                        None if estimate is None else estimate.expected_cached_tokens
+                    ),
+                    "actual_cached_tokens": observation.cached_tokens,
+                    "expected_prefill_tokens": (
+                        None if estimate is None else estimate.expected_prefill_tokens
+                    ),
+                    "actual_prefill_tokens": actual_prefill_tokens,
+                    "source_context_seconds": (
+                        None
+                        if lease.decision.source_context is None
+                        else lease.decision.source_context.estimated_seconds
+                    ),
+                    "target_context_seconds": (
+                        None
+                        if lease.decision.target_context is None
+                        else lease.decision.target_context.estimated_seconds
+                    ),
+                    "predicted_queue_seconds": observation.predicted_queue_seconds,
+                    "actual_queue_seconds": observation.queue_seconds,
+                    "queue_prediction_error_seconds": (
+                        observation.queue_prediction_error_seconds
+                    ),
+                    "actual_context_seconds": observation.context_seconds,
+                    "restore_seconds": restore_seconds_actual,
+                    "restore_throughput": restore_throughput,
+                    "prefill_throughput": prefill_throughput,
+                    "hit_probability": (
+                        None if estimate is None else estimate.hit_probability
+                    ),
+                    "queue_risk_seconds": lease.decision.queue_risk_seconds,
+                    "context_risk_seconds": lease.decision.context_risk_seconds,
+                    "decision_risk": lease.decision.decision_risk_seconds,
+                    "step_max_tokens_source": lease.decision.step_max_tokens_source,
+                    "effective_step_max_tokens": (
+                        lease.decision.effective_step_max_tokens
+                    ),
+                    "historical_step_tokens_p75": (
+                        lease.decision.historical_step_tokens_p75
+                    ),
+                    "group_remaining_tokens": lease.decision.group_remaining_tokens,
+                    "estimated_step_output_tokens": (
+                        lease.decision.estimated_step_output_tokens
+                    ),
+                    "source_decode_seconds": lease.decision.source_decode_seconds,
+                    "target_decode_seconds": lease.decision.target_decode_seconds,
+                }
+            )
+            state = self.pools.get(completion.fingerprint)
+            if state is not None:
+                state.update(
+                    self._pool_readiness(
+                        completion.fingerprint,
+                        now=time.monotonic(),
+                    )
+                )
+            self._record_successful_online_request()
+
     async def complete(
         self,
         lease: RoutingLease,
@@ -2406,36 +2397,12 @@ class EngineRebalancer:
         committed_tokens: list[int],
         success: bool = True,
     ) -> None:
-        if not self.config.enabled or lease.worker_url is None:
+        if not self.config.enabled:
             return
-        queue_raw = response_meta.get("queue_time")
-        try:
-            queue_seconds = (
-                None if queue_raw is None else max(0.0, float(queue_raw))
-            )
-        except (TypeError, ValueError):
-            queue_seconds = None
-        decode_throughput_raw = response_meta.get("decode_throughput")
-        try:
-            decode_throughput = float(decode_throughput_raw)
-        except (TypeError, ValueError):
-            decode_throughput = None
-        decode_seconds = (
-            max(0, output_tokens - 1) / decode_throughput
-            if decode_throughput is not None and decode_throughput > 0
-            else 0.0
-        )
-        e2e_raw = response_meta.get("e2e_latency")
-        try:
-            measured_e2e_seconds = float(e2e_raw)
-        except (TypeError, ValueError):
-            measured_e2e_seconds = None
-        cached_raw = response_meta.get("cached_tokens") or 0
-        try:
-            cached_tokens = int(cached_raw)
-        except (TypeError, ValueError):
-            cached_tokens = 0
+        completion = None
         async with self._lock:
+            if lease.worker_url is None:
+                return
             self._release_prefill_reservation(
                 lease.worker_url,
                 generation=lease.prefill_reservation_generation,
@@ -2479,174 +2446,20 @@ class EngineRebalancer:
                 max_tokens=lease.decision.effective_step_max_tokens,
                 output_tokens=output_tokens,
             )
-
-            elapsed = max(0.0, time.monotonic() - lease.started_monotonic)
-            e2e_seconds = (
-                elapsed if measured_e2e_seconds is None else measured_e2e_seconds
-            )
-            context_seconds = (
-                None
-                if queue_seconds is None
-                else max(0.0, e2e_seconds - queue_seconds - decode_seconds)
-            )
-            if new_owner == lease.decision.source_worker_url:
-                estimate = lease.decision.source_context
-                predicted_queue_seconds = lease.decision.source_queue_seconds
-            elif new_owner == lease.decision.target_worker_url:
-                estimate = lease.decision.target_context
-                predicted_queue_seconds = lease.decision.target_queue_seconds
-            else:
-                estimate = None
-                predicted_queue_seconds = None
-            # ``cached_tokens`` is the native SGLang outcome and therefore
-            # wins over the Proxy prediction.  In particular, a path modeled
-            # as full prefill may still hit shared Mooncake; classifying that
-            # response as NONE would contaminate the prefill-throughput model.
-            if cached_tokens <= 0:
-                source = CacheSource.NONE
-            elif old_owner == new_owner or target_seen_before:
-                source = CacheSource.LOCAL
-            elif deployment.shared_l3:
-                source = CacheSource.MOONCAKE
-            else:
-                source = CacheSource.LOCAL
-            observation = self.performance.observe(
-                fingerprint=deployment.cache_fingerprint,
+            completion = _CompletionObservation(
+                lease=lease,
                 engine_url=new_owner,
-                running=(load.running if load is not None else 0),
+                fingerprint=deployment.cache_fingerprint,
+                shared_l3=deployment.shared_l3,
+                old_owner=old_owner,
+                target_seen_before=target_seen_before,
+                running=load.running if load is not None else 0,
                 context_tokens=context_tokens,
-                queue_seconds=queue_seconds,
-                context_seconds=context_seconds,
-                cached_tokens=cached_tokens,
+                response_meta=dict(response_meta),
                 output_tokens=output_tokens,
-                decode_throughput=decode_throughput,
-                projected_load_score=lease.projected_load_score,
-                predicted_queue_seconds=predicted_queue_seconds,
-                estimated_context_seconds=(
-                    None if estimate is None else estimate.estimated_seconds
-                ),
-                cache_source=source,
+                elapsed_seconds=max(0.0, time.monotonic() - lease.started_monotonic),
             )
-            runtime_key = (
-                None
-                if old_owner is None
-                else (
-                    deployment.cache_fingerprint,
-                    old_owner,
-                    new_owner,
-                    context_bucket(context_tokens),
-                )
-            )
-            if (
-                estimate is not None
-                and estimate.cache_source is CacheSource.MOONCAKE
-                and observation.context_seconds is not None
-                and runtime_key is not None
-            ):
-                self._runtime_restore_errors[runtime_key].append(
-                    abs(estimate.estimated_seconds - observation.context_seconds)
-                )
-            self.cache_hits.observe(
-                fingerprint=deployment.cache_fingerprint,
-                engine_url=new_owner,
-                cache_source=source,
-                estimated_base_tokens=lease.base_tokens,
-                actual_cached_tokens=observation.cached_tokens,
-                context_tokens=context_tokens,
-            )
-            prefill_throughput = self.performance.prefill_throughput(
-                fingerprint=deployment.cache_fingerprint,
-                engine_url=new_owner,
-                context_tokens=context_tokens,
-            )
-            actual_prefill_tokens = max(0, context_tokens - observation.cached_tokens)
-            restore_seconds_actual = None
-            restore_throughput = None
-            if (
-                source is not CacheSource.NONE
-                and runtime_key is not None
-                and observation.cached_tokens > 0
-                and observation.context_seconds is not None
-                and prefill_throughput is not None
-            ):
-                restore_seconds_actual = max(
-                    0.0,
-                    observation.context_seconds
-                    - actual_prefill_tokens / prefill_throughput,
-                )
-                self._runtime_restore_seconds[runtime_key].append(
-                    restore_seconds_actual
-                )
-                profile = self.profiles.get(deployment.cache_fingerprint)
-                if profile is not None and restore_seconds_actual > 0:
-                    restore_throughput = (
-                        profile.estimate_bytes(observation.cached_tokens)
-                        / restore_seconds_actual
-                    )
-                    self._runtime_restore_throughputs[runtime_key].append(
-                        restore_throughput
-                    )
-            self._observations.append(
-                {
-                    "session_id": lease.decision.session_id,
-                    "engine_url": new_owner,
-                    "cache_source": source.value,
-                    "expected_cached_tokens": (
-                        None if estimate is None else estimate.expected_cached_tokens
-                    ),
-                    "actual_cached_tokens": observation.cached_tokens,
-                    "expected_prefill_tokens": (
-                        None if estimate is None else estimate.expected_prefill_tokens
-                    ),
-                    "actual_prefill_tokens": actual_prefill_tokens,
-                    "source_context_seconds": (
-                        None
-                        if lease.decision.source_context is None
-                        else lease.decision.source_context.estimated_seconds
-                    ),
-                    "target_context_seconds": (
-                        None
-                        if lease.decision.target_context is None
-                        else lease.decision.target_context.estimated_seconds
-                    ),
-                    "predicted_queue_seconds": observation.predicted_queue_seconds,
-                    "actual_queue_seconds": observation.queue_seconds,
-                    "queue_prediction_error_seconds": (
-                        observation.queue_prediction_error_seconds
-                    ),
-                    "actual_context_seconds": observation.context_seconds,
-                    "restore_seconds": restore_seconds_actual,
-                    "restore_throughput": restore_throughput,
-                    "prefill_throughput": prefill_throughput,
-                    "hit_probability": (
-                        None if estimate is None else estimate.hit_probability
-                    ),
-                    "queue_risk_seconds": lease.decision.queue_risk_seconds,
-                    "context_risk_seconds": lease.decision.context_risk_seconds,
-                    "decision_risk": lease.decision.decision_risk_seconds,
-                    "step_max_tokens_source": (lease.decision.step_max_tokens_source),
-                    "effective_step_max_tokens": (
-                        lease.decision.effective_step_max_tokens
-                    ),
-                    "historical_step_tokens_p75": (
-                        lease.decision.historical_step_tokens_p75
-                    ),
-                    "group_remaining_tokens": (lease.decision.group_remaining_tokens),
-                    "estimated_step_output_tokens": (
-                        lease.decision.estimated_step_output_tokens
-                    ),
-                    "source_decode_seconds": (lease.decision.source_decode_seconds),
-                    "target_decode_seconds": (lease.decision.target_decode_seconds),
-                }
-            )
-            state = self.pools.get(deployment.cache_fingerprint)
-            if state is not None:
-                state.update(
-                    self._pool_readiness(
-                        deployment.cache_fingerprint, now=time.monotonic()
-                    )
-                )
-            self._record_successful_online_request()
+        self._schedule_completion_observation(completion)
 
     async def fail(self, lease: RoutingLease) -> None:
         await self.complete(
