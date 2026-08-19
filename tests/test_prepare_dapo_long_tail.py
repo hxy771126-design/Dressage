@@ -12,6 +12,9 @@ SCRIPT = Path("examples/data/prepare_dapo_long_tail.py")
 BENCHMARK_SCRIPT = Path(
     "examples/scripts/benchmark_engine_rebalancing_qwen3.5_4b_sync_local_l3_hicache.sh"
 )
+BENCHMARK_35B_SCRIPT = Path(
+    "examples/scripts/benchmark_engine_rebalancing_qwen3.5_35b_a3b_sync_local_l3_hicache.sh"
+)
 SOURCE = Path("examples/data/dressage_dapo_prompts.jsonl")
 STEP_BALANCED_300 = Path(
     "examples/data/dressage_dapo_prompts_step_balanced_300.jsonl"
@@ -332,6 +335,22 @@ def test_committed_step_balanced_64_dataset_has_exact_workload(tmp_path):
 def test_engine_rebalancing_benchmark_dry_run_uses_batch_64_dataset():
     result = subprocess.run(
         ["bash", str(BENCHMARK_SCRIPT)],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "BENCHMARK_DRY_RUN": "1"},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "dressage_dapo_prompts_step_balanced_64.jsonl" in result.stdout
+    assert "rollout batch: 64" in result.stdout
+    assert "global batch:  64" in result.stdout
+    assert "Blackbox max steps: 20" in result.stdout
+
+
+def test_engine_rebalancing_35b_benchmark_dry_run_uses_batch_64_dataset():
+    result = subprocess.run(
+        ["bash", str(BENCHMARK_35B_SCRIPT)],
         check=False,
         capture_output=True,
         text=True,

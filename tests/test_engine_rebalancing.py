@@ -6259,15 +6259,15 @@ def test_engine_rebalancing_benchmark_defaults_to_one_off_on_pair(tmp_path):
     assert result.returncode == 0, result.stderr
     assert "seed20260806-off-r1" in result.stdout
     assert "seed20260806-on-r1" in result.stdout
-    assert "rollout batch: 256" in result.stdout
-    assert "global batch:  256" in result.stdout
+    assert "rollout batch: 64" in result.stdout
+    assert "global batch:  64" in result.stdout
     assert "response max:  12288" in result.stdout
     assert "sandbox slots: 24" in result.stdout
     assert "slot timeout:  3600" in result.stdout
     assert "Mooncake size: 24gb" in result.stdout
     assert "load batch window: 60 ms" in result.stdout
     assert "min load improvement ratio: 0.10" in result.stdout
-    assert "dressage_dapo_prompts_step_balanced_256.jsonl" in result.stdout
+    assert "dressage_dapo_prompts_step_balanced_64.jsonl" in result.stdout
     assert "warm-up" not in result.stdout
     assert "off-r2" not in result.stdout
     assert "on-r2" not in result.stdout
@@ -6388,8 +6388,9 @@ def test_engine_rebalancing_benchmark_samples_long_tail_dataset_once():
     assert source.count(prepare_call) == 1
     assert 'python3 "${LONG_TAIL_TOOL}" sample' in source
     assert "prepare_long_tail_prompts" not in run_one
-    assert "ROLLOUT_BATCH_SIZE=256" in source
-    assert "GLOBAL_BATCH_SIZE=256" in source
+    assert "ROLLOUT_BATCH_SIZE=64" in source
+    assert "GLOBAL_BATCH_SIZE=64" in source
+    assert '--sample-size "${ROLLOUT_BATCH_SIZE}"' in source
     assert "ROLLOUT_MAX_RESPONSE_LEN=12288" in source
     assert "DRESSAGE_BLACKBOX_SLOTS_PER_NODE=24" in source
     assert "DRESSAGE_BLACKBOX_ACQUIRE_TIMEOUT_SEC=3600" in source
