@@ -11,6 +11,7 @@ import signal
 import subprocess
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import httpx
@@ -34,6 +35,7 @@ from dressage.proxy.rebalancing.scheduler import (
     EngineDeploymentInfo,
     EngineLoad,
     GroupLengthEstimator,
+    LoadScore,
     RoutingDecision,
     RoutingLease,
     SessionRoutingState,
@@ -1460,6 +1462,196 @@ def test_calibration_snapshots_are_atomic_periodic_and_final(tmp_path):
     assert first.directory != second.directory
 
 
+def test_completion_parses_response_metadata_before_taking_scheduler_lock(tmp_path):
+    client = ControlPlaneClient()
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(enabled=True),
+        model_id="model",
+        model_config=simple_model_config(),
+        calibration_snapshot_root=tmp_path,
+        calibration_snapshot_interval_requests=1,
+    )
+
+    class LockAwareMetadata(dict):
+        def __init__(self, values):
+            super().__init__(values)
+            self.lock_states = []
+
+        def get(self, key, default=None):
+            self.lock_states.append(rebalancer._lock.locked())
+            return super().get(key, default)
+
+    async def scenario():
+        await rebalancer.refresh()
+        lease = await rebalancer.acquire(
+            session_id="metadata-lock",
+            input_ids=[1, 2, 3],
+            step_max_new_tokens=4,
+        )
+        metadata = LockAwareMetadata(
+            {
+                "queue_time": 0.1,
+                "decode_throughput": 10.0,
+                "e2e_latency": 0.5,
+                "cached_tokens": 2,
+            }
+        )
+        await rebalancer.complete(
+            lease,
+            response_meta=metadata,
+            output_tokens=2,
+            committed_tokens=[1, 2, 3, 4, 5],
+        )
+
+        assert metadata.lock_states
+        assert not any(metadata.lock_states)
+        assert rebalancer.sessions["metadata-lock"].owner_worker_url == lease.worker_url
+        assert rebalancer.loads[lease.worker_url].reserved_requests == 0
+        assert len(rebalancer._observations) == 1
+        await rebalancer._drain_snapshot_tasks()
+
+    run(scenario())
+
+
+def test_periodic_snapshot_capture_runs_after_completion_returns(
+    tmp_path, monkeypatch
+):
+    client = ControlPlaneClient()
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(enabled=True),
+        model_id="model",
+        model_config=simple_model_config(),
+        calibration_snapshot_root=tmp_path,
+        calibration_snapshot_interval_requests=1,
+    )
+    captured = []
+    original_capture = rebalancer._capture_file_snapshot
+
+    def capture(kind):
+        captured.append(kind)
+        return original_capture(kind)
+
+    monkeypatch.setattr(rebalancer, "_capture_file_snapshot", capture)
+
+    async def scenario():
+        await rebalancer.refresh()
+        lease = await rebalancer.acquire(
+            session_id="async-snapshot",
+            input_ids=[1, 2, 3],
+            step_max_new_tokens=4,
+        )
+        await rebalancer.complete(
+            lease,
+            response_meta={
+                "queue_time": 0.1,
+                "decode_throughput": 10.0,
+                "e2e_latency": 0.5,
+                "cached_tokens": 0,
+            },
+            output_tokens=2,
+            committed_tokens=[1, 2, 3, 4, 5],
+        )
+
+        assert captured == []
+        assert rebalancer._online_request_count == 1
+        assert len(rebalancer._observations) == 1
+        await rebalancer._drain_snapshot_tasks()
+        assert captured == ["periodic"]
+        assert (
+            rebalancer._snapshot_store.directory / "request-000000001.json"
+        ).is_file()
+
+    run(scenario())
+
+
+def test_close_drains_pending_periodic_snapshot_task(tmp_path, monkeypatch):
+    rebalancer = EngineRebalancer(
+        ControlPlaneClient(),
+        config=EngineRebalancingConfig(enabled=True),
+        model_id="model",
+        calibration_snapshot_root=tmp_path,
+        calibration_snapshot_interval_requests=1,
+    )
+    periodic_started = asyncio.Event()
+    release_periodic = asyncio.Event()
+    persisted = []
+
+    async def persist(kind, online_request_count):
+        persisted.append((kind, online_request_count))
+        if kind == "periodic":
+            periodic_started.set()
+            await release_periodic.wait()
+
+    monkeypatch.setattr(rebalancer, "_persist_current_snapshot", persist)
+
+    async def scenario():
+        rebalancer._record_successful_online_request()
+        await periodic_started.wait()
+        close_task = asyncio.create_task(rebalancer.close())
+        await asyncio.sleep(0)
+        assert not close_task.done()
+
+        release_periodic.set()
+        await close_task
+        assert persisted == [("periodic", 1), ("final", 1)]
+        assert not rebalancer._snapshot_tasks
+
+    run(scenario())
+
+
+def test_periodic_snapshot_capture_failure_does_not_affect_completed_request(
+    tmp_path, monkeypatch, caplog
+):
+    client = ControlPlaneClient()
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(enabled=True),
+        model_id="model",
+        model_config=simple_model_config(),
+        calibration_snapshot_root=tmp_path,
+        calibration_snapshot_interval_requests=1,
+    )
+
+    def fail_capture():
+        raise RuntimeError("snapshot unavailable")
+
+    monkeypatch.setattr(rebalancer, "calibration_snapshot", fail_capture)
+
+    async def scenario():
+        await rebalancer.refresh()
+        lease = await rebalancer.acquire(
+            session_id="snapshot-failure",
+            input_ids=[1, 2, 3],
+            step_max_new_tokens=4,
+        )
+        with caplog.at_level(logging.WARNING):
+            await rebalancer.complete(
+                lease,
+                response_meta={
+                    "queue_time": 0.1,
+                    "decode_throughput": 10.0,
+                    "e2e_latency": 0.5,
+                    "cached_tokens": 0,
+                },
+                output_tokens=2,
+                committed_tokens=[1, 2, 3, 4, 5],
+            )
+            assert rebalancer.sessions["snapshot-failure"].owner_worker_url == (
+                lease.worker_url
+            )
+            assert len(rebalancer._observations) == 1
+            await rebalancer._drain_snapshot_tasks()
+
+        assert "failed to capture engine rebalancing periodic calibration snapshot" in (
+            caplog.text
+        )
+        assert not rebalancer._snapshot_tasks
+
+    run(scenario())
+
+
 def test_ray_preflight_state_is_independent_and_releases_backend(monkeypatch, tmp_path):
     config_path = tmp_path / "deployment.json"
     config_path.write_text(
@@ -2460,6 +2652,151 @@ def test_step_budget_prefers_request_and_rollout_caps_before_context():
             assert group_limited.decision.estimated_step_output_tokens == 1000
         finally:
             await rebalancer.fail(group_limited)
+
+    run(scenario())
+
+
+def test_load_selection_resolves_step_budget_once_per_fingerprint(monkeypatch):
+    client = ControlPlaneClient()
+    client.urls.append("http://node-c:30000")
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(enabled=True),
+        model_id="model",
+        model_config=simple_model_config(),
+    )
+
+    async def scenario():
+        await rebalancer.refresh()
+        first, second, third = client.urls
+        original = rebalancer._resolve_step_budget
+        fingerprints = []
+
+        def resolve(**kwargs):
+            fingerprints.append(kwargs["fingerprint"])
+            return original(**kwargs)
+
+        monkeypatch.setattr(rebalancer, "_resolve_step_budget", resolve)
+        await rebalancer.acquire(
+            session_id="same-fingerprint",
+            input_ids=[1] * 10,
+            step_max_new_tokens=20,
+        )
+        shared_fingerprint = rebalancer.deployments[first].cache_fingerprint
+        assert fingerprints == [shared_fingerprint]
+
+        fingerprints.clear()
+        rebalancer.deployments[third] = replace(
+            rebalancer.deployments[third],
+            cache_fingerprint="different-fingerprint",
+        )
+        rebalancer._least_load(
+            [first, second, third],
+            session_id="two-fingerprints",
+            session=SessionRoutingState(),
+            prompt_tokens=10,
+            step_max_new_tokens=20,
+            context_remaining_tokens=None,
+        )
+        assert fingerprints.count(shared_fingerprint) == 1
+        assert fingerprints.count("different-fingerprint") == 1
+
+    run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("source", "target", "source_score", "target_score", "expected"),
+    [
+        ("http://node-a:30000", "http://node-a:30000", 0.7, 0.2, 0.7),
+        (None, "http://node-b:30000", None, 0.4, 0.4),
+        ("http://node-a:30000", "http://node-b:30000", 0.7, 0.3, 0.3),
+    ],
+)
+def test_reservation_reuses_selected_decision_projected_load(
+    monkeypatch,
+    source,
+    target,
+    source_score,
+    target_score,
+    expected,
+):
+    client = ControlPlaneClient()
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(enabled=True),
+        model_id="model",
+    )
+
+    async def scenario():
+        await rebalancer.refresh()
+
+        def score(total):
+            if total is None:
+                return None
+            return LoadScore(0.0, 0.0, 0.0, 0.0, total)
+
+        decision = RoutingDecision(
+            session_id="reuse-projected",
+            source_worker_url=source,
+            target_worker_url=target,
+            cache_fingerprint=rebalancer.deployments[target].cache_fingerprint,
+            state=SchedulerState.ACTIVE,
+            reason="test",
+            source_projected_load=score(source_score),
+            target_projected_load=score(target_score),
+            moved=source is not None and source != target,
+        )
+        monkeypatch.setattr(
+            rebalancer,
+            "_projected_load_score",
+            lambda *args, **kwargs: pytest.fail("projected load was recomputed"),
+        )
+        lease = rebalancer._reserve(
+            decision,
+            input_ids=[1, 2, 3],
+            base_tokens=0,
+            budget=StepGenerationBudget("request", 4, None, None, 4),
+        )
+        assert lease.projected_load_score == expected
+
+    run(scenario())
+
+
+def test_reservation_recomputes_projected_load_when_decision_has_no_score(
+    monkeypatch,
+):
+    client = ControlPlaneClient()
+    rebalancer = EngineRebalancer(
+        client,
+        config=EngineRebalancingConfig(enabled=True),
+        model_id="model",
+    )
+
+    async def scenario():
+        await rebalancer.refresh()
+        target = client.urls[0]
+        calls = []
+
+        def projected(*args, **kwargs):
+            calls.append((args, kwargs))
+            return 0.6
+
+        monkeypatch.setattr(rebalancer, "_projected_load_score", projected)
+        lease = rebalancer._reserve(
+            RoutingDecision(
+                session_id="fallback-projected",
+                source_worker_url=target,
+                target_worker_url=target,
+                cache_fingerprint=rebalancer.deployments[target].cache_fingerprint,
+                state=SchedulerState.ACTIVE,
+                reason="decision_error_keep_owner",
+            ),
+            input_ids=[1, 2, 3],
+            base_tokens=0,
+            budget=StepGenerationBudget("request", 4, None, None, 4),
+        )
+        assert lease.projected_load_score == 0.6
+        assert len(calls) == 1
 
     run(scenario())
 
@@ -3694,7 +4031,7 @@ def test_engine_rebalancing_benchmark_defaults_to_one_off_on_pair(tmp_path):
     assert "response max:  12288" in result.stdout
     assert "sandbox slots: 16" in result.stdout
     assert "slot timeout:  3600" in result.stdout
-    assert "dressage_dapo_prompts_long_tail.jsonl" in result.stdout
+    assert "dressage_dapo_prompts_step_balanced_256.jsonl" in result.stdout
     assert "warm-up" not in result.stdout
     assert "off-r2" not in result.stdout
     assert "on-r2" not in result.stdout
@@ -3702,6 +4039,32 @@ def test_engine_rebalancing_benchmark_defaults_to_one_off_on_pair(tmp_path):
     assert "Median rollout speedup" not in source
     assert "Warm-up" not in source
     assert not (tmp_path / "benchmark").exists()
+
+
+def test_engine_rebalancing_benchmark_allows_prompt_source_override(tmp_path):
+    path = Path(
+        "examples/scripts/benchmark_engine_rebalancing_qwen3.5_4b_sync_local_l3_hicache.sh"
+    )
+    prompt_source = Path(
+        "examples/data/dressage_dapo_prompts_dynamic_multi.jsonl"
+    ).resolve()
+    result = subprocess.run(
+        ["bash", str(path)],
+        cwd=Path.cwd(),
+        env={
+            **os.environ,
+            "BENCHMARK_DRY_RUN": "1",
+            "BENCHMARK_ROOT": str(tmp_path / "benchmark"),
+            "LONG_TAIL_PROMPT_DATA": str(prompt_source),
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert f"prompt source: {prompt_source}" in result.stdout
+    assert "dressage_dapo_prompts_step_balanced_256.jsonl" not in result.stdout
 
 
 def test_engine_rebalancing_benchmark_samples_long_tail_dataset_once():

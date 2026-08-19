@@ -7,7 +7,7 @@ REPO_ROOT="${REPO_ROOT:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 SOURCE_RECIPE="${SCRIPT_DIR}/run_blackbox_qwen3.5_4b_sync_local_l3_hicache.sh"
 LONG_TAIL_TOOL="${REPO_ROOT}/examples/data/prepare_dapo_long_tail.py"
 BENCHMARK_ROOT="${BENCHMARK_ROOT:-${REPO_ROOT}/log/benchmarks/engine_rebalancing}"
-PROMPT_SOURCE="${LONG_TAIL_PROMPT_DATA:-${REPO_ROOT}/examples/data/dressage_dapo_prompts_long_tail.jsonl}"
+PROMPT_SOURCE="${LONG_TAIL_PROMPT_DATA:-${REPO_ROOT}/examples/data/dressage_dapo_prompts_step_balanced_256.jsonl}"
 PROMPT_EFFECTIVE="${BENCHMARK_ROOT}/prompts.deterministic.jsonl"
 
 BENCHMARK_SEED="${BENCHMARK_SEED:-20260806}"

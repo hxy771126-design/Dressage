@@ -640,7 +640,8 @@ class EngineRebalancer:
     ) -> None:
         if self._snapshot_store is None:
             return
-        payload = self._capture_file_snapshot(kind)
+        async with self._lock:
+            payload = self._capture_file_snapshot(kind)
         if payload is not None:
             await self._write_calibration_snapshot(
                 kind,
@@ -652,14 +653,13 @@ class EngineRebalancer:
         self,
         kind: str,
         online_request_count: int,
-        payload: Mapping[str, Any],
     ) -> None:
         if self._snapshot_store is None:
             return
         try:
             loop = asyncio.get_running_loop()
             task = loop.create_task(
-                self._write_calibration_snapshot(kind, online_request_count, payload),
+                self._persist_current_snapshot(kind, online_request_count),
                 name=f"engine-rebalancing-{kind}-snapshot",
             )
         except Exception:
@@ -712,13 +712,9 @@ class EngineRebalancer:
             store is not None
             and self._online_request_count % store.interval_requests == 0
         ):
-            payload = self._capture_file_snapshot("periodic")
-            if payload is None:
-                return
             self._schedule_calibration_snapshot(
                 "periodic",
                 self._online_request_count,
-                payload,
             )
 
     async def _run_machine_preflight(self) -> None:
@@ -1670,15 +1666,20 @@ class EngineRebalancer:
                 ),
             )
         )
-        budgets = {
-            target: self._resolve_step_budget(
-                session=session,
-                fingerprint=self.deployments[target].cache_fingerprint,
-                step_max_new_tokens=step_max_new_tokens,
-                context_remaining_tokens=context_remaining_tokens,
-            )
-            for target in candidates
-        }
+        budgets_by_fingerprint: dict[str, StepGenerationBudget] = {}
+        budgets: dict[str, StepGenerationBudget] = {}
+        for target in candidates:
+            target_fingerprint = self.deployments[target].cache_fingerprint
+            budget = budgets_by_fingerprint.get(target_fingerprint)
+            if budget is None:
+                budget = self._resolve_step_budget(
+                    session=session,
+                    fingerprint=target_fingerprint,
+                    step_max_new_tokens=step_max_new_tokens,
+                    context_remaining_tokens=context_remaining_tokens,
+                )
+                budgets_by_fingerprint[target_fingerprint] = budget
+            budgets[target] = budget
 
         if source is None:
             scores = self._load_scores(
@@ -2187,15 +2188,20 @@ class EngineRebalancer:
         max_tokens = max([self.loads[url].token_capacity for url in urls] + [1])
         max_queue = max([self.loads[url].queued for url in urls] + [1])
 
-        budgets = {
-            url: self._resolve_step_budget(
-                session=session,
-                fingerprint=self.deployments[url].cache_fingerprint,
-                step_max_new_tokens=step_max_new_tokens,
-                context_remaining_tokens=context_remaining_tokens,
-            )
-            for url in urls
-        }
+        budgets_by_fingerprint: dict[str, StepGenerationBudget] = {}
+        budgets: dict[str, StepGenerationBudget] = {}
+        for url in urls:
+            fingerprint = self.deployments[url].cache_fingerprint
+            budget = budgets_by_fingerprint.get(fingerprint)
+            if budget is None:
+                budget = self._resolve_step_budget(
+                    session=session,
+                    fingerprint=fingerprint,
+                    step_max_new_tokens=step_max_new_tokens,
+                    context_remaining_tokens=context_remaining_tokens,
+                )
+                budgets_by_fingerprint[fingerprint] = budget
+            budgets[url] = budget
 
         def key(url: str) -> tuple[float, str]:
             score = self._projected_load_score(
@@ -2352,10 +2358,19 @@ class EngineRebalancer:
                 reserved_prefill_tokens = max(0, len(input_ids) - base_tokens)
             else:
                 reserved_prefill_tokens = len(input_ids)
-            projected_load_score = self._projected_load_score(
-                target,
-                prompt_tokens=len(input_ids),
-                expected_output_tokens=expected_output_tokens,
+            selected_projected_load = (
+                decision.source_projected_load
+                if target == decision.source_worker_url
+                else decision.target_projected_load
+            )
+            projected_load_score = (
+                selected_projected_load.total
+                if selected_projected_load is not None
+                else self._projected_load_score(
+                    target,
+                    prompt_tokens=len(input_ids),
+                    expected_output_tokens=expected_output_tokens,
+                )
             )
             load = self.loads[target]
             load.reserved_requests += 1
@@ -2393,6 +2408,33 @@ class EngineRebalancer:
     ) -> None:
         if not self.config.enabled or lease.worker_url is None:
             return
+        queue_raw = response_meta.get("queue_time")
+        try:
+            queue_seconds = (
+                None if queue_raw is None else max(0.0, float(queue_raw))
+            )
+        except (TypeError, ValueError):
+            queue_seconds = None
+        decode_throughput_raw = response_meta.get("decode_throughput")
+        try:
+            decode_throughput = float(decode_throughput_raw)
+        except (TypeError, ValueError):
+            decode_throughput = None
+        decode_seconds = (
+            max(0, output_tokens - 1) / decode_throughput
+            if decode_throughput is not None and decode_throughput > 0
+            else 0.0
+        )
+        e2e_raw = response_meta.get("e2e_latency")
+        try:
+            measured_e2e_seconds = float(e2e_raw)
+        except (TypeError, ValueError):
+            measured_e2e_seconds = None
+        cached_raw = response_meta.get("cached_tokens") or 0
+        try:
+            cached_tokens = int(cached_raw)
+        except (TypeError, ValueError):
+            cached_tokens = 0
         async with self._lock:
             self._release_prefill_reservation(
                 lease.worker_url,
@@ -2439,38 +2481,14 @@ class EngineRebalancer:
             )
 
             elapsed = max(0.0, time.monotonic() - lease.started_monotonic)
-            queue_raw = response_meta.get("queue_time")
-            try:
-                queue_seconds = (
-                    None if queue_raw is None else max(0.0, float(queue_raw))
-                )
-            except (TypeError, ValueError):
-                queue_seconds = None
-            decode_throughput_raw = response_meta.get("decode_throughput")
-            try:
-                decode_throughput = float(decode_throughput_raw)
-            except (TypeError, ValueError):
-                decode_throughput = None
-            decode_seconds = (
-                max(0, output_tokens - 1) / decode_throughput
-                if decode_throughput is not None and decode_throughput > 0
-                else 0.0
+            e2e_seconds = (
+                elapsed if measured_e2e_seconds is None else measured_e2e_seconds
             )
-            e2e = response_meta.get("e2e_latency")
-            try:
-                e2e_seconds = float(e2e)
-            except (TypeError, ValueError):
-                e2e_seconds = elapsed
             context_seconds = (
                 None
                 if queue_seconds is None
                 else max(0.0, e2e_seconds - queue_seconds - decode_seconds)
             )
-            cached_raw = response_meta.get("cached_tokens") or 0
-            try:
-                cached_tokens = int(cached_raw)
-            except (TypeError, ValueError):
-                cached_tokens = 0
             if new_owner == lease.decision.source_worker_url:
                 estimate = lease.decision.source_context
                 predicted_queue_seconds = lease.decision.source_queue_seconds

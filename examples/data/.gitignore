@@ -8,6 +8,7 @@
 !dressage_dapo_prompts_dynamic.jsonl
 !dressage_dapo_prompts_dynamic_multi.jsonl
 !dressage_dapo_prompts_long_tail.jsonl
+!dressage_dapo_prompts_step_balanced_256.jsonl
 !prepare_dapo_long_tail.py
 
 !swegym/
