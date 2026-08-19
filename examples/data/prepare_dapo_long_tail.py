@@ -14,7 +14,8 @@ from collections import Counter
 
 
 BUILD_COUNTS = {"short": 2100, "medium": 600, "long": 300}
-SAMPLE_COUNTS = {"short": 179, "medium": 51, "long": 26}
+SAMPLE_WEIGHTS = {"short": 7, "medium": 2, "long": 1}
+DEFAULT_SAMPLE_SIZE = 256
 TOOL_CALLS = {"short": 1, "medium": 5, "long": 15}
 PROFILE_VERSION = "dapo-long-tail-v1"
 
@@ -148,9 +149,34 @@ def _determinize(row: dict, seed: str) -> None:
         message["content"] = content
 
 
-def sample(input_path: pathlib.Path, output_path: pathlib.Path, seed: str) -> None:
+def _sample_counts(sample_size: int) -> dict[str, int]:
+    if sample_size <= 0:
+        raise ValueError("sample size must be positive")
+
+    total_weight = sum(SAMPLE_WEIGHTS.values())
+    counts = {
+        name: sample_size * weight // total_weight
+        for name, weight in SAMPLE_WEIGHTS.items()
+    }
+    remaining = sample_size - sum(counts.values())
+    ranked_remainders = sorted(
+        enumerate(SAMPLE_WEIGHTS.items()),
+        key=lambda item: (-(sample_size * item[1][1] % total_weight), item[0]),
+    )
+    for _, (name, _) in ranked_remainders[:remaining]:
+        counts[name] += 1
+    return counts
+
+
+def sample(
+    input_path: pathlib.Path,
+    output_path: pathlib.Path,
+    seed: str,
+    sample_size: int = DEFAULT_SAMPLE_SIZE,
+) -> None:
     rows = _read_jsonl(input_path)
-    by_class: dict[str, list[dict]] = {name: [] for name in SAMPLE_COUNTS}
+    sample_counts = _sample_counts(sample_size)
+    by_class: dict[str, list[dict]] = {name: [] for name in sample_counts}
     for row in rows:
         workload_class = row.get("metadata", {}).get("workload_class")
         if workload_class not in by_class:
@@ -158,7 +184,7 @@ def sample(input_path: pathlib.Path, output_path: pathlib.Path, seed: str) -> No
         by_class[workload_class].append(row)
 
     selected = []
-    for workload_class, count in SAMPLE_COUNTS.items():
+    for workload_class, count in sample_counts.items():
         candidates = sorted(
             by_class[workload_class],
             key=lambda row: _rank(seed, _instance_id(row), "sample"),
@@ -180,13 +206,17 @@ def main() -> None:
         subparser.add_argument("--input", type=pathlib.Path, required=True)
         subparser.add_argument("--output", type=pathlib.Path, required=True)
         subparser.add_argument("--seed", default="20260806")
+        if command == "sample":
+            subparser.add_argument(
+                "--sample-size", type=int, default=DEFAULT_SAMPLE_SIZE
+            )
     args = parser.parse_args()
     if args.input.resolve() == args.output.resolve():
         parser.error("input and output must be different files")
     if args.command == "build":
         build(args.input, args.output, args.seed)
     else:
-        sample(args.input, args.output, args.seed)
+        sample(args.input, args.output, args.seed, args.sample_size)
 
 
 if __name__ == "__main__":

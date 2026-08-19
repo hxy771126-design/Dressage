@@ -7,7 +7,7 @@ REPO_ROOT="${REPO_ROOT:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 SOURCE_RECIPE="${SCRIPT_DIR}/run_blackbox_qwen3.5_4b_sync_local_l3_hicache.sh"
 LONG_TAIL_TOOL="${REPO_ROOT}/examples/data/prepare_dapo_long_tail.py"
 BENCHMARK_ROOT="${BENCHMARK_ROOT:-${REPO_ROOT}/log/benchmarks/engine_rebalancing}"
-PROMPT_SOURCE="${LONG_TAIL_PROMPT_DATA:-${REPO_ROOT}/examples/data/dressage_dapo_prompts_step_balanced_256.jsonl}"
+PROMPT_SOURCE="${LONG_TAIL_PROMPT_DATA:-${REPO_ROOT}/examples/data/dressage_dapo_prompts_step_balanced_64.jsonl}"
 PROMPT_EFFECTIVE="${BENCHMARK_ROOT}/prompts.deterministic.jsonl"
 
 BENCHMARK_SEED="${BENCHMARK_SEED:-20260806}"
@@ -18,9 +18,9 @@ ENGINE_REBALANCING_MIN_LOAD_IMPROVEMENT_RATIO="${ENGINE_REBALANCING_MIN_LOAD_IMP
 # These values intentionally are not tunable in the A/B benchmark. Keeping the
 # workload fixed is part of the validity check.
 ROLLOUT_TEMPERATURE=0
-ROLLOUT_BATCH_SIZE=256
+ROLLOUT_BATCH_SIZE=64
 N_SAMPLES_PER_PROMPT=1
-GLOBAL_BATCH_SIZE=256
+GLOBAL_BATCH_SIZE=64
 ROLLOUT_MAX_RESPONSE_LEN=12288
 DRESSAGE_BLACKBOX_SLOTS_PER_NODE=24
 DRESSAGE_BLACKBOX_ACQUIRE_TIMEOUT_SEC=3600
@@ -120,7 +120,8 @@ prepare_long_tail_prompts() {
   python3 "${LONG_TAIL_TOOL}" sample \
     --input "${source_path}" \
     --output "${output_path}" \
-    --seed "${seed}"
+    --seed "${seed}" \
+    --sample-size "${ROLLOUT_BATCH_SIZE}"
 }
 
 prepare_long_tail_prompts "${PROMPT_SOURCE}" "${PROMPT_EFFECTIVE}" "${BENCHMARK_SEED}"
