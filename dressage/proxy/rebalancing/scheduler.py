@@ -13,7 +13,6 @@ from collections import defaultdict, deque
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
-from statistics import median
 from typing import Any, Deque, Mapping
 from urllib.parse import urlsplit
 
@@ -306,8 +305,6 @@ class LoadScore:
     request_pressure: float
     token_pressure: float
     queue_pressure: float
-    prefill_pressure: float
-    decode_pressure: float
     total: float
 
 
@@ -447,7 +444,6 @@ class _FrozenBatchEngineTrace:
     token_capacity: int | None
     token_usage: float | None
     gen_throughput: float | None
-    decode_rate_ratio: float | None
     queued: int | None
     queue_pressure: float | None
     waiting_uncached_tokens: int | None
@@ -456,7 +452,7 @@ class _FrozenBatchEngineTrace:
     live_ledger_prefill: int
     base_requests: int | None
     base_tokens: int | None
-    base_prefill: int | None
+    base_queue: int | None
 
 
 @dataclass(frozen=True)
@@ -1857,56 +1853,19 @@ class EngineRebalancer:
                     and self.loads[url].healthy
                 )
             )
-            positive_decode_rates = [
-                successful[url].gen_throughput
-                for url in successful_urls
-                if math.isfinite(successful[url].gen_throughput)
-                and successful[url].gen_throughput > 0
-            ]
-            reference_decode_rate = (
-                float(median(positive_decode_rates))
-                if positive_decode_rates
-                else None
-            )
-            decode_rate_ratios = {
-                url: (
-                    reference_decode_rate / successful[url].gen_throughput
-                    if reference_decode_rate is not None
-                    and math.isfinite(successful[url].gen_throughput)
-                    and successful[url].gen_throughput > 0
-                    else 1.0
-                )
-                for url in successful_urls
-            }
-            max_successful_queued = max(
-                (successful[url].queued for url in successful_urls),
-                default=0,
-            )
             engines = []
             engine_traces = []
             baselines: dict[str, EngineBaseline] = {}
             for url in successful_urls:
                 snapshot = successful[url]
-                live_requests, live_tokens, live_prefill = (
-                    self._live_reservation_totals(url)
-                )
                 baseline = EngineBaseline(
                     url=url,
-                    base_requests=max(snapshot.running, live_requests),
-                    base_tokens=max(snapshot.active_tokens, live_tokens),
-                    base_prefill=max(
-                        snapshot.waiting_uncached_tokens,
-                        live_prefill,
-                    ),
+                    base_requests=snapshot.running,
+                    base_tokens=snapshot.active_tokens,
+                    base_queue=snapshot.queued,
                     request_capacity=snapshot.request_capacity,
                     token_capacity=snapshot.token_capacity,
                     token_usage=snapshot.token_usage,
-                    queue_pressure=snapshot.queued
-                    / max(
-                        1,
-                        snapshot.request_capacity,
-                        max_successful_queued,
-                    ),
                 )
                 engines.append(baseline)
                 baselines[url] = baseline
@@ -1953,10 +1912,11 @@ class EngineRebalancer:
                             or not math.isfinite(snapshot.gen_throughput)
                             else snapshot.gen_throughput
                         ),
-                        decode_rate_ratio=decode_rate_ratios.get(result.url),
                         queued=None if snapshot is None else snapshot.queued,
                         queue_pressure=(
-                            None if baseline is None else baseline.queue_pressure
+                            None
+                            if baseline is None
+                            else baseline.base_queue / baseline.request_capacity
                         ),
                         waiting_uncached_tokens=(
                             None
@@ -1972,8 +1932,8 @@ class EngineRebalancer:
                         base_tokens=(
                             None if baseline is None else int(baseline.base_tokens)
                         ),
-                        base_prefill=(
-                            None if baseline is None else int(baseline.base_prefill)
+                        base_queue=(
+                            None if baseline is None else int(baseline.base_queue)
                         ),
                     )
                 )
@@ -2129,27 +2089,19 @@ class EngineRebalancer:
                         prefill_increment = prompt_tokens - page_aligned_lcp
                     else:
                         prefill_increment = prompt_tokens
-                    estimated_output = max(
-                        0,
-                        int(budget.estimated_step_output_tokens or 0),
-                    )
                     edges.append(
                         FeasibleEdge(
                             session_id=pending.session_id,
                             engine_url=target,
-                            request_increment=1,
+                            queue_increment=1,
                             token_increment=(
-                                prompt_tokens
-                                + estimated_output
+                                max(0, prompt_tokens - lcp)
+                                if healthy_owner and target == source
+                                else prompt_tokens
                             ),
                             prefill_increment=prefill_increment,
                             voluntary_migration=voluntary,
                             migration_cost_tokens=lcp if voluntary else 0,
-                            decode_pressure_increment=(
-                                estimated_output
-                                / max(1.0, baselines[target].token_capacity)
-                                * decode_rate_ratios[target]
-                            ),
                         )
                     )
                     budgets.append((target, budget))
@@ -2221,27 +2173,15 @@ class EngineRebalancer:
                 token_capacity = cached.token_capacity or max(
                     [engine.token_capacity for engine in compatible] + [1]
                 )
-                live_requests, live_tokens, live_prefill = (
-                    self._live_reservation_totals(url)
-                )
                 decision_engines.append(
                     EngineBaseline(
                         url=url,
-                        base_requests=max(cached.running, live_requests),
-                        base_tokens=max(cached.active_tokens, live_tokens),
-                        base_prefill=max(
-                            cached.waiting_uncached_tokens,
-                            live_prefill,
-                        ),
+                        base_requests=cached.running,
+                        base_tokens=cached.active_tokens,
+                        base_queue=cached.queued,
                         request_capacity=request_capacity,
                         token_capacity=token_capacity,
                         token_usage=cached.token_usage,
-                        queue_pressure=cached.queued
-                        / max(
-                            1,
-                            request_capacity,
-                            max_successful_queued,
-                        ),
                     )
                 )
             return _FrozenBatch(
@@ -2603,7 +2543,7 @@ class EngineRebalancer:
                             selected_targets[step.arrival_id]
                         )
                     increments = {
-                        engine.url: [0.0, 0.0, 0.0, 0.0]
+                        engine.url: [0.0, 0.0]
                         for engine in frozen.decision_engines
                     }
                     selected_edges_by_arrival: dict[int, FeasibleEdge] = {}
@@ -2628,10 +2568,11 @@ class EngineRebalancer:
                             edge = FeasibleEdge(
                                 session_id=frozen_step.pending.session_id,
                                 engine_url=target,
-                                request_increment=1,
-                                token_increment=(
+                                queue_increment=1,
+                                token_increment=max(
+                                    0,
                                     len(frozen_step.pending.input_ids)
-                                    + (budget.estimated_step_output_tokens or 0)
+                                    - dict(frozen_step.base_tokens)[target],
                                 ),
                                 prefill_increment=max(
                                     0,
@@ -2645,26 +2586,20 @@ class EngineRebalancer:
                                 frozen_step.pending.arrival_id
                             ] = edge
                             totals = increments[edge.engine_url]
-                            totals[0] += edge.request_increment
+                            totals[0] += edge.queue_increment
                             totals[1] += edge.token_increment
-                            totals[2] += edge.prefill_increment
-                            totals[3] += edge.decode_pressure_increment
                     base_scores: dict[str, LoadScore] = {}
                     projected_scores: dict[str, LoadScore] = {}
                     for engine in frozen.decision_engines:
                         (
-                            request_increment,
+                            queue_increment,
                             token_increment,
-                            prefill_increment,
-                            decode_pressure_increment,
                         ) = increments[engine.url]
                         base_scores[engine.url] = self._batch_load_score(engine)
                         projected_scores[engine.url] = self._batch_load_score(
                             engine,
-                            request_increment=request_increment,
+                            queue_increment=queue_increment,
                             token_increment=token_increment,
-                            prefill_increment=prefill_increment,
-                            decode_pressure_increment=decode_pressure_increment,
                         )
                     for frozen_step in frozen.steps:
                         step = frozen_step.pending
@@ -2805,34 +2740,22 @@ class EngineRebalancer:
     def _batch_load_score(
         engine: EngineBaseline,
         *,
-        request_increment: float = 0.0,
+        queue_increment: float = 0.0,
         token_increment: float = 0.0,
-        prefill_increment: float = 0.0,
-        decode_pressure_increment: float = 0.0,
     ) -> LoadScore:
-        request_pressure = (
-            engine.base_requests + request_increment
-        ) / engine.request_capacity
+        request_pressure = engine.base_requests / engine.request_capacity
         token_pressure = max(
             (engine.base_tokens + token_increment) / engine.token_capacity,
             engine.token_usage,
         )
-        prefill_pressure = (
-            engine.base_prefill + prefill_increment
-        ) / engine.token_capacity
+        queue_pressure = (
+            engine.base_queue + queue_increment
+        ) / engine.request_capacity
         return LoadScore(
             request_pressure=request_pressure,
             token_pressure=token_pressure,
-            queue_pressure=engine.queue_pressure,
-            prefill_pressure=prefill_pressure,
-            decode_pressure=decode_pressure_increment,
-            total=(
-                request_pressure
-                + token_pressure
-                + engine.queue_pressure
-                + prefill_pressure
-                + decode_pressure_increment
-            ),
+            queue_pressure=queue_pressure,
+            total=max(request_pressure, token_pressure, queue_pressure),
         )
 
     def _batch_trace(
@@ -2864,7 +2787,6 @@ class EngineRebalancer:
             int | None,
             list[str],
             dict[str, int],
-            dict[str, float],
         ]:
             frozen_step = frozen_by_arrival.get(step.arrival_id)
             if frozen_step is None:
@@ -2876,7 +2798,6 @@ class EngineRebalancer:
                         for result in fetch_results
                         if result.status == "ok"
                     ],
-                    {},
                     {},
                 )
             candidate_urls = (
@@ -2892,14 +2813,6 @@ class EngineRebalancer:
                     for edge in frozen_step.edges
                 }
             )
-            candidate_decode_pressures = (
-                {frozen_step.fixed_target: 0.0}
-                if frozen_step.fixed_target is not None
-                else {
-                    edge.engine_url: edge.decode_pressure_increment
-                    for edge in frozen_step.edges
-                }
-            )
             target = frozen_step.fixed_target or solved_assignment.get(
                 step.session_id
             )
@@ -2912,36 +2825,36 @@ class EngineRebalancer:
                 None if budget is None else budget.estimated_step_output_tokens,
                 candidate_urls,
                 candidate_costs,
-                candidate_decode_pressures,
             )
 
-        def committed_migration_cost(step: _PendingBatchStep) -> int:
+        def committed_edge(step: _PendingBatchStep) -> FeasibleEdge | None:
+            lease = lease_by_arrival.get(step.arrival_id)
+            frozen_step = frozen_by_arrival.get(step.arrival_id)
+            if lease is None or frozen_step is None:
+                return None
+            return next(
+                (
+                    edge
+                    for edge in frozen_step.edges
+                    if edge.engine_url == lease.worker_url
+                ),
+                None,
+            )
+
+        def committed_token_increment(step: _PendingBatchStep) -> int:
             lease = lease_by_arrival.get(step.arrival_id)
             frozen_step = frozen_by_arrival.get(step.arrival_id)
             if lease is None or frozen_step is None:
                 return 0
-            return next(
-                (
-                    edge.migration_cost_tokens
-                    for edge in frozen_step.edges
-                    if edge.engine_url == lease.worker_url
-                ),
-                0,
-            )
+            edge = committed_edge(step)
+            if edge is not None:
+                return int(edge.token_increment)
+            base_tokens = dict(frozen_step.base_tokens).get(lease.worker_url, 0)
+            return max(0, len(step.input_ids) - base_tokens)
 
-        def committed_decode_pressure(step: _PendingBatchStep) -> float:
-            lease = lease_by_arrival.get(step.arrival_id)
-            frozen_step = frozen_by_arrival.get(step.arrival_id)
-            if lease is None or frozen_step is None:
-                return 0.0
-            return next(
-                (
-                    edge.decode_pressure_increment
-                    for edge in frozen_step.edges
-                    if edge.engine_url == lease.worker_url
-                ),
-                0.0,
-            )
+        def committed_migration_cost(step: _PendingBatchStep) -> int:
+            edge = committed_edge(step)
+            return 0 if edge is None else edge.migration_cost_tokens
 
         trace_inputs = {
             step.arrival_id: frozen_trace_inputs(step) for step in batch.steps
@@ -2996,7 +2909,6 @@ class EngineRebalancer:
                     "candidate_migration_cost_tokens": trace_inputs[
                         step.arrival_id
                     ][3],
-                    "candidate_decode_pressure": trace_inputs[step.arrival_id][4],
                     "status": (
                         "cancelled"
                         if step.cancelled
@@ -3016,15 +2928,21 @@ class EngineRebalancer:
                         if step.arrival_id not in lease_by_arrival
                         else lease_by_arrival[step.arrival_id].decision.moved
                     ),
-                    "request_increment": (
+                    "queue_increment": (
                         0 if step.arrival_id not in lease_by_arrival else 1
                     ),
-                    "token_increment": (
+                    "token_increment": committed_token_increment(step),
+                    "reserved_requests": (
+                        0 if step.arrival_id not in lease_by_arrival else 1
+                    ),
+                    "reserved_tokens": (
                         0
                         if step.arrival_id not in lease_by_arrival
-                        else lease_by_arrival[step.arrival_id].reserved_tokens
+                        else lease_by_arrival[
+                            step.arrival_id
+                        ].reserved_tokens
                     ),
-                    "prefill_increment": (
+                    "reserved_prefill_tokens": (
                         0
                         if step.arrival_id not in lease_by_arrival
                         else lease_by_arrival[
@@ -3032,7 +2950,6 @@ class EngineRebalancer:
                         ].reserved_prefill_tokens
                     ),
                     "migration_cost_tokens": committed_migration_cost(step),
-                    "decode_pressure_increment": committed_decode_pressure(step),
                 }
                 for step in sorted(batch.steps, key=lambda item: item.arrival_id)
             ],
@@ -3056,7 +2973,6 @@ class EngineRebalancer:
                             token_capacity=None,
                             token_usage=None,
                             gen_throughput=None,
-                            decode_rate_ratio=None,
                             queued=None,
                             queue_pressure=None,
                             waiting_uncached_tokens=None,
@@ -3065,7 +2981,7 @@ class EngineRebalancer:
                             live_ledger_prefill=0,
                             base_requests=None,
                             base_tokens=None,
-                            base_prefill=None,
+                            base_queue=None,
                         )
                         for result in fetch_results
                     )
@@ -3160,14 +3076,12 @@ class EngineRebalancer:
         self,
         url: str,
         *,
-        prompt_tokens: int,
-        expected_output_tokens: int = 0,
-        capacity_fallback: tuple[int, int, int] | None = None,
+        token_increment: int,
+        capacity_fallback: tuple[int, int] | None = None,
     ) -> float:
         return self._load_score(
             url,
-            prompt_tokens=prompt_tokens,
-            expected_output_tokens=expected_output_tokens,
+            token_increment=token_increment,
             include_pending_request=True,
             capacity_fallback=capacity_fallback,
         ).total
@@ -3176,10 +3090,9 @@ class EngineRebalancer:
         self,
         url: str,
         *,
-        prompt_tokens: int,
-        expected_output_tokens: int = 0,
+        token_increment: int,
         include_pending_request: bool,
-        capacity_fallback: tuple[int, int, int] | None = None,
+        capacity_fallback: tuple[int, int] | None = None,
     ) -> LoadScore:
         load = self.loads[url]
         if capacity_fallback is None:
@@ -3196,45 +3109,25 @@ class EngineRebalancer:
             max_tokens = max(
                 [self.loads[item].token_capacity for item in compatible] + [1]
             )
-            max_queue = max([self.loads[item].queued for item in compatible] + [1])
         else:
-            max_running, max_tokens, max_queue = capacity_fallback
+            max_running, max_tokens = capacity_fallback
         req_capacity = load.request_capacity or max_running
         token_capacity = load.token_capacity or max_tokens
-        queue_capacity = max(max_queue, req_capacity)
-        pending_requests = 1 if include_pending_request else 0
+        queue_increment = 1 if include_pending_request else 0
         pending_tokens = (
-            prompt_tokens + max(0, int(expected_output_tokens))
-            if include_pending_request
-            else 0
+            max(0, int(token_increment)) if include_pending_request else 0
         )
-        request_pressure = (
-            max(load.running, load.reserved_requests) + pending_requests
-        ) / max(1, req_capacity)
+        request_pressure = load.running / max(1, req_capacity)
         token_pressure = max(
-            (
-                max(load.active_tokens, load.reserved_tokens) + pending_tokens
-            )
-            / max(1, token_capacity),
+            (load.active_tokens + pending_tokens) / max(1, token_capacity),
             load.token_usage,
         )
-        queue_pressure = load.queued / max(1, queue_capacity)
-        prefill_pressure = max(
-            load.waiting_uncached_tokens,
-            load.reserved_prefill_tokens,
-        ) / max(1, token_capacity)
+        queue_pressure = (load.queued + queue_increment) / max(1, req_capacity)
         return LoadScore(
             request_pressure=request_pressure,
             token_pressure=token_pressure,
             queue_pressure=queue_pressure,
-            prefill_pressure=prefill_pressure,
-            decode_pressure=0.0,
-            total=(
-                request_pressure
-                + token_pressure
-                + queue_pressure
-                + prefill_pressure
-            ),
+            total=max(request_pressure, token_pressure, queue_pressure),
         )
 
     def _reserve(
@@ -3280,10 +3173,14 @@ class EngineRebalancer:
             else:
                 reserved_prefill_tokens = len(input_ids)
             if projected_load_score is None:
+                token_increment = (
+                    max(0, len(input_ids) - base_tokens)
+                    if target == decision.source_worker_url
+                    else len(input_ids)
+                )
                 projected_load_score = self._projected_load_score(
                     target,
-                    prompt_tokens=len(input_ids),
-                    expected_output_tokens=expected_output_tokens,
+                    token_increment=token_increment,
                 )
             if reserved_prefill_tokens > 0:
                 prefill_reservation_generation = self._load_generations[target] + 1

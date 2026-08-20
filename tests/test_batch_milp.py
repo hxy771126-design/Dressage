@@ -17,21 +17,19 @@ def engine(
     *,
     base_requests: float = 0.0,
     base_tokens: float = 0.0,
-    base_prefill: float = 0.0,
+    base_queue: float = 0.0,
     request_capacity: float = 10.0,
     token_capacity: float = 10.0,
     token_usage: float = 0.0,
-    queue_pressure: float = 0.0,
 ):
     return solver_module().EngineBaseline(
         url=url,
         base_requests=base_requests,
         base_tokens=base_tokens,
-        base_prefill=base_prefill,
+        base_queue=base_queue,
         request_capacity=request_capacity,
         token_capacity=token_capacity,
         token_usage=token_usage,
-        queue_pressure=queue_pressure,
     )
 
 
@@ -39,20 +37,18 @@ def edge(
     session_id: str,
     engine_url: str,
     *,
-    requests: float,
+    queue: float,
     tokens: float = 0.0,
     prefill: float = 0.0,
-    decode_pressure: float = 0.0,
     migration: bool = False,
     migration_cost_tokens: int = 0,
 ):
     return solver_module().FeasibleEdge(
         session_id=session_id,
         engine_url=engine_url,
-        request_increment=requests,
+        queue_increment=queue,
         token_increment=tokens,
         prefill_increment=prefill,
-        decode_pressure_increment=decode_pressure,
         voluntary_migration=migration,
         migration_cost_tokens=migration_cost_tokens,
     )
@@ -76,19 +72,16 @@ def assignment_objectives(batch, selected_edges):
     loads = []
     for baseline in batch.engines:
         assigned = [edge for edge in selected_edges if edge.engine_url == baseline.url]
-        request = (
-            baseline.base_requests + sum(edge.request_increment for edge in assigned)
-        ) / baseline.request_capacity
+        request = baseline.base_requests / baseline.request_capacity
         token = max(
             (baseline.base_tokens + sum(edge.token_increment for edge in assigned))
             / baseline.token_capacity,
             baseline.token_usage,
         )
-        prefill = (
-            baseline.base_prefill + sum(edge.prefill_increment for edge in assigned)
-        ) / baseline.token_capacity
-        decode = sum(edge.decode_pressure_increment for edge in assigned)
-        loads.append(request + token + baseline.queue_pressure + prefill + decode)
+        queue = (
+            baseline.base_queue + sum(edge.queue_increment for edge in assigned)
+        ) / baseline.request_capacity
+        loads.append(max(request, token, queue))
     return (
         max(loads),
         sum(
@@ -107,12 +100,46 @@ def target_assignment_objectives(batch, selected_edges):
     )
 
 
-def test_milp_balances_hand_derived_request_load():
+def test_milp_uses_max_pressure_and_adds_new_steps_to_queue():
+    module = solver_module()
+    batch = module.BatchProblem(
+        engines=(
+            module.EngineBaseline(
+                url="a",
+                base_requests=4,
+                base_tokens=6,
+                base_queue=3,
+                request_capacity=10,
+                token_capacity=10,
+                token_usage=0.5,
+            ),
+        ),
+        edges_by_session={
+            "s": (
+                module.FeasibleEdge(
+                    session_id="s",
+                    engine_url="a",
+                    queue_increment=1,
+                    token_increment=1,
+                    prefill_increment=0,
+                    voluntary_migration=False,
+                ),
+            )
+        },
+    )
+
+    result = module.solve_batch_milp(batch)
+
+    assert result.maximum_load == pytest.approx(0.7)
+    assert result.minimum_load == pytest.approx(0.7)
+
+
+def test_milp_balances_hand_derived_queue_load():
     batch = problem(
         [engine("a"), engine("b")],
         {
-            "s1": (edge("s1", "a", requests=6), edge("s1", "b", requests=6)),
-            "s2": (edge("s2", "a", requests=6), edge("s2", "b", requests=6)),
+            "s1": (edge("s1", "a", queue=6), edge("s1", "b", queue=6)),
+            "s2": (edge("s2", "a", queue=6), edge("s2", "b", queue=6)),
         },
     )
 
@@ -132,33 +159,32 @@ def test_milp_recomputes_load_with_token_usage_floor():
                 "a",
                 base_requests=1,
                 base_tokens=1,
-                base_prefill=2,
+                base_queue=2,
                 token_usage=0.6,
-                queue_pressure=0.05,
             ),
             engine("b", base_requests=1),
         ],
         {
             "s": (
-                edge("s", "a", requests=1, tokens=2, prefill=1),
+                edge("s", "a", queue=1, tokens=2, prefill=1),
             )
         },
     )
 
     result = solver_module().solve_batch_milp(batch)
 
-    assert result.maximum_load == pytest.approx(1.15)
+    assert result.maximum_load == pytest.approx(0.6)
     assert result.minimum_load == pytest.approx(0.1)
-    assert result.load_range == pytest.approx(1.05)
+    assert result.load_range == pytest.approx(0.5)
 
 
-def test_milp_recomputes_load_with_decode_pressure():
+def test_milp_recomputes_load_with_base_queue():
     batch = problem(
-        [engine("a"), engine("b")],
+        [engine("a", base_queue=5), engine("b")],
         {
             "s": (
-                edge("s", "a", requests=1, decode_pressure=0.25),
-                edge("s", "b", requests=1, decode_pressure=0.05),
+                edge("s", "a", queue=1),
+                edge("s", "b", queue=1),
             )
         },
     )
@@ -166,21 +192,21 @@ def test_milp_recomputes_load_with_decode_pressure():
     result = solver_module().solve_batch_milp(batch)
 
     assert result.assignment == {"s": "b"}
-    assert result.maximum_load == pytest.approx(0.15)
-    assert result.minimum_load == pytest.approx(0.0)
-    assert result.load_range == pytest.approx(0.15)
+    assert result.maximum_load == pytest.approx(0.5)
+    assert result.minimum_load == pytest.approx(0.1)
+    assert result.load_range == pytest.approx(0.4)
 
 
 def test_milp_does_not_impose_a_unit_load_limit():
     batch = problem(
         [engine("a", base_requests=15)],
-        {"s": (edge("s", "a", requests=5),)},
+        {"s": (edge("s", "a", queue=5),)},
     )
 
     result = solver_module().solve_batch_milp(batch)
 
     assert result.status is solver_module().SolverStatus.OPTIMAL
-    assert result.maximum_load == pytest.approx(2.0)
+    assert result.maximum_load == pytest.approx(1.5)
 
 
 def test_milp_uses_stable_hash_after_load_even_if_tie_migrates():
@@ -188,8 +214,8 @@ def test_milp_uses_stable_hash_after_load_even_if_tie_migrates():
         [engine("a"), engine("b")],
         {
             "session": (
-                edge("session", "a", requests=1),
-                edge("session", "b", requests=1, migration=True),
+                edge("session", "a", queue=1),
+                edge("session", "b", queue=1, migration=True),
             )
         },
     )
@@ -203,8 +229,8 @@ def test_milp_uses_stable_hash_after_load_even_if_tie_migrates():
 
 def test_milp_uses_stable_sha256_tie_breaking():
     candidates = (
-        edge("s", "a", requests=1),
-        edge("s", "b", requests=1),
+        edge("s", "a", queue=1),
+        edge("s", "b", queue=1),
     )
     expected = min(
         candidates,
@@ -222,24 +248,24 @@ def test_milp_uses_stable_sha256_tie_breaking():
 
 def test_target_milp_minimizes_kv_cost_before_maximum_load():
     batch = problem(
-        [engine("a", base_requests=6), engine("b")],
+        [engine("a", base_queue=6), engine("b")],
         {
             "large": (
-                edge("large", "a", requests=2),
+                edge("large", "a", queue=2),
                 edge(
                     "large",
                     "b",
-                    requests=2,
+                    queue=2,
                     migration=True,
                     migration_cost_tokens=5,
                 ),
             ),
             "small": (
-                edge("small", "a", requests=1),
+                edge("small", "a", queue=1),
                 edge(
                     "small",
                     "b",
-                    requests=1,
+                    queue=1,
                     migration=True,
                     migration_cost_tokens=1,
                 ),
@@ -263,8 +289,8 @@ def test_target_milp_minimizes_kv_cost_before_maximum_load():
 
 def test_target_milp_reports_an_infeasible_load_limit():
     batch = problem(
-        [engine("a", base_requests=9)],
-        {"s": (edge("s", "a", requests=2),)},
+        [engine("a", base_queue=9)],
+        {"s": (edge("s", "a", queue=2),)},
     )
 
     with pytest.raises(solver_module().BatchSolverError) as raised:
@@ -279,14 +305,14 @@ def test_target_milp_reports_an_infeasible_load_limit():
 
 def test_target_milp_keeps_zero_cost_owner_when_sticky_load_meets_target():
     batch = problem(
-        [engine("a", base_requests=8), engine("b")],
+        [engine("a", base_queue=8), engine("b")],
         {
             "s": (
-                edge("s", "a", requests=1),
+                edge("s", "a", queue=1),
                 edge(
                     "s",
                     "b",
-                    requests=1,
+                    queue=1,
                     migration=True,
                     migration_cost_tokens=5,
                 ),
@@ -305,17 +331,16 @@ def test_target_milp_keeps_zero_cost_owner_when_sticky_load_meets_target():
     assert result.voluntary_migrations == 0
 
 
-def test_target_milp_keeps_kv_cost_priority_over_decode_pressure():
+def test_target_milp_keeps_kv_cost_priority_over_lower_maximum_load():
     batch = problem(
-        [engine("a"), engine("b")],
+        [engine("a", base_queue=4), engine("b")],
         {
             "s": (
-                edge("s", "a", requests=1, decode_pressure=0.4),
+                edge("s", "a", queue=1),
                 edge(
                     "s",
                     "b",
-                    requests=1,
-                    decode_pressure=0.0,
+                    queue=1,
                     migration=True,
                     migration_cost_tokens=1,
                 ),
@@ -336,31 +361,31 @@ def test_target_milp_keeps_kv_cost_priority_over_decode_pressure():
 
 def test_target_milp_matches_exhaustive_cost_load_and_hash_ordering():
     batch = problem(
-        [engine("a", base_requests=4), engine("b")],
+        [engine("a", base_queue=4), engine("b")],
         {
             "s1": (
-                edge("s1", "a", requests=3),
+                edge("s1", "a", queue=3),
                 edge(
                     "s1",
                     "b",
-                    requests=3,
+                    queue=3,
                     migration=True,
                     migration_cost_tokens=5,
                 ),
             ),
             "s2": (
-                edge("s2", "a", requests=2),
+                edge("s2", "a", queue=2),
                 edge(
                     "s2",
                     "b",
-                    requests=2,
+                    queue=2,
                     migration=True,
                     migration_cost_tokens=2,
                 ),
             ),
             "new": (
-                edge("new", "a", requests=1),
-                edge("new", "b", requests=1),
+                edge("new", "a", queue=1),
+                edge("new", "b", queue=1),
             ),
         },
     )
@@ -401,7 +426,7 @@ def test_problem_rejects_an_edge_for_an_unknown_engine():
     with pytest.raises(ValueError, match="unknown Engine 'missing'"):
         problem(
             [engine("a")],
-            {"s": (edge("s", "missing", requests=1),)},
+            {"s": (edge("s", "missing", queue=1),)},
         )
 
 
@@ -419,7 +444,7 @@ def test_problem_rejects_negative_migration_cost_tokens():
                     edge(
                         "s",
                         "a",
-                        requests=1,
+                        queue=1,
                         migration=True,
                         migration_cost_tokens=-1,
                     ),
@@ -428,18 +453,9 @@ def test_problem_rejects_negative_migration_cost_tokens():
         )
 
 
-@pytest.mark.parametrize("value", [-0.1, float("nan"), float("inf")])
-def test_problem_rejects_invalid_decode_pressure(value):
-    with pytest.raises(ValueError, match="decode pressure increment"):
-        problem(
-            [engine("a")],
-            {"s": (edge("s", "a", requests=1, decode_pressure=value),)},
-        )
-
-
 def test_input_values_are_frozen_and_problem_copies_edge_mapping():
     baseline = engine("a")
-    candidate = edge("s", "a", requests=1)
+    candidate = edge("s", "a", queue=1)
     edges_by_session = {"s": [candidate]}
     batch = problem([baseline], edges_by_session)
     edges_by_session["s"].clear()
@@ -455,11 +471,11 @@ def test_input_values_are_frozen_and_problem_copies_edge_mapping():
 
 def test_greedy_never_migrates_when_an_owner_edge_exists():
     batch = problem(
-        [engine("a", base_requests=9), engine("b")],
+        [engine("a", base_queue=9), engine("b")],
         {
             "s": (
-                edge("s", "a", requests=1),
-                edge("s", "b", requests=1, migration=True),
+                edge("s", "a", queue=1),
+                edge("s", "b", queue=1, migration=True),
             )
         },
     )
@@ -472,13 +488,13 @@ def test_greedy_never_migrates_when_an_owner_edge_exists():
     assert result.voluntary_migrations == 0
 
 
-def test_greedy_recomputes_selected_decode_pressure():
+def test_greedy_recomputes_selected_max_pressure():
     batch = problem(
-        [engine("a"), engine("b")],
+        [engine("a", base_tokens=1), engine("b")],
         {
             "s": (
-                edge("s", "a", requests=1, decode_pressure=0.2),
-                edge("s", "b", requests=1, migration=True),
+                edge("s", "a", queue=1, tokens=2),
+                edge("s", "b", queue=1, migration=True),
             )
         },
     )
@@ -492,12 +508,12 @@ def test_greedy_recomputes_selected_decode_pressure():
 def test_greedy_is_stable_across_session_and_edge_input_order():
     edges = {
         "s2": (
-            edge("s2", "b", requests=3, migration=True),
-            edge("s2", "a", requests=3, migration=True),
+            edge("s2", "b", queue=3, migration=True),
+            edge("s2", "a", queue=3, migration=True),
         ),
         "s1": (
-            edge("s1", "b", requests=3, migration=True),
-            edge("s1", "a", requests=3, migration=True),
+            edge("s1", "b", queue=3, migration=True),
+            edge("s1", "a", queue=3, migration=True),
         ),
     }
     reversed_edges = {
@@ -522,16 +538,16 @@ def test_milp_matches_exhaustive_load_and_tie_ordering():
         [engine("a"), engine("b")],
         {
             "s1": (
-                edge("s1", "a", requests=4),
-                edge("s1", "b", requests=4, migration=True),
+                edge("s1", "a", queue=4),
+                edge("s1", "b", queue=4, migration=True),
             ),
             "s2": (
-                edge("s2", "a", requests=4, migration=True),
-                edge("s2", "b", requests=4),
+                edge("s2", "a", queue=4, migration=True),
+                edge("s2", "b", queue=4),
             ),
             "s3": (
-                edge("s3", "a", requests=0),
-                edge("s3", "b", requests=0),
+                edge("s3", "a", queue=0),
+                edge("s3", "b", queue=0),
             ),
         },
     )
