@@ -274,6 +274,15 @@ class EngineLoad:
         return payload
 
 
+def _effective_base_queue(
+    *,
+    running: int,
+    queued: int,
+    live_ledger_requests: int,
+) -> int:
+    return queued + max(0, live_ledger_requests - running - queued)
+
+
 @dataclass
 class SessionRoutingState:
     owner_worker_url: str | None = None
@@ -1858,11 +1867,16 @@ class EngineRebalancer:
             baselines: dict[str, EngineBaseline] = {}
             for url in successful_urls:
                 snapshot = successful[url]
+                live_requests, _, _ = self._live_reservation_totals(url)
                 baseline = EngineBaseline(
                     url=url,
                     base_requests=snapshot.running,
                     base_tokens=snapshot.active_tokens,
-                    base_queue=snapshot.queued,
+                    base_queue=_effective_base_queue(
+                        running=snapshot.running,
+                        queued=snapshot.queued,
+                        live_ledger_requests=live_requests,
+                    ),
                     request_capacity=snapshot.request_capacity,
                     token_capacity=snapshot.token_capacity,
                     token_usage=snapshot.token_usage,
@@ -2178,7 +2192,11 @@ class EngineRebalancer:
                         url=url,
                         base_requests=cached.running,
                         base_tokens=cached.active_tokens,
-                        base_queue=cached.queued,
+                        base_queue=_effective_base_queue(
+                            running=cached.running,
+                            queued=cached.queued,
+                            live_ledger_requests=cached.reserved_requests,
+                        ),
                         request_capacity=request_capacity,
                         token_capacity=token_capacity,
                         token_usage=cached.token_usage,
@@ -3122,7 +3140,12 @@ class EngineRebalancer:
             (load.active_tokens + pending_tokens) / max(1, token_capacity),
             load.token_usage,
         )
-        queue_pressure = (load.queued + queue_increment) / max(1, req_capacity)
+        base_queue = _effective_base_queue(
+            running=load.running,
+            queued=load.queued,
+            live_ledger_requests=load.reserved_requests,
+        )
+        queue_pressure = (base_queue + queue_increment) / max(1, req_capacity)
         return LoadScore(
             request_pressure=request_pressure,
             token_pressure=token_pressure,

@@ -339,7 +339,7 @@ def test_config_accepts_zero_and_rejects_negative_load_batch_window():
         EngineRebalancingConfig(load_batch_coalescing_window_ms=-1)
 
 
-def test_load_score_ignores_reservations_and_projects_new_step_to_queue():
+def test_load_score_adds_only_unseen_request_ledger_to_queue():
     client = ControlPlaneClient()
     rebalancer = EngineRebalancer(
         client,
@@ -352,7 +352,7 @@ def test_load_score_ignores_reservations_and_projects_new_step_to_queue():
         target = client.urls[0]
         load = rebalancer.loads[target]
         load.running = 2
-        load.reserved_requests = 200
+        load.reserved_requests = 5
         load.queued = 3
         load.active_tokens = 1_000
         load.reserved_tokens = 90_000
@@ -363,7 +363,18 @@ def test_load_score_ignores_reservations_and_projects_new_step_to_queue():
         load.reserved_prefill_tokens = 90_000
         rebalancer.loads[client.urls[1]].queued = 1_000
 
-        base = rebalancer._load_score(
+        observed = rebalancer._load_score(
+            target,
+            token_increment=0,
+            include_pending_request=False,
+        )
+        assert observed.request_pressure == pytest.approx(0.02)
+        assert observed.token_pressure == pytest.approx(0.01)
+        assert observed.queue_pressure == pytest.approx(0.03)
+        assert observed.total == pytest.approx(0.06)
+
+        load.reserved_requests = 7
+        lagged = rebalancer._load_score(
             target,
             token_increment=0,
             include_pending_request=False,
@@ -374,14 +385,14 @@ def test_load_score_ignores_reservations_and_projects_new_step_to_queue():
             include_pending_request=True,
         )
 
-        assert base.request_pressure == pytest.approx(0.02)
-        assert base.token_pressure == pytest.approx(0.01)
-        assert base.queue_pressure == pytest.approx(0.03)
-        assert base.total == pytest.approx(0.06)
-        assert projected.request_pressure == base.request_pressure
+        assert lagged.request_pressure == pytest.approx(0.02)
+        assert lagged.token_pressure == pytest.approx(0.01)
+        assert lagged.queue_pressure == pytest.approx(0.05)
+        assert lagged.total == pytest.approx(0.08)
+        assert projected.request_pressure == lagged.request_pressure
         assert projected.token_pressure == pytest.approx(0.011)
-        assert projected.queue_pressure == pytest.approx(0.04)
-        assert projected.total == pytest.approx(0.071)
+        assert projected.queue_pressure == pytest.approx(0.06)
+        assert projected.total == pytest.approx(0.091)
         assert set(projected.__dict__) == {
             "request_pressure",
             "token_pressure",
@@ -389,6 +400,17 @@ def test_load_score_ignores_reservations_and_projects_new_step_to_queue():
             "total",
         }
 
+        load.running = 4
+        handed_off = rebalancer._load_score(
+            target,
+            token_increment=0,
+            include_pending_request=False,
+        )
+        assert handed_off.request_pressure == pytest.approx(0.04)
+        assert handed_off.queue_pressure == pytest.approx(0.03)
+        assert handed_off.total == lagged.total
+
+        load.running = 2
         load.token_usage = 0.02
         usage_floor = rebalancer._load_score(
             target,
@@ -396,7 +418,7 @@ def test_load_score_ignores_reservations_and_projects_new_step_to_queue():
             include_pending_request=False,
         )
         assert usage_floor.token_pressure == pytest.approx(0.02)
-        assert usage_floor.total == pytest.approx(0.07)
+        assert usage_floor.total == pytest.approx(0.09)
 
     run(scenario())
 
@@ -3679,9 +3701,30 @@ def test_next_batch_trace_effective_base_includes_previous_live_ledger():
         assert engine["live_ledger_prefill"] == 40
         assert engine["base_requests"] == 0
         assert engine["base_tokens"] == 0
-        assert engine["base_queue"] == 0
+        assert engine["base_queue"] == 1
+        assert engine["queue_pressure"] == pytest.approx(0.01)
+        assert second.worker_url != first.worker_url
         await rebalancer.fail(first)
         await rebalancer.fail(second)
+
+        third_task = asyncio.create_task(
+            rebalancer.acquire(
+                session_id="baseline-third",
+                input_ids=[3] * 10,
+            )
+        )
+        await wait_for_condition(
+            lambda: sum(client.batch_load_calls.values()) == 3 * len(client.urls)
+        )
+        client.resolve_batch(2)
+        third = await third_task
+        released_trace = (await rebalancer.snapshot())["recent_load_batches"][-1]
+        assert all(
+            item["live_ledger_requests"] == 0
+            and item["base_queue"] == 0
+            for item in released_trace["engines"]
+        )
+        await rebalancer.fail(third)
 
     run(scenario())
 
