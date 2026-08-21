@@ -169,24 +169,24 @@ def _build_model(problem: BatchProblem) -> _Model:
         assignment_matrix[row, edge_indexes_by_session[session_id]] = 1.0
 
     token_matrix = np.zeros((engine_count, variable_count))
-    token_load_matrix = np.zeros((engine_count, variable_count))
-    queue_load_matrix = np.zeros((engine_count, variable_count))
+    load_matrix = np.zeros((engine_count, variable_count))
     token_upper = np.empty(engine_count)
-    queue_upper = np.empty(engine_count)
+    load_upper = np.empty(engine_count)
     for engine_index, engine in enumerate(problem.engines):
         token_matrix[engine_index, token_offset + engine_index] = -1.0
-        token_load_matrix[engine_index, token_offset + engine_index] = 1.0
-        token_load_matrix[engine_index, maximum_load_index] = -1.0
-        queue_load_matrix[engine_index, maximum_load_index] = -1.0
+        load_matrix[engine_index, token_offset + engine_index] = 1.0
+        load_matrix[engine_index, maximum_load_index] = -1.0
         token_upper[engine_index] = -engine.base_tokens / engine.token_capacity
-        queue_upper[engine_index] = -engine.base_queue / engine.request_capacity
+        load_upper[engine_index] = -(
+            engine.base_requests + engine.base_queue
+        ) / engine.request_capacity
     for edge_index, edge in enumerate(edges):
         engine_index = engine_indexes[edge.engine_url]
         engine = problem.engines[engine_index]
         token_matrix[engine_index, edge_index] = (
             edge.token_increment / engine.token_capacity
         )
-        queue_load_matrix[engine_index, edge_index] = (
+        load_matrix[engine_index, edge_index] = (
             edge.queue_increment / engine.request_capacity
         )
 
@@ -195,10 +195,6 @@ def _build_model(problem: BatchProblem) -> _Model:
     upper_bounds[:edge_count] = 1.0
     for engine_index, engine in enumerate(problem.engines):
         lower_bounds[token_offset + engine_index] = engine.token_usage
-    lower_bounds[maximum_load_index] = max(
-        engine.base_requests / engine.request_capacity
-        for engine in problem.engines
-    )
 
     return _Model(
         edges=edges,
@@ -206,8 +202,7 @@ def _build_model(problem: BatchProblem) -> _Model:
         constraints=(
             LinearConstraint(assignment_matrix, 1.0, 1.0),
             LinearConstraint(token_matrix, -np.inf, token_upper),
-            LinearConstraint(token_load_matrix, -np.inf, 0.0),
-            LinearConstraint(queue_load_matrix, -np.inf, queue_upper),
+            LinearConstraint(load_matrix, -np.inf, load_upper),
         ),
         bounds=Bounds(lower_bounds, upper_bounds),
         integrality=np.concatenate(
@@ -285,7 +280,7 @@ def _engine_loads(
         queue = (
             engine.base_queue + sum(edge.queue_increment for edge in assigned)
         ) / engine.request_capacity
-        loads.append(max(request, token, queue))
+        loads.append(request + token + queue)
     return tuple(loads)
 
 

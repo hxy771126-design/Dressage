@@ -2755,7 +2755,7 @@ class EngineRebalancer:
             request_pressure=request_pressure,
             token_pressure=token_pressure,
             queue_pressure=queue_pressure,
-            total=max(request_pressure, token_pressure, queue_pressure),
+            total=request_pressure + token_pressure + queue_pressure,
         )
 
     def _batch_trace(
@@ -3127,7 +3127,7 @@ class EngineRebalancer:
             request_pressure=request_pressure,
             token_pressure=token_pressure,
             queue_pressure=queue_pressure,
-            total=max(request_pressure, token_pressure, queue_pressure),
+            total=request_pressure + token_pressure + queue_pressure,
         )
 
     def _reserve(

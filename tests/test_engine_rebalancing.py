@@ -377,11 +377,11 @@ def test_load_score_ignores_reservations_and_projects_new_step_to_queue():
         assert base.request_pressure == pytest.approx(0.02)
         assert base.token_pressure == pytest.approx(0.01)
         assert base.queue_pressure == pytest.approx(0.03)
-        assert base.total == pytest.approx(0.03)
+        assert base.total == pytest.approx(0.06)
         assert projected.request_pressure == base.request_pressure
         assert projected.token_pressure == pytest.approx(0.011)
         assert projected.queue_pressure == pytest.approx(0.04)
-        assert projected.total == pytest.approx(0.04)
+        assert projected.total == pytest.approx(0.071)
         assert set(projected.__dict__) == {
             "request_pressure",
             "token_pressure",
@@ -396,6 +396,7 @@ def test_load_score_ignores_reservations_and_projects_new_step_to_queue():
             include_pending_request=False,
         )
         assert usage_floor.token_pressure == pytest.approx(0.02)
+        assert usage_floor.total == pytest.approx(0.07)
 
     run(scenario())
 

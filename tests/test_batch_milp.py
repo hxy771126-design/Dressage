@@ -81,7 +81,7 @@ def assignment_objectives(batch, selected_edges):
         queue = (
             baseline.base_queue + sum(edge.queue_increment for edge in assigned)
         ) / baseline.request_capacity
-        loads.append(max(request, token, queue))
+        loads.append(request + token + queue)
     return (
         max(loads),
         sum(
@@ -100,14 +100,14 @@ def target_assignment_objectives(batch, selected_edges):
     )
 
 
-def test_milp_uses_max_pressure_and_adds_new_steps_to_queue():
+def test_milp_sums_pressures_and_adds_new_steps_to_queue():
     module = solver_module()
     batch = module.BatchProblem(
         engines=(
             module.EngineBaseline(
                 url="a",
                 base_requests=4,
-                base_tokens=6,
+                base_tokens=7,
                 base_queue=3,
                 request_capacity=10,
                 token_capacity=10,
@@ -120,7 +120,7 @@ def test_milp_uses_max_pressure_and_adds_new_steps_to_queue():
                     session_id="s",
                     engine_url="a",
                     queue_increment=1,
-                    token_increment=1,
+                    token_increment=0,
                     prefill_increment=0,
                     voluntary_migration=False,
                 ),
@@ -130,8 +130,8 @@ def test_milp_uses_max_pressure_and_adds_new_steps_to_queue():
 
     result = module.solve_batch_milp(batch)
 
-    assert result.maximum_load == pytest.approx(0.7)
-    assert result.minimum_load == pytest.approx(0.7)
+    assert result.maximum_load == pytest.approx(1.5)
+    assert result.minimum_load == pytest.approx(1.5)
 
 
 def test_milp_balances_hand_derived_queue_load():
@@ -173,9 +173,9 @@ def test_milp_recomputes_load_with_token_usage_floor():
 
     result = solver_module().solve_batch_milp(batch)
 
-    assert result.maximum_load == pytest.approx(0.6)
+    assert result.maximum_load == pytest.approx(1.0)
     assert result.minimum_load == pytest.approx(0.1)
-    assert result.load_range == pytest.approx(0.5)
+    assert result.load_range == pytest.approx(0.9)
 
 
 def test_milp_recomputes_load_with_base_queue():
@@ -206,7 +206,7 @@ def test_milp_does_not_impose_a_unit_load_limit():
     result = solver_module().solve_batch_milp(batch)
 
     assert result.status is solver_module().SolverStatus.OPTIMAL
-    assert result.maximum_load == pytest.approx(1.5)
+    assert result.maximum_load == pytest.approx(2.0)
 
 
 def test_milp_uses_stable_hash_after_load_even_if_tie_migrates():
@@ -488,7 +488,7 @@ def test_greedy_never_migrates_when_an_owner_edge_exists():
     assert result.voluntary_migrations == 0
 
 
-def test_greedy_recomputes_selected_max_pressure():
+def test_greedy_recomputes_selected_summed_pressure():
     batch = problem(
         [engine("a", base_tokens=1), engine("b")],
         {
@@ -502,7 +502,7 @@ def test_greedy_recomputes_selected_max_pressure():
     result = solver_module().solve_batch_greedy(batch)
 
     assert result.assignment == {"s": "a"}
-    assert result.maximum_load == pytest.approx(0.3)
+    assert result.maximum_load == pytest.approx(0.4)
 
 
 def test_greedy_is_stable_across_session_and_edge_input_order():
