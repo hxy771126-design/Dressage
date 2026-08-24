@@ -10,11 +10,13 @@ BENCHMARK_WORKLOAD="${BENCHMARK_WORKLOAD:-dapo_long_tail}"
 case "${BENCHMARK_WORKLOAD}" in
   dapo_long_tail)
     BENCHMARK_BATCH_SIZE="${BENCHMARK_BATCH_SIZE:-64}"
+    DRESSAGE_PROXY_REQUEST_TIMEOUT_SEC="${DRESSAGE_PROXY_REQUEST_TIMEOUT_SEC:-300}"
     PROMPT_SOURCE="${BENCHMARK_PROMPT_DATA:-${LONG_TAIL_PROMPT_DATA:-${REPO_ROOT}/examples/data/dressage_dapo_prompts_step_balanced_${BENCHMARK_BATCH_SIZE}.jsonl}}"
     DEFAULT_BENCHMARK_ROOT="${REPO_ROOT}/log/benchmarks/engine_rebalancing"
     ;;
   repeat_multistep)
     BENCHMARK_BATCH_SIZE="${BENCHMARK_BATCH_SIZE:-256}"
+    DRESSAGE_PROXY_REQUEST_TIMEOUT_SEC="${DRESSAGE_PROXY_REQUEST_TIMEOUT_SEC:-1800}"
     if [[ -z "${BENCHMARK_PROMPT_DATA:-}" ]]; then
       echo "BENCHMARK_PROMPT_DATA is required for repeat_multistep" >&2
       exit 2
@@ -94,6 +96,7 @@ print_plan() {
   echo "  response max:  ${ROLLOUT_MAX_RESPONSE_LEN}"
   echo "  sandbox slots: ${DRESSAGE_BLACKBOX_SLOTS_PER_NODE}"
   echo "  slot timeout:  ${DRESSAGE_BLACKBOX_ACQUIRE_TIMEOUT_SEC}"
+  echo "  request timeout: ${DRESSAGE_PROXY_REQUEST_TIMEOUT_SEC} seconds"
   echo "  Blackbox max steps: ${DRESSAGE_BLACKBOX_MAX_STEPS}"
   echo "  Proxy max session steps: ${DRESSAGE_PROXY_MAX_STEPS_PER_SESSION}"
   echo "  generate function: ${CUSTOM_GENERATE_FUNCTION_PATH}"
@@ -125,6 +128,10 @@ if [[ "${BENCHMARK_DRY_RUN}" != "0" && "${BENCHMARK_DRY_RUN}" != "1" ]]; then
 fi
 if [[ ! "${BENCHMARK_BATCH_SIZE}" =~ ^[1-9][0-9]*$ ]]; then
   echo "BENCHMARK_BATCH_SIZE must be a positive integer" >&2
+  exit 2
+fi
+if [[ ! "${DRESSAGE_PROXY_REQUEST_TIMEOUT_SEC}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "DRESSAGE_PROXY_REQUEST_TIMEOUT_SEC must be a positive integer" >&2
   exit 2
 fi
 if [[ ! "${ENGINE_REBALANCING_LOAD_BATCH_COALESCING_WINDOW_MS}" =~ ^[0-9]+$ ]]; then
@@ -235,6 +242,7 @@ record_environment() {
     "${DRESSAGE_PADDOCK_MODE}" \
     "${DRESSAGE_LOG_WRITE_MODE}" \
     "${DRESSAGE_REPEAT_MULTISTEP_TOOL_DELAY_MS}" \
+    "${DRESSAGE_PROXY_REQUEST_TIMEOUT_SEC}" \
     "${CONTEXT_WINDOW:-default}" \
     "${SGLANG_CONTEXT_LENGTH:-default}" \
     "${MOONCAKE_GLOBAL_SEGMENT_SIZE}" \
@@ -276,6 +284,7 @@ from collections import Counter
     paddock_mode,
     log_write_mode,
     repeat_tool_delay_ms,
+    proxy_request_timeout_sec,
     context_window,
     sglang_context_length,
     mooncake_global_segment_size,
@@ -421,6 +430,7 @@ values = {
     "paddock_mode": paddock_mode,
     "log_write_mode": log_write_mode,
     "repeat_tool_delay_ms": repeat_tool_delay_ms,
+    "proxy_request_timeout_sec": proxy_request_timeout_sec,
     "context_window": context_window,
     "sglang_context_length": sglang_context_length,
     "mooncake_global_segment_size": mooncake_global_segment_size,
@@ -1515,6 +1525,7 @@ run_one() {
     export DRESSAGE_LOCAL_BWRAP_AUTO_START
     export DRESSAGE_BLACKBOX_RUNNER_MODE
     export DRESSAGE_REPEAT_MULTISTEP_TOOL_DELAY_MS
+    export DRESSAGE_PROXY_REQUEST_TIMEOUT_SEC
     export CUSTOM_GENERATE_FUNCTION_PATH
     export MODEL_REASONING_TYPE
     export REASONING_PARSE_BACKEND

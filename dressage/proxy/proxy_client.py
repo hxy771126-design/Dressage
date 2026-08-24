@@ -2,9 +2,26 @@
 
 from __future__ import annotations
 
+import math
+import os
 from typing import Any, Mapping
 
 import httpx
+
+
+def _default_request_timeout() -> httpx.Timeout:
+    raw_value = os.environ.get("DRESSAGE_PROXY_REQUEST_TIMEOUT_SEC", "300")
+    try:
+        seconds = float(raw_value)
+    except ValueError as exc:
+        raise ValueError(
+            "DRESSAGE_PROXY_REQUEST_TIMEOUT_SEC must be a positive finite number"
+        ) from exc
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise ValueError(
+            "DRESSAGE_PROXY_REQUEST_TIMEOUT_SEC must be a positive finite number"
+        )
+    return httpx.Timeout(seconds, connect=10.0)
 
 
 class ProxyClient:
@@ -24,11 +41,17 @@ class ProxyClient:
             str(key): str(value) for key, value in (default_headers or {}).items()
         }
         self._owns_client = client is None
-        self._client = client or httpx.AsyncClient(
-            timeout=timeout or httpx.Timeout(300.0, connect=10.0),
-            trust_env=False,
-            verify=verify,
-        )
+        if client is not None:
+            self._client = client
+        else:
+            effective_timeout = (
+                timeout if timeout is not None else _default_request_timeout()
+            )
+            self._client = httpx.AsyncClient(
+                timeout=effective_timeout,
+                trust_env=False,
+                verify=verify,
+            )
 
     def _headers(self, extra: Mapping[str, str] | None = None) -> dict[str, str]:
         headers = dict(self._default_headers)

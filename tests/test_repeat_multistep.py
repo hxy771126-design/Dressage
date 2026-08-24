@@ -400,17 +400,19 @@ def test_repeat_benchmark_dry_run_uses_whitebox_limits(
     prompt = REPO_ROOT / "examples" / "data" / (
         "dressage_repeat_multistep_4k_52_256.jsonl"
     )
+    env = {
+        **os.environ,
+        "BENCHMARK_DRY_RUN": "1",
+        "BENCHMARK_ROOT": str(tmp_path / model),
+        "BENCHMARK_WORKLOAD": "repeat_multistep",
+        "BENCHMARK_PROMPT_DATA": str(prompt),
+        "DRESSAGE_REPEAT_MULTISTEP_TOOL_DELAY_MS": "200",
+    }
+    env.pop("DRESSAGE_PROXY_REQUEST_TIMEOUT_SEC", None)
     result = subprocess.run(
         ["bash", str(script)],
         cwd=REPO_ROOT,
-        env={
-            **os.environ,
-            "BENCHMARK_DRY_RUN": "1",
-            "BENCHMARK_ROOT": str(tmp_path / model),
-            "BENCHMARK_WORKLOAD": "repeat_multistep",
-            "BENCHMARK_PROMPT_DATA": str(prompt),
-            "DRESSAGE_REPEAT_MULTISTEP_TOOL_DELAY_MS": "200",
-        },
+        env=env,
         check=False,
         capture_output=True,
         text=True,
@@ -430,7 +432,83 @@ def test_repeat_benchmark_dry_run_uses_whitebox_limits(
     assert "Paddock mode:  whitebox" in result.stdout
     assert "log write mode:await" in result.stdout
     assert "tool delay:    200 ms" in result.stdout
+    assert "request timeout: 1800 seconds" in result.stdout
     assert "context window: 262144" in result.stdout
     assert "SGLang context: 262144" in result.stdout
     assert f"Mooncake size: {mooncake_size}" in result.stdout
     assert not (tmp_path / model).exists()
+
+
+def test_repeat_benchmark_dry_run_accepts_request_timeout_override(tmp_path):
+    script = REPO_ROOT / "examples" / "scripts" / (
+        "benchmark_engine_rebalancing_qwen3.5_4b_sync_local_l3_hicache.sh"
+    )
+    prompt = REPO_ROOT / "examples" / "data" / (
+        "dressage_repeat_multistep_4k_52_256.jsonl"
+    )
+    result = subprocess.run(
+        ["bash", str(script)],
+        cwd=REPO_ROOT,
+        env={
+            **os.environ,
+            "BENCHMARK_DRY_RUN": "1",
+            "BENCHMARK_ROOT": str(tmp_path / "override"),
+            "BENCHMARK_WORKLOAD": "repeat_multistep",
+            "BENCHMARK_PROMPT_DATA": str(prompt),
+            "DRESSAGE_PROXY_REQUEST_TIMEOUT_SEC": "3600",
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "request timeout: 3600 seconds" in result.stdout
+    assert not (tmp_path / "override").exists()
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "1.5", "invalid"])
+def test_repeat_benchmark_rejects_invalid_request_timeout(tmp_path, value):
+    script = REPO_ROOT / "examples" / "scripts" / (
+        "benchmark_engine_rebalancing_qwen3.5_4b_sync_local_l3_hicache.sh"
+    )
+    prompt = REPO_ROOT / "examples" / "data" / (
+        "dressage_repeat_multistep_4k_52_256.jsonl"
+    )
+    output = tmp_path / value.replace("/", "_")
+    result = subprocess.run(
+        ["bash", str(script)],
+        cwd=REPO_ROOT,
+        env={
+            **os.environ,
+            "BENCHMARK_DRY_RUN": "1",
+            "BENCHMARK_ROOT": str(output),
+            "BENCHMARK_WORKLOAD": "repeat_multistep",
+            "BENCHMARK_PROMPT_DATA": str(prompt),
+            "DRESSAGE_PROXY_REQUEST_TIMEOUT_SEC": value,
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 2
+    assert "DRESSAGE_PROXY_REQUEST_TIMEOUT_SEC must be a positive integer" in (
+        result.stderr
+    )
+    assert not output.exists()
+
+
+def test_repeat_runners_forward_request_timeout_through_ray_runtime_env():
+    for model in ("qwen3.5_4b", "qwen3.5_35b_a3b"):
+        script = REPO_ROOT / "examples" / "scripts" / (
+            f"run_blackbox_{model}_sync_local_l3_hicache.sh"
+        )
+        source = script.read_text(encoding="utf-8")
+        runtime_env = source[
+            source.index("RUNTIME_ENV_JSON=") : source.index("ray job submit")
+        ]
+        assert (
+            '"DRESSAGE_PROXY_REQUEST_TIMEOUT_SEC": '
+            '"${DRESSAGE_PROXY_REQUEST_TIMEOUT_SEC:-300}"'
+        ) in runtime_env

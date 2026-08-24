@@ -6264,18 +6264,20 @@ def test_engine_rebalancing_benchmark_defaults_to_one_off_on_pair(tmp_path):
         "examples/scripts/benchmark_engine_rebalancing_qwen3.5_4b_sync_local_l3_hicache.sh"
     )
     source = path.read_text()
+    env = {
+        **os.environ,
+        "BENCHMARK_DRY_RUN": "1",
+        "BENCHMARK_ROOT": str(tmp_path / "benchmark"),
+        "BENCHMARK_SEED": "20260806",
+        "PROMPT_DATA": str(
+            Path("examples/data/dressage_dapo_prompts_dynamic_multi.jsonl")
+        ),
+    }
+    env.pop("DRESSAGE_PROXY_REQUEST_TIMEOUT_SEC", None)
     result = subprocess.run(
         ["bash", str(path)],
         cwd=Path.cwd(),
-        env={
-            **os.environ,
-            "BENCHMARK_DRY_RUN": "1",
-            "BENCHMARK_ROOT": str(tmp_path / "benchmark"),
-            "BENCHMARK_SEED": "20260806",
-            "PROMPT_DATA": str(
-                Path("examples/data/dressage_dapo_prompts_dynamic_multi.jsonl")
-            ),
-        },
+        env=env,
         check=False,
         capture_output=True,
         text=True,
@@ -6289,6 +6291,7 @@ def test_engine_rebalancing_benchmark_defaults_to_one_off_on_pair(tmp_path):
     assert "response max:  12288" in result.stdout
     assert "sandbox slots: 24" in result.stdout
     assert "slot timeout:  3600" in result.stdout
+    assert "request timeout: 300 seconds" in result.stdout
     assert "Mooncake size: 24gb" in result.stdout
     assert "load batch window: 60 ms" in result.stdout
     assert "min load improvement ratio: 0.10" in result.stdout
@@ -7069,6 +7072,7 @@ def test_engine_rebalancing_benchmark_environment_records_prompt_fingerprints(
         "blackbox",
         "background",
         "0",
+        "300",
         "65536",
         "default",
         "16gb",
@@ -7101,6 +7105,7 @@ def test_engine_rebalancing_benchmark_environment_records_prompt_fingerprints(
         "dressage.rollout.generate.blackbox_dispatch.generate"
     )
     assert environment["context_window"] == "65536"
+    assert environment["proxy_request_timeout_sec"] == "300"
     assert environment["load_batch_coalescing_window_ms"] == "125"
     assert environment["min_load_improvement_ratio"] == "0.05"
     assert environment["engine_load_snapshot_interval_seconds"] == "5"

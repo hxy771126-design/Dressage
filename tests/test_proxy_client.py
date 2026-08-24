@@ -56,7 +56,9 @@ def test_proxy_client_sends_default_headers_and_reads_capabilities():
     assert requests[0].headers["x-instance-id"] == "instance-1"
 
 
-def test_proxy_client_default_timeout_is_bounded():
+def test_proxy_client_default_timeout_is_bounded(monkeypatch):
+    monkeypatch.delenv("DRESSAGE_PROXY_REQUEST_TIMEOUT_SEC", raising=False)
+
     async def run_test() -> tuple[float | None, float | None]:
         client = ProxyClient("http://proxy.test")
         try:
@@ -68,6 +70,71 @@ def test_proxy_client_default_timeout_is_bounded():
 
     assert connect == 10.0
     assert read == 300.0
+
+
+def test_proxy_client_uses_request_timeout_from_environment(monkeypatch):
+    monkeypatch.setenv("DRESSAGE_PROXY_REQUEST_TIMEOUT_SEC", "1800")
+
+    async def run_test() -> tuple[float | None, float | None]:
+        client = ProxyClient("http://proxy.test")
+        try:
+            return client._client.timeout.connect, client._client.timeout.read
+        finally:
+            await client.close()
+
+    connect, read = asyncio.run(run_test())
+
+    assert connect == 10.0
+    assert read == 1800.0
+
+
+def test_proxy_client_explicit_timeout_overrides_environment(monkeypatch):
+    monkeypatch.setenv("DRESSAGE_PROXY_REQUEST_TIMEOUT_SEC", "invalid")
+
+    async def run_test() -> tuple[float | None, float | None]:
+        client = ProxyClient(
+            "http://proxy.test",
+            timeout=httpx.Timeout(45.0, connect=5.0),
+        )
+        try:
+            return client._client.timeout.connect, client._client.timeout.read
+        finally:
+            await client.close()
+
+    connect, read = asyncio.run(run_test())
+
+    assert connect == 5.0
+    assert read == 45.0
+
+
+def test_proxy_client_injected_client_does_not_parse_timeout_environment(
+    monkeypatch,
+):
+    monkeypatch.setenv("DRESSAGE_PROXY_REQUEST_TIMEOUT_SEC", "invalid")
+
+    async def run_test() -> None:
+        async with httpx.AsyncClient() as http_client:
+            client = ProxyClient("http://proxy.test", client=http_client)
+            assert client._client is http_client
+
+    asyncio.run(run_test())
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["0", "-1", "nan", "inf", "-inf", "not-a-number"],
+)
+def test_proxy_client_rejects_invalid_request_timeout_environment(
+    monkeypatch,
+    value,
+):
+    monkeypatch.setenv("DRESSAGE_PROXY_REQUEST_TIMEOUT_SEC", value)
+
+    with pytest.raises(
+        ValueError,
+        match="DRESSAGE_PROXY_REQUEST_TIMEOUT_SEC must be a positive finite number",
+    ):
+        ProxyClient("http://proxy.test")
 
 
 def test_proxy_client_discards_session_context_with_delete_and_checks_status():
