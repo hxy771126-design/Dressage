@@ -6413,8 +6413,9 @@ def test_engine_rebalancing_benchmark_samples_long_tail_dataset_once():
     assert source.count(prepare_call) == 1
     assert 'python3 "${LONG_TAIL_TOOL}" sample' in source
     assert "prepare_long_tail_prompts" not in run_one
-    assert "ROLLOUT_BATCH_SIZE=64" in source
-    assert "GLOBAL_BATCH_SIZE=64" in source
+    assert 'BENCHMARK_BATCH_SIZE="${BENCHMARK_BATCH_SIZE:-64}"' in source
+    assert 'ROLLOUT_BATCH_SIZE="${BENCHMARK_BATCH_SIZE}"' in source
+    assert 'GLOBAL_BATCH_SIZE="${BENCHMARK_BATCH_SIZE}"' in source
     assert '--sample-size "${ROLLOUT_BATCH_SIZE}"' in source
     assert "ROLLOUT_MAX_RESPONSE_LEN=12288" in source
     assert "DRESSAGE_BLACKBOX_SLOTS_PER_NODE=24" in source
@@ -7052,6 +7053,7 @@ def test_engine_rebalancing_benchmark_environment_records_prompt_fingerprints(
         str(output),
         "seed20260806-off-r1",
         "off",
+        "dapo_long_tail",
         "20260806",
         "0",
         "256",
@@ -7061,6 +7063,14 @@ def test_engine_rebalancing_benchmark_environment_records_prompt_fingerprints(
         "16",
         "3600",
         "20",
+        "0",
+        "dressage.rollout.generate.blackbox_dispatch.generate",
+        "",
+        "blackbox",
+        "background",
+        "0",
+        "65536",
+        "default",
         "16gb",
         "125",
         "0.05",
@@ -7086,6 +7096,11 @@ def test_engine_rebalancing_benchmark_environment_records_prompt_fingerprints(
     assert environment["rollout_max_response_len"] == "12288"
     assert environment["sandbox_slots_per_node"] == "16"
     assert environment["sandbox_acquire_timeout_sec"] == "3600"
+    assert environment["benchmark_workload"] == "dapo_long_tail"
+    assert environment["generate_function_path"] == (
+        "dressage.rollout.generate.blackbox_dispatch.generate"
+    )
+    assert environment["context_window"] == "65536"
     assert environment["load_batch_coalescing_window_ms"] == "125"
     assert environment["min_load_improvement_ratio"] == "0.05"
     assert environment["engine_load_snapshot_interval_seconds"] == "5"
@@ -7561,11 +7576,13 @@ def _write_benchmark_sample(
     instance_id: str,
     sampling_seed: int | None,
     segment_index: int,
+    metadata_overrides: dict | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     metadata = {}
     if sampling_seed is not None:
         metadata["rollout_sampling_seed"] = sampling_seed
+    metadata.update(metadata_overrides or {})
     path.write_text(
         json.dumps(
             {
@@ -7580,6 +7597,158 @@ def _write_benchmark_sample(
         ),
         encoding="utf-8",
     )
+
+
+def test_repeat_benchmark_collector_records_complete_trajectory_health(tmp_path):
+    step_distribution = [1] * 216 + [8] + [52] * 39
+    samples = tmp_path / "runtime" / "traj_payload" / "run" / "samples"
+    for index, planned_steps in enumerate(step_distribution):
+        _write_benchmark_sample(
+            samples / f"{index:03d}.json",
+            instance_id=f"repeat-{index:03d}",
+            sampling_seed=11,
+            segment_index=0,
+            metadata_overrides={
+                "planned_model_steps": planned_steps,
+                "attempted_model_steps": planned_steps,
+                "actual_model_steps": planned_steps,
+                "failed_step_count": 0,
+                "truncated_step_count": 0,
+                "protocol_success": True,
+                "repeat_tool_delay_ms": 0,
+            },
+        )
+    tmp_path.joinpath("run.log").write_text(
+        "[2026-08-24 12:00:00] perf 0: "
+        "{'perf/rollout_time': 10.0, "
+        "'perf/effective_tokens_per_gpu_per_sec': 1.0}\n",
+        encoding="utf-8",
+    )
+    tmp_path.joinpath("environment.txt").write_text(
+        "benchmark_workload=repeat_multistep\n"
+        "rollout_batch_size=256\n"
+        "prompt_effective_planned_model_steps_total=2252\n"
+        "prompt_effective_sha256=dataset-sha\n"
+        "prompt_effective_workload_distribution_json={\"steps:1\":216,\"steps:8\":1,\"steps:52\":39}\n"
+        "generate_function_path=dressage.recipes.repeat_multistep.agent_whitebox.generate\n"
+        "repeat_tool_delay_ms=0\n"
+        "context_window=262144\n"
+        "sglang_context_length=262144\n"
+        "gpu_count=8\n"
+        "hostname=test\n"
+        "gpu_inventory_sha256=gpu\n"
+        "code_fingerprint=code\n",
+        encoding="utf-8",
+    )
+
+    result = _run_benchmark_heredoc(
+        "collect_run", str(tmp_path), "run", "off", "0", "1", "2", "1"
+    )
+
+    assert result.returncode == 0, result.stderr
+    metrics = json.loads((tmp_path / "metrics.json").read_text(encoding="utf-8"))
+    assert metrics["repeat_workload"] == {
+        "actual_model_steps_total": 2252,
+        "attempted_model_steps_total": 2252,
+        "failed_step_count": 0,
+        "planned_model_steps_total": 2252,
+        "protocol_failure_count": 0,
+        "rebalancing_batch_id_count": 0,
+        "trajectory_health": {
+            f"repeat-{index:03d}": {
+                "actual_model_steps": planned_steps,
+                "attempted_model_steps": planned_steps,
+                "failed_step_count": 0,
+                "planned_model_steps": planned_steps,
+                "protocol_success": True,
+                "repeat_tool_delay_ms": 0,
+                "truncated_step_count": 0,
+            }
+            for index, planned_steps in enumerate(step_distribution)
+        },
+        "trajectory_health_count": 256,
+        "truncated_step_count": 0,
+    }
+    assert not any(
+        "repeat workload" in error for error in metrics["acceptance_errors"]
+    )
+    assert metrics["workload"] == {
+        "benchmark_workload": "repeat_multistep",
+        "context_window": "262144",
+        "generate_function_path": (
+            "dressage.recipes.repeat_multistep.agent_whitebox.generate"
+        ),
+        "planned_model_steps_total": "2252",
+        "prompt_effective_sha256": "dataset-sha",
+        "repeat_tool_delay_ms": "0",
+        "sglang_context_length": "262144",
+        "step_distribution_json": (
+            '{"steps:1":216,"steps:8":1,"steps:52":39}'
+        ),
+    }
+
+
+def test_repeat_benchmark_collector_requires_batch_ids_and_natural_batch(tmp_path):
+    _write_tail_metric_fixture(tmp_path)
+    tmp_path.joinpath("environment.txt").write_text(
+        "benchmark_workload=repeat_multistep\n"
+        "rollout_batch_size=256\n"
+        "prompt_effective_planned_model_steps_total=2252\n"
+        "gpu_count=8\n",
+        encoding="utf-8",
+    )
+    session_path = (
+        tmp_path / "runtime" / "traj_payload" / "run" / "alpha" / "session.json"
+    )
+    session = json.loads(session_path.read_text(encoding="utf-8"))
+    for metric in session["data"][0]["extra_info"]["request_metrics"]:
+        metric.pop("rebalancing_batch_id")
+    session_path.write_text(json.dumps(session), encoding="utf-8")
+    snapshot_path = tmp_path / "engine_load_snapshots.jsonl"
+    snapshots = [
+        json.loads(line) for line in snapshot_path.read_text(encoding="utf-8").splitlines()
+    ]
+    for snapshot in snapshots:
+        for trace in snapshot["payload"]["recent_load_batches"]:
+            trace["batch"]["registered_count"] = 1
+    snapshot_path.write_text(
+        "".join(json.dumps(snapshot) + "\n" for snapshot in snapshots),
+        encoding="utf-8",
+    )
+
+    result = _run_benchmark_heredoc(
+        "collect_run", str(tmp_path), "run", "on", "0", "1", "2", "1"
+    )
+
+    assert result.returncode == 0, result.stderr
+    errors = json.loads((tmp_path / "metrics.json").read_text(encoding="utf-8"))[
+        "acceptance_errors"
+    ]
+    assert "repeat workload ON requests missing rebalancing batch IDs: 5/5" in errors
+    assert "repeat workload observed no natural multi-step load batch" in errors
+
+
+def test_benchmark_collector_rejects_context_overflow(tmp_path):
+    _write_benchmark_sample(
+        tmp_path / "runtime" / "traj_payload" / "run" / "samples" / "a.json",
+        instance_id="alpha",
+        sampling_seed=11,
+        segment_index=0,
+    )
+    tmp_path.joinpath("run.log").write_text(
+        "request rejected: input exceeds maximum context length\n",
+        encoding="utf-8",
+    )
+
+    result = _run_benchmark_heredoc(
+        "collect_run", str(tmp_path), "run", "off", "0", "1", "2", "1"
+    )
+
+    assert result.returncode == 0, result.stderr
+    errors = json.loads((tmp_path / "metrics.json").read_text(encoding="utf-8"))[
+        "acceptance_errors"
+    ]
+    assert any("detected context_overflow" in error for error in errors)
 
 
 def _collect_benchmark_run(run_dir: Path) -> dict:

@@ -6,26 +6,72 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 REPO_ROOT="${REPO_ROOT:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 SOURCE_RECIPE="${SCRIPT_DIR}/run_blackbox_qwen3.5_35b_a3b_sync_local_l3_hicache.sh"
 LONG_TAIL_TOOL="${REPO_ROOT}/examples/data/prepare_dapo_long_tail.py"
-BENCHMARK_ROOT="${BENCHMARK_ROOT:-${REPO_ROOT}/log/benchmarks/engine_rebalancing_qwen35b_tp2}"
-PROMPT_SOURCE="${LONG_TAIL_PROMPT_DATA:-${REPO_ROOT}/examples/data/dressage_dapo_prompts_step_balanced_64.jsonl}"
+BENCHMARK_WORKLOAD="${BENCHMARK_WORKLOAD:-dapo_long_tail}"
+case "${BENCHMARK_WORKLOAD}" in
+  dapo_long_tail)
+    BENCHMARK_BATCH_SIZE="${BENCHMARK_BATCH_SIZE:-64}"
+    PROMPT_SOURCE="${BENCHMARK_PROMPT_DATA:-${LONG_TAIL_PROMPT_DATA:-${REPO_ROOT}/examples/data/dressage_dapo_prompts_step_balanced_${BENCHMARK_BATCH_SIZE}.jsonl}}"
+    DEFAULT_BENCHMARK_ROOT="${REPO_ROOT}/log/benchmarks/engine_rebalancing_qwen35b_tp2"
+    ;;
+  repeat_multistep)
+    BENCHMARK_BATCH_SIZE="${BENCHMARK_BATCH_SIZE:-256}"
+    if [[ -z "${BENCHMARK_PROMPT_DATA:-}" ]]; then
+      echo "BENCHMARK_PROMPT_DATA is required for repeat_multistep" >&2
+      exit 2
+    fi
+    PROMPT_SOURCE="${BENCHMARK_PROMPT_DATA}"
+    DEFAULT_BENCHMARK_ROOT="${REPO_ROOT}/log/benchmarks/engine_rebalancing_qwen35b_tp2_repeat_multistep_bs${BENCHMARK_BATCH_SIZE}"
+    ;;
+  *)
+    echo "BENCHMARK_WORKLOAD must be dapo_long_tail or repeat_multistep" >&2
+    exit 2
+    ;;
+esac
+BENCHMARK_ROOT="${BENCHMARK_ROOT:-${DEFAULT_BENCHMARK_ROOT}}"
 PROMPT_EFFECTIVE="${BENCHMARK_ROOT}/prompts.deterministic.jsonl"
 
 BENCHMARK_SEED="${BENCHMARK_SEED:-20260806}"
 BENCHMARK_DRY_RUN="${BENCHMARK_DRY_RUN:-0}"
 ENGINE_REBALANCING_LOAD_BATCH_COALESCING_WINDOW_MS="${ENGINE_REBALANCING_LOAD_BATCH_COALESCING_WINDOW_MS:-60}"
 ENGINE_REBALANCING_MIN_LOAD_IMPROVEMENT_RATIO="${ENGINE_REBALANCING_MIN_LOAD_IMPROVEMENT_RATIO:-0.10}"
+DRESSAGE_REPEAT_MULTISTEP_TOOL_DELAY_MS="${DRESSAGE_REPEAT_MULTISTEP_TOOL_DELAY_MS:-0}"
 
-# These values intentionally are not tunable in the A/B benchmark. Keeping the
-# workload fixed is part of the validity check.
 ROLLOUT_TEMPERATURE=0
-ROLLOUT_BATCH_SIZE=64
 N_SAMPLES_PER_PROMPT=1
-GLOBAL_BATCH_SIZE=64
-ROLLOUT_MAX_RESPONSE_LEN=12288
-DRESSAGE_BLACKBOX_SLOTS_PER_NODE=16
+ROLLOUT_BATCH_SIZE="${BENCHMARK_BATCH_SIZE}"
+GLOBAL_BATCH_SIZE="${BENCHMARK_BATCH_SIZE}"
 DRESSAGE_BLACKBOX_ACQUIRE_TIMEOUT_SEC=3600
 DRESSAGE_BLACKBOX_MAX_STEPS=20
-MOONCAKE_GLOBAL_SEGMENT_SIZE=24gb
+CUSTOM_GENERATE_FUNCTION_PATH="dressage.rollout.generate.blackbox_dispatch.generate"
+DRESSAGE_PROXY_MAX_STEPS_PER_SESSION=0
+DRESSAGE_LOG_WRITE_MODE=background
+DRESSAGE_REWARD_MODULES=""
+DRESSAGE_PADDOCK_MODE=blackbox
+DRESSAGE_LOCAL_BWRAP_AUTO_START=1
+DRESSAGE_BLACKBOX_RUNNER_MODE=bwrap
+MODEL_REASONING_TYPE=""
+REASONING_PARSE_BACKEND=sglang_api
+SGLANG_CONTEXT_LENGTH=""
+
+if [[ "${BENCHMARK_WORKLOAD}" == "repeat_multistep" ]]; then
+  ROLLOUT_MAX_RESPONSE_LEN=6400
+  DRESSAGE_BLACKBOX_SLOTS_PER_NODE=0
+  MOONCAKE_GLOBAL_SEGMENT_SIZE=128gb
+  CUSTOM_GENERATE_FUNCTION_PATH="dressage.recipes.repeat_multistep.agent_whitebox.generate"
+  DRESSAGE_PROXY_MAX_STEPS_PER_SESSION=100
+  DRESSAGE_LOG_WRITE_MODE=await
+  DRESSAGE_REWARD_MODULES="dressage.recipes.repeat_multistep.reward"
+  DRESSAGE_PADDOCK_MODE=whitebox
+  DRESSAGE_LOCAL_BWRAP_AUTO_START=0
+  DRESSAGE_BLACKBOX_RUNNER_MODE=disabled
+  MODEL_REASONING_TYPE=qwen3
+  CONTEXT_WINDOW=262144
+  SGLANG_CONTEXT_LENGTH=262144
+else
+  ROLLOUT_MAX_RESPONSE_LEN=12288
+  DRESSAGE_BLACKBOX_SLOTS_PER_NODE=16
+  MOONCAKE_GLOBAL_SEGMENT_SIZE=24gb
+fi
 MODEL_PATH="${BASE_FOLDER:-/root}/Qwen3.5-35B-A3B"
 ROLLOUT_NUM_GPUS_PER_ENGINE=2
 EXPECTED_ENGINE_COUNT=4
@@ -41,6 +87,7 @@ print_plan() {
   echo "Engine Rebalancing A/B benchmark"
   echo "  source recipe: ${SOURCE_RECIPE}"
   echo "  output root:   ${BENCHMARK_ROOT}"
+  echo "  workload:      ${BENCHMARK_WORKLOAD}"
   echo "  prompt source: ${PROMPT_SOURCE}"
   echo "  prompt data:   ${PROMPT_EFFECTIVE}"
   echo "  seed:          ${BENCHMARK_SEED}"
@@ -52,6 +99,13 @@ print_plan() {
   echo "  sandbox slots: ${DRESSAGE_BLACKBOX_SLOTS_PER_NODE}"
   echo "  slot timeout:  ${DRESSAGE_BLACKBOX_ACQUIRE_TIMEOUT_SEC}"
   echo "  Blackbox max steps: ${DRESSAGE_BLACKBOX_MAX_STEPS}"
+  echo "  Proxy max session steps: ${DRESSAGE_PROXY_MAX_STEPS_PER_SESSION}"
+  echo "  generate function: ${CUSTOM_GENERATE_FUNCTION_PATH}"
+  echo "  Paddock mode:  ${DRESSAGE_PADDOCK_MODE}"
+  echo "  log write mode:${DRESSAGE_LOG_WRITE_MODE}"
+  echo "  tool delay:    ${DRESSAGE_REPEAT_MULTISTEP_TOOL_DELAY_MS} ms"
+  echo "  context window: ${CONTEXT_WINDOW:-default}"
+  echo "  SGLang context: ${SGLANG_CONTEXT_LENGTH:-default}"
   echo "  Mooncake size: ${MOONCAKE_GLOBAL_SEGMENT_SIZE}"
   echo "  model:         ${MODEL_PATH}"
   echo "  GPUs/engine:   ${ROLLOUT_NUM_GPUS_PER_ENGINE}"
@@ -77,8 +131,16 @@ if [[ "${BENCHMARK_DRY_RUN}" != "0" && "${BENCHMARK_DRY_RUN}" != "1" ]]; then
   echo "BENCHMARK_DRY_RUN must be 0 or 1" >&2
   exit 2
 fi
+if [[ ! "${BENCHMARK_BATCH_SIZE}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "BENCHMARK_BATCH_SIZE must be a positive integer" >&2
+  exit 2
+fi
 if [[ ! "${ENGINE_REBALANCING_LOAD_BATCH_COALESCING_WINDOW_MS}" =~ ^[0-9]+$ ]]; then
   echo "ENGINE_REBALANCING_LOAD_BATCH_COALESCING_WINDOW_MS must be a non-negative integer" >&2
+  exit 2
+fi
+if [[ ! "${DRESSAGE_REPEAT_MULTISTEP_TOOL_DELAY_MS}" =~ ^[0-9]+$ ]]; then
+  echo "DRESSAGE_REPEAT_MULTISTEP_TOOL_DELAY_MS must be a non-negative integer" >&2
   exit 2
 fi
 if [[ ! "${ENGINE_REBALANCING_MIN_LOAD_IMPROVEMENT_RATIO}" =~ ^(0([.][0-9]+)?|1([.]0+)?)$ ]]; then
@@ -90,9 +152,20 @@ if [[ ! -f "${SOURCE_RECIPE}" ]]; then
   echo "Cannot find source recipe: ${SOURCE_RECIPE}" >&2
   exit 1
 fi
-if [[ ! -f "${LONG_TAIL_TOOL}" ]]; then
+if [[ "${BENCHMARK_WORKLOAD}" == "dapo_long_tail" && ! -f "${LONG_TAIL_TOOL}" ]]; then
   echo "Cannot find long-tail preparation tool: ${LONG_TAIL_TOOL}" >&2
   exit 1
+fi
+if [[ ! -f "${PROMPT_SOURCE}" ]]; then
+  echo "Cannot find prompt dataset: ${PROMPT_SOURCE}" >&2
+  exit 1
+fi
+if [[ "${BENCHMARK_WORKLOAD}" == "repeat_multistep" ]]; then
+  PROMPT_ROW_COUNT="$(wc -l <"${PROMPT_SOURCE}" | tr -d '[:space:]')"
+  if [[ "${PROMPT_ROW_COUNT}" != "${BENCHMARK_BATCH_SIZE}" ]]; then
+    echo "Repeat dataset must contain ${BENCHMARK_BATCH_SIZE} rows, found ${PROMPT_ROW_COUNT}" >&2
+    exit 2
+  fi
 fi
 
 print_plan
@@ -101,7 +174,7 @@ if [[ "${BENCHMARK_DRY_RUN}" == "1" ]]; then
   exit 0
 fi
 
-for command_name in python3 git curl tee; do
+for command_name in python3 git curl tee cp; do
   if ! command -v "${command_name}" >/dev/null 2>&1; then
     echo "Missing required command: ${command_name}" >&2
     exit 1
@@ -132,7 +205,11 @@ prepare_long_tail_prompts() {
     --sample-size "${ROLLOUT_BATCH_SIZE}"
 }
 
-prepare_long_tail_prompts "${PROMPT_SOURCE}" "${PROMPT_EFFECTIVE}" "${BENCHMARK_SEED}"
+if [[ "${BENCHMARK_WORKLOAD}" == "repeat_multistep" ]]; then
+  cp -- "${PROMPT_SOURCE}" "${PROMPT_EFFECTIVE}"
+else
+  prepare_long_tail_prompts "${PROMPT_SOURCE}" "${PROMPT_EFFECTIVE}" "${BENCHMARK_SEED}"
+fi
 TEMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/dressage-rebalancing-benchmark.XXXXXX")"
 trap 'rm -rf -- "${TEMP_DIR}"' EXIT
 
@@ -150,6 +227,7 @@ record_environment() {
     "${output_path}" \
     "${run_name}" \
     "${mode}" \
+    "${BENCHMARK_WORKLOAD}" \
     "${BENCHMARK_SEED}" \
     "${ROLLOUT_TEMPERATURE}" \
     "${ROLLOUT_BATCH_SIZE}" \
@@ -159,6 +237,14 @@ record_environment() {
     "${DRESSAGE_BLACKBOX_SLOTS_PER_NODE}" \
     "${DRESSAGE_BLACKBOX_ACQUIRE_TIMEOUT_SEC}" \
     "${DRESSAGE_BLACKBOX_MAX_STEPS}" \
+    "${DRESSAGE_PROXY_MAX_STEPS_PER_SESSION}" \
+    "${CUSTOM_GENERATE_FUNCTION_PATH}" \
+    "${DRESSAGE_REWARD_MODULES}" \
+    "${DRESSAGE_PADDOCK_MODE}" \
+    "${DRESSAGE_LOG_WRITE_MODE}" \
+    "${DRESSAGE_REPEAT_MULTISTEP_TOOL_DELAY_MS}" \
+    "${CONTEXT_WINDOW:-default}" \
+    "${SGLANG_CONTEXT_LENGTH:-default}" \
     "${MOONCAKE_GLOBAL_SEGMENT_SIZE}" \
     "${MODEL_PATH}" \
     "${ROLLOUT_NUM_GPUS_PER_ENGINE}" \
@@ -186,6 +272,7 @@ from collections import Counter
     output,
     run_name,
     mode,
+    benchmark_workload,
     seed,
     rollout_temperature,
     rollout_batch_size,
@@ -195,6 +282,14 @@ from collections import Counter
     sandbox_slots_per_node,
     sandbox_acquire_timeout_sec,
     blackbox_max_steps,
+    proxy_max_steps_per_session,
+    generate_function_path,
+    reward_modules,
+    paddock_mode,
+    log_write_mode,
+    repeat_tool_delay_ms,
+    context_window,
+    sglang_context_length,
     mooncake_global_segment_size,
     model_path,
     rollout_num_gpus_per_engine,
@@ -231,12 +326,33 @@ def workload_distribution(path: str) -> str:
         lines = pathlib.Path(path).read_text(encoding="utf-8").splitlines()
         for line in lines:
             row = json.loads(line)
-            workload_class = row.get("metadata", {}).get("workload_class")
+            metadata = row.get("metadata", {})
+            workload_class = metadata.get("workload_class")
             if isinstance(workload_class, str):
                 counts[workload_class] += 1
+                continue
+            planned_steps = metadata.get("planned_model_steps")
+            if isinstance(planned_steps, int) and not isinstance(planned_steps, bool):
+                counts[f"steps:{planned_steps}"] += 1
     except (OSError, json.JSONDecodeError, AttributeError):
         return "{}"
     return json.dumps(dict(sorted(counts.items())), sort_keys=True, separators=(",", ":"))
+
+
+def planned_model_steps_total(path: str) -> int | None:
+    try:
+        rows = [
+            json.loads(line)
+            for line in pathlib.Path(path).read_text(encoding="utf-8").splitlines()
+        ]
+    except (OSError, json.JSONDecodeError):
+        return None
+    values = [row.get("metadata", {}).get("planned_model_steps") for row in rows]
+    if not values or any(
+        not isinstance(value, int) or isinstance(value, bool) for value in values
+    ):
+        return None
+    return sum(values)
 
 
 git_head = command(["git", "rev-parse", "HEAD"])
@@ -285,6 +401,7 @@ values = {
     "captured_at": dt.datetime.now(dt.timezone.utc).isoformat(),
     "run_name": run_name,
     "mode": mode,
+    "benchmark_workload": benchmark_workload,
     "hostname": socket.gethostname(),
     "gpu_count": len(gpu_lines),
     "gpu_inventory_json": json.dumps(gpu_lines, ensure_ascii=False),
@@ -299,9 +416,11 @@ values = {
     "prompt_source": prompt_source,
     "prompt_source_sha256": fingerprint_payload["prompt_source_sha256"],
     "prompt_source_workload_distribution_json": workload_distribution(prompt_source),
+    "prompt_source_planned_model_steps_total": planned_model_steps_total(prompt_source),
     "prompt_effective": prompt_effective,
     "prompt_effective_sha256": fingerprint_payload["prompt_effective_sha256"],
     "prompt_effective_workload_distribution_json": workload_distribution(prompt_effective),
+    "prompt_effective_planned_model_steps_total": planned_model_steps_total(prompt_effective),
     "code_fingerprint": code_fingerprint,
     "benchmark_seed": seed,
     "rollout_temperature": rollout_temperature,
@@ -312,6 +431,14 @@ values = {
     "sandbox_slots_per_node": sandbox_slots_per_node,
     "sandbox_acquire_timeout_sec": sandbox_acquire_timeout_sec,
     "blackbox_max_steps": blackbox_max_steps,
+    "proxy_max_steps_per_session": proxy_max_steps_per_session,
+    "generate_function_path": generate_function_path,
+    "reward_modules": reward_modules,
+    "paddock_mode": paddock_mode,
+    "log_write_mode": log_write_mode,
+    "repeat_tool_delay_ms": repeat_tool_delay_ms,
+    "context_window": context_window,
+    "sglang_context_length": sglang_context_length,
     "mooncake_global_segment_size": mooncake_global_segment_size,
     "model_path": model_path,
     "rollout_num_gpus_per_engine": rollout_num_gpus_per_engine,
@@ -707,20 +834,39 @@ effective_tokens_available = True
 artifact_retry_count = 0
 aborted_sample_count = 0
 hash_lines: list[str] = []
+repeat_health_by_instance: dict[str, dict] = {}
+inconsistent_repeat_health: set[str] = set()
 for sample_path in sample_paths:
     try:
         sample = json.loads(sample_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         continue
     metadata = sample.get("metadata")
+    instance_id = str(sample.get("instance_id"))
     sampling_seed = None
     if isinstance(metadata, dict):
         try:
             sampling_seed = int(metadata["rollout_sampling_seed"])
         except (KeyError, TypeError, ValueError):
             pass
+        if "planned_model_steps" in metadata:
+            health = {
+                key: metadata.get(key)
+                for key in (
+                    "planned_model_steps",
+                    "attempted_model_steps",
+                    "actual_model_steps",
+                    "failed_step_count",
+                    "truncated_step_count",
+                    "protocol_success",
+                    "repeat_tool_delay_ms",
+                )
+            }
+            previous = repeat_health_by_instance.setdefault(instance_id, health)
+            if previous != health:
+                inconsistent_repeat_health.add(instance_id)
     record = {
-        "instance_id": str(sample.get("instance_id")),
+        "instance_id": instance_id,
         "sampling_seed": sampling_seed,
         "segment_index": sample.get("segment_index"),
         "tokens": sample.get("tokens"),
@@ -903,6 +1049,11 @@ sticky_e2e_values = [
     for extra in request_steps.values()
     if extra.get("rebalancing_moved") is not True
 ]
+rebalancing_batch_id_count = sum(
+    isinstance(extra.get("rebalancing_batch_id"), int)
+    and not isinstance(extra.get("rebalancing_batch_id"), bool)
+    for extra in request_steps.values()
+)
 
 snapshot_records: list[dict] = []
 snapshot_path = run_dir / "engine_load_snapshots.jsonl"
@@ -1047,6 +1198,17 @@ valid_registered_counts = [
     for value in registered_counts
     if isinstance(value, int) and not isinstance(value, bool) and value >= 0
 ]
+adopted_plan_counts: dict[str, int] = {}
+batch_migration_count = 0
+for trace in ordered_traces:
+    adopted_plan = trace.get("adopted_plan")
+    if isinstance(adopted_plan, str):
+        adopted_plan_counts[adopted_plan] = adopted_plan_counts.get(adopted_plan, 0) + 1
+    batch_migration_count += sum(
+        step.get("moved") is True
+        for step in trace.get("steps") or []
+        if isinstance(step, dict)
+    )
 tail_metrics = {
     "request": {
         "e2e_latency_seconds": distribution(request_e2e_values),
@@ -1076,6 +1238,8 @@ tail_metrics = {
         "solve_seconds": distribution(solve_values),
         "sticky_elapsed_seconds": distribution(sticky_values),
         "optimized_elapsed_seconds": distribution(optimized_values),
+        "adopted_plan_counts": adopted_plan_counts,
+        "migration_count": batch_migration_count,
         "fallback_counts": fallback_counts,
         "fallback_rates": fallback_rates,
     },
@@ -1094,6 +1258,31 @@ tail_metrics = {
     },
 }
 
+
+def repeat_integer_total(field: str) -> int:
+    return sum(
+        value
+        for health in repeat_health_by_instance.values()
+        if isinstance((value := health.get(field)), int)
+        and not isinstance(value, bool)
+    )
+
+
+repeat_workload = {
+    "trajectory_health_count": len(repeat_health_by_instance),
+    "planned_model_steps_total": repeat_integer_total("planned_model_steps"),
+    "attempted_model_steps_total": repeat_integer_total("attempted_model_steps"),
+    "actual_model_steps_total": repeat_integer_total("actual_model_steps"),
+    "failed_step_count": repeat_integer_total("failed_step_count"),
+    "truncated_step_count": repeat_integer_total("truncated_step_count"),
+    "protocol_failure_count": sum(
+        health.get("protocol_success") is not True
+        for health in repeat_health_by_instance.values()
+    ),
+    "rebalancing_batch_id_count": rebalancing_batch_id_count,
+    "trajectory_health": dict(sorted(repeat_health_by_instance.items())),
+}
+
 patterns = {
     "rollout_retry": re.compile(
         r"resubmitting rollout group for retry|returned group[^\n]*to rollout buffer for retry|"
@@ -1107,6 +1296,11 @@ patterns = {
     "engine_failure": re.compile(
         r"(?:sglang|engine)[^\n]*(?:process exited|crashed|unhealthy|died)|"
         r"engine[^\n]*failed health check",
+        re.IGNORECASE,
+    ),
+    "context_overflow": re.compile(
+        r"exceeds (?:the )?(?:model's )?maximum context(?: length)?|"
+        r"maximum context length exceeded|context length exceeded",
         re.IGNORECASE,
     ),
     "batch_put_failed": re.compile(r"BatchPut failed", re.IGNORECASE),
@@ -1146,6 +1340,58 @@ if artifact_retry_count:
     acceptance_errors.append(f"trajectory artifacts report {artifact_retry_count} rollout retries")
 if aborted_sample_count:
     acceptance_errors.append(f"found {aborted_sample_count} aborted trajectory samples")
+if environment.get("benchmark_workload") == "repeat_multistep":
+    expected_trajectories = int(environment.get("rollout_batch_size", "256"))
+    expected_steps = int(
+        environment.get("prompt_effective_planned_model_steps_total", "2252")
+    )
+    if trajectory_count != expected_trajectories:
+        acceptance_errors.append(
+            "repeat workload trajectory count is "
+            f"{trajectory_count}, expected {expected_trajectories}"
+        )
+    if len(repeat_health_by_instance) != expected_trajectories:
+        acceptance_errors.append(
+            "repeat workload trajectory health count is "
+            f"{len(repeat_health_by_instance)}, expected {expected_trajectories}"
+        )
+    if inconsistent_repeat_health:
+        acceptance_errors.append(
+            "repeat workload has inconsistent trajectory metadata: "
+            + ",".join(sorted(inconsistent_repeat_health))
+        )
+    if repeat_workload["actual_model_steps_total"] != expected_steps:
+        acceptance_errors.append(
+            "repeat workload actual model steps are "
+            f"{repeat_workload['actual_model_steps_total']}, expected {expected_steps}"
+        )
+    for instance_id, health in sorted(repeat_health_by_instance.items()):
+        planned_steps = health.get("planned_model_steps")
+        if (
+            health.get("attempted_model_steps") != planned_steps
+            or health.get("actual_model_steps") != planned_steps
+            or health.get("failed_step_count") != 0
+            or health.get("truncated_step_count") != 0
+            or health.get("protocol_success") is not True
+        ):
+            acceptance_errors.append(
+                f"repeat workload trajectory {instance_id} did not complete cleanly"
+            )
+    if mode == "on":
+        if len(request_steps) != expected_steps:
+            acceptance_errors.append(
+                "repeat workload request metric count is "
+                f"{len(request_steps)}, expected {expected_steps}"
+            )
+        if rebalancing_batch_id_count != len(request_steps):
+            acceptance_errors.append(
+                "repeat workload ON requests missing rebalancing batch IDs: "
+                f"{len(request_steps) - rebalancing_batch_id_count}/{len(request_steps)}"
+            )
+        if not any(value > 1 for value in valid_registered_counts):
+            acceptance_errors.append(
+                "repeat workload observed no natural multi-step load batch"
+            )
 sampling_seeds_by_instance: dict[str, set[int]] = defaultdict(set)
 missing_sampling_seed_instances: set[str] = set()
 for record in records:
@@ -1199,10 +1445,25 @@ metrics = {
     "recent_mooncake_cached_observations": len(mooncake_observations),
     "matched_mooncake_migrations": len(matched_mooncake_observations),
     "kv_migration_evidence": bool(matched_mooncake_observations),
+    "repeat_workload": repeat_workload,
     "tail_metrics": tail_metrics,
     "hostname": environment.get("hostname"),
     "gpu_inventory_sha256": environment.get("gpu_inventory_sha256"),
     "code_fingerprint": environment.get("code_fingerprint"),
+    "workload": {
+        "benchmark_workload": environment.get("benchmark_workload"),
+        "prompt_effective_sha256": environment.get("prompt_effective_sha256"),
+        "step_distribution_json": environment.get(
+            "prompt_effective_workload_distribution_json"
+        ),
+        "planned_model_steps_total": environment.get(
+            "prompt_effective_planned_model_steps_total"
+        ),
+        "generate_function_path": environment.get("generate_function_path"),
+        "repeat_tool_delay_ms": environment.get("repeat_tool_delay_ms"),
+        "context_window": environment.get("context_window"),
+        "sglang_context_length": environment.get("sglang_context_length"),
+    },
     "perf": perf,
     "perf_log_line": perf_line,
     "error_matches": error_matches,
@@ -1267,6 +1528,18 @@ run_one() {
     export DRESSAGE_BLACKBOX_SLOTS_PER_NODE
     export DRESSAGE_BLACKBOX_ACQUIRE_TIMEOUT_SEC
     export DRESSAGE_BLACKBOX_MAX_STEPS
+    export DRESSAGE_PROXY_MAX_STEPS_PER_SESSION
+    export DRESSAGE_LOG_WRITE_MODE
+    export DRESSAGE_REWARD_MODULES
+    export DRESSAGE_PADDOCK_MODE
+    export DRESSAGE_LOCAL_BWRAP_AUTO_START
+    export DRESSAGE_BLACKBOX_RUNNER_MODE
+    export DRESSAGE_REPEAT_MULTISTEP_TOOL_DELAY_MS
+    export CUSTOM_GENERATE_FUNCTION_PATH
+    export MODEL_REASONING_TYPE
+    export REASONING_PARSE_BACKEND
+    export CONTEXT_WINDOW
+    export SGLANG_CONTEXT_LENGTH
     export MOONCAKE_GLOBAL_SEGMENT_SIZE
     export ENGINE_REBALANCING_LOAD_BATCH_COALESCING_WINDOW_MS
     export ENGINE_REBALANCING_MIN_LOAD_IMPROVEMENT_RATIO

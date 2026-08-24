@@ -94,6 +94,12 @@ dressage_apply_common_defaults \
   "local_bwrap"
 dressage_apply_local_bwrap_defaults 16
 
+CUSTOM_GENERATE_FUNCTION_PATH="${CUSTOM_GENERATE_FUNCTION_PATH:-dressage.rollout.generate.blackbox_dispatch.generate}"
+DRESSAGE_PROXY_MAX_STEPS_PER_SESSION="${DRESSAGE_PROXY_MAX_STEPS_PER_SESSION:-0}"
+DRESSAGE_LOG_WRITE_MODE="${DRESSAGE_LOG_WRITE_MODE:-background}"
+MODEL_REASONING_TYPE="${MODEL_REASONING_TYPE:-}"
+REASONING_PARSE_BACKEND="${REASONING_PARSE_BACKEND:-sglang_api}"
+
 # Self-contained single-node Mooncake L3 configuration. Each SGLang Engine
 # contributes one segment, so the 4GB default yields 32GB across 8 Engines.
 MOONCAKE_MASTER_HOST="127.0.0.1"
@@ -234,6 +240,12 @@ PROXY_ARGS=(
   --context-window "${CONTEXT_WINDOW}"
   --enable-engine-rebalancing
 )
+if [[ -n "${MODEL_REASONING_TYPE}" ]]; then
+  PROXY_ARGS+=(
+    --model-reasoning-type "${MODEL_REASONING_TYPE}"
+    --reasoning-parse-backend "${REASONING_PARSE_BACKEND}"
+  )
+fi
 
 CKPT_ARGS=(
   --hf-checkpoint "${BASE_FOLDER}/Qwen3.5-4B"
@@ -247,7 +259,7 @@ ROLLOUT_ARGS=(
   --rollout-function-path \
     dressage.rollout.sync_rollout.generate_rollout_sync
   --custom-generate-function-path \
-    dressage.rollout.generate.blackbox_dispatch.generate
+    "${CUSTOM_GENERATE_FUNCTION_PATH}"
   --custom-rm-path \
     dressage.reward.custom_rm.custom_rm
   --data-source-path \
@@ -341,6 +353,9 @@ SGLANG_ARGS=(
   --sglang-router-port "${SGLANG_ROUTER_PORT}"
   --router-policy consistent_hashing
 )
+if [[ -n "${SGLANG_CONTEXT_LENGTH:-}" ]]; then
+  SGLANG_ARGS+=(--sglang-context-length "${SGLANG_CONTEXT_LENGTH}")
+fi
 
 MISC_ARGS=(
   --attention-dropout 0.0
@@ -600,6 +615,9 @@ RUNTIME_ENV_JSON=$(cat <<EOF_JSON
     "CUDA_DEVICE_MAX_CONNECTIONS": "1",
     "NCCL_NVLS_ENABLE": "${HAS_NVLINK}",
     "DRESSAGE_PROXY_URL": "${DRESSAGE_PROXY_URL}",
+    "DRESSAGE_PROXY_MAX_STEPS_PER_SESSION": "${DRESSAGE_PROXY_MAX_STEPS_PER_SESSION}",
+    "DRESSAGE_LOG_WRITE_MODE": "${DRESSAGE_LOG_WRITE_MODE}",
+    "DRESSAGE_REPEAT_MULTISTEP_TOOL_DELAY_MS": "${DRESSAGE_REPEAT_MULTISTEP_TOOL_DELAY_MS:-0}",
     "DRESSAGE_PADDOCK_MODE": "${DRESSAGE_PADDOCK_MODE}",
     "DRESSAGE_SANDBOX_PROVIDER": "${DRESSAGE_SANDBOX_PROVIDER}",
     "DRESSAGE_BLACKBOX_MAX_STEPS": "${DRESSAGE_BLACKBOX_MAX_STEPS}",

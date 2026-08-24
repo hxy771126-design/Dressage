@@ -7,6 +7,8 @@ import sys
 from collections import Counter
 from pathlib import Path
 
+import pytest
+
 
 SCRIPT = Path("examples/data/prepare_dapo_long_tail.py")
 BENCHMARK_SCRIPT = Path(
@@ -362,3 +364,23 @@ def test_engine_rebalancing_35b_benchmark_dry_run_uses_batch_64_dataset():
     assert "rollout batch: 64" in result.stdout
     assert "global batch:  64" in result.stdout
     assert "Blackbox max steps: 20" in result.stdout
+
+
+@pytest.mark.parametrize("script", [BENCHMARK_SCRIPT, BENCHMARK_35B_SCRIPT])
+def test_engine_rebalancing_benchmark_batch_override_is_consistent(script):
+    result = subprocess.run(
+        ["bash", str(script)],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "BENCHMARK_DRY_RUN": "1",
+            "BENCHMARK_BATCH_SIZE": "256",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "dressage_dapo_prompts_step_balanced_256.jsonl" in result.stdout
+    assert "rollout batch: 256" in result.stdout
+    assert "global batch:  256" in result.stdout

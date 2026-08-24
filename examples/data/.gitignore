@@ -11,6 +11,8 @@
 !dressage_dapo_prompts_step_balanced_300.jsonl
 !dressage_dapo_prompts_step_balanced_256.jsonl
 !dressage_dapo_prompts_step_balanced_64.jsonl
+!dressage_repeat_multistep_4k_52_256.jsonl
+!dressage_repeat_multistep_6k_36_256.jsonl
 !prepare_dapo_long_tail.py
 
 !swegym/
