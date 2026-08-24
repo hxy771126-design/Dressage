@@ -385,6 +385,18 @@ def test_whitebox_agent_session_id_generates_uuid_when_missing(monkeypatch):
     assert whitebox_agent._agent_session_id(sample, "wb") == "wb-abc123"
 
 
+def test_whitebox_agent_session_id_uses_deterministic_metadata():
+    sample = SimpleNamespace(
+        session_id=None,
+        metadata={"dressage_deterministic_session_id": "repeat-ms-tail-0001"},
+    )
+
+    assert (
+        whitebox_agent._agent_session_id(sample, "repeat-ms")
+        == "repeat-ms-tail-0001"
+    )
+
+
 def test_whitebox_stamp_runtime_metadata_writes_sample_session_id():
     sample = SimpleNamespace(session_id="old", metadata={})
 

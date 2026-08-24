@@ -15,7 +15,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-test = ["pytest>=8.3.0", "pytest-asyncio>=0.24.0"]
+test = ["blake3>=1,<2", "pytest>=8.3.0", "pytest-asyncio>=0.24.0"]
+data = ["blake3>=1,<2"]
 harbor = [
     "harbor==0.18.0",
     "dressage-blackbox-server==1.1.0",

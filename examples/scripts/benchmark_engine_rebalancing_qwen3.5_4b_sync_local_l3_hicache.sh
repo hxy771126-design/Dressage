@@ -437,6 +437,7 @@ values = {
     "load_batch_coalescing_window_ms": load_batch_coalescing_window_ms,
     "min_load_improvement_ratio": min_load_improvement_ratio,
     "engine_load_snapshot_interval_seconds": 5,
+    "sglang_worker_load_snapshot_interval_seconds": 1,
 }
 
 path = pathlib.Path(output)
@@ -601,11 +602,115 @@ _capture_benchmark_snapshots() {
 }
 
 '''
-sampler_function = ""
-sampler_cleanup = ""
-sampler_start = ""
+sampler_function = r'''_capture_benchmark_sglang_worker_load_history() {
+  local phase="$1"
+  local output_path="${DRESSAGE_BENCHMARK_OUTPUT_DIR}/sglang_worker_load_snapshots.jsonl"
+
+  python3 - "${phase}" "${SGLANG_ROUTER_URL}" >>"${output_path}" <<'PY_WORKER_LOADS'
+import hashlib
+import json
+import sys
+import time
+import urllib.parse
+import urllib.request
+
+phase, router_url = sys.argv[1:]
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def load_json(url):
+    request = urllib.request.Request(url, headers={"Accept": "application/json"})
+    with opener.open(request, timeout=2) as response:
+        return json.load(response)
+
+
+try:
+    payload = load_json(f"{router_url.rstrip('/')}/workers")
+except Exception:
+    raise SystemExit(0)
+
+router = urllib.parse.urlsplit(router_url)
+workers = []
+for worker in payload.get("workers", []):
+    if not isinstance(worker, dict) or worker.get("is_healthy") is not True:
+        continue
+    if str(worker.get("connection_mode", "http")).lower() != "http":
+        continue
+    raw_url = worker.get("url")
+    if not isinstance(raw_url, str) or not raw_url:
+        continue
+    parsed = urllib.parse.urlsplit(raw_url)
+    if parsed.hostname in {"0.0.0.0", "::"}:
+        host = router.hostname or parsed.hostname
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        netloc = f"{host}:{parsed.port}" if parsed.port is not None else host
+        parsed = parsed._replace(netloc=netloc)
+    worker_url = urllib.parse.urlunsplit(parsed).rstrip("/")
+    try:
+        load = load_json(f"{worker_url}/v1/loads")
+    except Exception as exc:
+        load = {"error": type(exc).__name__}
+    workers.append({"url": worker_url, "load": load})
+
+if not workers:
+    raise SystemExit(0)
+worker_urls = sorted(worker["url"] for worker in workers)
+fingerprint_payload = json.dumps(worker_urls, separators=(",", ":")).encode()
+print(
+    json.dumps(
+        {
+            "captured_at": time.time(),
+            "phase": phase,
+            "topology_sha256": hashlib.sha256(fingerprint_payload).hexdigest(),
+            "workers": sorted(workers, key=lambda worker: worker["url"]),
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+)
+PY_WORKER_LOADS
+}
+
+_start_benchmark_sglang_worker_load_sampler() {
+  if [[ -z "${DRESSAGE_BENCHMARK_OUTPUT_DIR:-}" ]]; then
+    return
+  fi
+  mkdir -p "${DRESSAGE_BENCHMARK_OUTPUT_DIR}"
+  : >"${DRESSAGE_BENCHMARK_OUTPUT_DIR}/sglang_worker_load_snapshots.jsonl"
+  BENCHMARK_SGLANG_WORKER_LOAD_SAMPLER_STOP_PATH="${DRESSAGE_BENCHMARK_OUTPUT_DIR}/.sglang_worker_load_sampler.stop"
+  rm -f -- "${BENCHMARK_SGLANG_WORKER_LOAD_SAMPLER_STOP_PATH}"
+  _capture_benchmark_sglang_worker_load_history baseline
+  (
+    while [[ ! -e "${BENCHMARK_SGLANG_WORKER_LOAD_SAMPLER_STOP_PATH}" ]]; do
+      for _ in $(seq 1 10); do
+        if [[ -e "${BENCHMARK_SGLANG_WORKER_LOAD_SAMPLER_STOP_PATH}" ]]; then
+          exit 0
+        fi
+        sleep 0.1
+      done
+      _capture_benchmark_sglang_worker_load_history sample
+    done
+  ) &
+  BENCHMARK_SGLANG_WORKER_LOAD_SAMPLER_PID=$!
+}
+
+_stop_benchmark_sglang_worker_load_sampler() {
+  local pid="${BENCHMARK_SGLANG_WORKER_LOAD_SAMPLER_PID:-}"
+  if [[ -n "${pid}" ]]; then
+    touch "${BENCHMARK_SGLANG_WORKER_LOAD_SAMPLER_STOP_PATH}"
+    wait "${pid}" 2>/dev/null || true
+    BENCHMARK_SGLANG_WORKER_LOAD_SAMPLER_PID=""
+    rm -f -- "${BENCHMARK_SGLANG_WORKER_LOAD_SAMPLER_STOP_PATH}"
+  fi
+  _capture_benchmark_sglang_worker_load_history final
+}
+
+'''
+sampler_cleanup = "  _stop_benchmark_sglang_worker_load_sampler\n"
+sampler_start = "_start_benchmark_sglang_worker_load_sampler\n\n"
 if mode == "on":
-    sampler_function = r'''_capture_benchmark_engine_load_history() {
+    sampler_function += r'''_capture_benchmark_engine_load_history() {
   local phase="$1"
   local output_path="${DRESSAGE_BENCHMARK_OUTPUT_DIR}/engine_load_snapshots.jsonl"
   local temporary_path="${output_path}.tmp"
@@ -670,8 +775,10 @@ _stop_benchmark_engine_load_sampler() {
 }
 
 '''
-    sampler_cleanup = "  _stop_benchmark_engine_load_sampler\n"
-    sampler_start = "_start_benchmark_engine_load_sampler\n\n"
+    sampler_cleanup = (
+        "  _stop_benchmark_engine_load_sampler\n" + sampler_cleanup
+    )
+    sampler_start += "_start_benchmark_engine_load_sampler\n\n"
 cleanup_marker = "cleanup() {\n  status=$?\n  set +e\n"
 if cleanup_marker not in text:
     raise SystemExit("source recipe cleanup marker changed")
@@ -685,11 +792,10 @@ text = text.replace(
     1,
 )
 
-if mode == "on":
-    rollout_marker = "ray job submit \\\n"
-    if rollout_marker not in text:
-        raise SystemExit("source recipe rollout launch marker changed")
-    text = text.replace(rollout_marker, sampler_start + rollout_marker, 1)
+rollout_marker = "ray job submit \\\n"
+if rollout_marker not in text:
+    raise SystemExit("source recipe rollout launch marker changed")
+text = text.replace(rollout_marker, sampler_start + rollout_marker, 1)
 
 pathlib.Path(output).write_text(text, encoding="utf-8")
 PY
@@ -1188,6 +1294,65 @@ valid_registered_counts = [
     for value in registered_counts
     if isinstance(value, int) and not isinstance(value, bool) and value >= 0
 ]
+
+worker_snapshot_records: list[dict] = []
+worker_snapshot_path = run_dir / "sglang_worker_load_snapshots.jsonl"
+if worker_snapshot_path.exists():
+    for line in worker_snapshot_path.read_text(
+        encoding="utf-8", errors="replace"
+    ).splitlines():
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(record, dict) and isinstance(record.get("workers"), list):
+            worker_snapshot_records.append(record)
+
+
+def max_to_mean(values) -> float | None:
+    parsed = [
+        number
+        for value in values
+        if (number := non_negative_number(value)) is not None
+    ]
+    mean = sum(parsed) / len(parsed) if parsed else 0.0
+    return max(parsed) / mean if mean > 0 else None
+
+
+outstanding_skew: list[float] = []
+token_skew: list[float] = []
+token_usage_skew: list[float] = []
+for record in worker_snapshot_records:
+    outstanding: list[float] = []
+    tokens: list[float] = []
+    token_usage: list[float] = []
+    for worker in record["workers"]:
+        load = worker.get("load") if isinstance(worker, dict) else None
+        if not isinstance(load, dict) or "error" in load:
+            continue
+        running = non_negative_number(load.get("num_running_reqs"))
+        waiting_value = load.get("num_waiting_reqs")
+        if waiting_value is None:
+            waiting_value = load.get("num_queue_reqs")
+        waiting = non_negative_number(waiting_value)
+        if running is not None and waiting is not None:
+            outstanding.append(running + waiting)
+        token_value = load.get("num_total_tokens")
+        if token_value is None:
+            token_value = load.get("num_used_tokens")
+        if (parsed_tokens := non_negative_number(token_value)) is not None:
+            tokens.append(parsed_tokens)
+        if (parsed_usage := non_negative_number(load.get("token_usage"))) is not None:
+            token_usage.append(parsed_usage)
+    for values, target in (
+        (outstanding, outstanding_skew),
+        (tokens, token_skew),
+        (token_usage, token_usage_skew),
+    ):
+        ratio = max_to_mean(values)
+        if ratio is not None:
+            target.append(ratio)
+
 adopted_plan_counts: dict[str, int] = {}
 batch_migration_count = 0
 for trace in ordered_traces:
@@ -1233,10 +1398,24 @@ tail_metrics = {
         "fallback_counts": fallback_counts,
         "fallback_rates": fallback_rates,
     },
+    "sglang_worker_load": {
+        "snapshot_count": len(worker_snapshot_records),
+        "topology_sha256": sorted(
+            {
+                str(record["topology_sha256"])
+                for record in worker_snapshot_records
+                if record.get("topology_sha256") is not None
+            }
+        ),
+        "outstanding_max_to_mean": distribution(outstanding_skew),
+        "token_max_to_mean": distribution(token_skew),
+        "token_usage_max_to_mean": distribution(token_usage_skew),
+    },
     "coverage": {
         "trajectory_step_count": len(request_steps),
         "request_e2e_count": request_e2e_count,
         "request_queue_count": request_queue_count,
+        "sglang_worker_load_snapshot_count": len(worker_snapshot_records),
         "baseline_batch_id": baseline_batch_id,
         "batch_count": len(ordered_batch_ids),
         "first_batch_id": ordered_batch_ids[0] if ordered_batch_ids else None,
@@ -1293,6 +1472,8 @@ patterns = {
         r"maximum context length exceeded|context length exceeded",
         re.IGNORECASE,
     ),
+    "read_timeout": re.compile(r"(?:httpx[.])?ReadTimeout", re.IGNORECASE),
+    "kv_cache_pool_full": re.compile(r"KV cache pool is full", re.IGNORECASE),
     "batch_put_failed": re.compile(r"BatchPut failed", re.IGNORECASE),
     "insufficient_space": re.compile(r"insufficient space", re.IGNORECASE),
 }

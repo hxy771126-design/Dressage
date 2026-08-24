@@ -7109,6 +7109,7 @@ def test_engine_rebalancing_benchmark_environment_records_prompt_fingerprints(
     assert environment["load_batch_coalescing_window_ms"] == "125"
     assert environment["min_load_improvement_ratio"] == "0.05"
     assert environment["engine_load_snapshot_interval_seconds"] == "5"
+    assert environment["sglang_worker_load_snapshot_interval_seconds"] == "1"
     assert "prompt_source_workload_distribution_json" in environment
     assert "prompt_effective_workload_distribution_json" in environment
 
@@ -7137,8 +7138,13 @@ def test_engine_rebalancing_benchmark_injects_rebalancing_settings_only_for_on(
         for flag in flags:
             assert (flag in generated) is (mode == "on")
         assert ("engine_load_snapshots.jsonl" in generated) is (mode == "on")
+        assert "sglang_worker_load_snapshots.jsonl" in generated
+        assert "_start_benchmark_sglang_worker_load_sampler\n" in generated
         assert ("_start_benchmark_engine_load_sampler\n" in generated) is (
             mode == "on"
+        )
+        assert generated.index("_start_benchmark_sglang_worker_load_sampler\n") < (
+            generated.index("ray job submit")
         )
         if mode == "on":
             assert generated.index("_start_benchmark_engine_load_sampler\n") < generated.index(
@@ -7436,6 +7442,52 @@ def test_engine_rebalancing_benchmark_collects_type7_tail_metrics(tmp_path):
     assert tail["coverage"]["batch_ids"] == [41, 42, 43]
     assert tail["coverage"]["missing_batch_ids"] == []
     assert tail["coverage"]["complete"] is True
+
+
+def test_engine_rebalancing_benchmark_collects_worker_load_skew(tmp_path):
+    _write_tail_metric_fixture(tmp_path)
+    snapshots = []
+    for captured_at, outstanding in (
+        (1.0, [10] * 8),
+        (2.0, [26, 18, 14, 10, 9, 8, 8, 7]),
+    ):
+        snapshots.append(
+            {
+                "captured_at": captured_at,
+                "phase": "sample",
+                "topology_sha256": "topology",
+                "workers": [
+                    {
+                        "url": f"http://worker-{index}:30000",
+                        "load": {
+                            "num_running_reqs": value,
+                            "num_waiting_reqs": 0,
+                            "num_total_tokens": value * 1000,
+                            "token_usage": value / 100,
+                        },
+                    }
+                    for index, value in enumerate(outstanding)
+                ],
+            }
+        )
+    tmp_path.joinpath("sglang_worker_load_snapshots.jsonl").write_text(
+        "".join(json.dumps(snapshot) + "\n" for snapshot in snapshots),
+        encoding="utf-8",
+    )
+
+    result = _run_benchmark_heredoc(
+        "collect_run", str(tmp_path), "run", "on", "0", "1", "2", "1"
+    )
+
+    assert result.returncode == 0, result.stderr
+    worker_load = json.loads(
+        (tmp_path / "metrics.json").read_text(encoding="utf-8")
+    )["tail_metrics"]["sglang_worker_load"]
+    assert worker_load["snapshot_count"] == 2
+    assert worker_load["topology_sha256"] == ["topology"]
+    assert worker_load["outstanding_max_to_mean"]["max"] == pytest.approx(2.08)
+    assert worker_load["token_max_to_mean"]["max"] == pytest.approx(2.08)
+    assert worker_load["token_usage_max_to_mean"]["max"] == pytest.approx(2.08)
 
 
 def test_engine_rebalancing_benchmark_marks_batch_history_gaps_incomplete(tmp_path):
@@ -7754,6 +7806,39 @@ def test_benchmark_collector_rejects_context_overflow(tmp_path):
         "acceptance_errors"
     ]
     assert any("detected context_overflow" in error for error in errors)
+
+
+@pytest.mark.parametrize(
+    ("log_line", "error_key"),
+    [
+        ("httpx.ReadTimeout while reading model response", "read_timeout"),
+        ("KV cache pool is full. Retract requests", "kv_cache_pool_full"),
+    ],
+)
+def test_repeat_benchmark_collector_rejects_runtime_capacity_failures(
+    tmp_path,
+    log_line,
+    error_key,
+):
+    _write_benchmark_sample(
+        tmp_path / "runtime" / "traj_payload" / "run" / "samples" / "a.json",
+        instance_id="alpha",
+        sampling_seed=11,
+        segment_index=0,
+    )
+    tmp_path.joinpath("run.log").write_text(log_line + "\n", encoding="utf-8")
+
+    result = _run_benchmark_heredoc(
+        "collect_run", str(tmp_path), "run", "off", "0", "1", "2", "1"
+    )
+
+    assert result.returncode == 0, result.stderr
+    metrics = json.loads((tmp_path / "metrics.json").read_text(encoding="utf-8"))
+    assert metrics["error_matches"][error_key]
+    assert any(
+        error.startswith(f"detected {error_key}:")
+        for error in metrics["acceptance_errors"]
+    )
 
 
 def _collect_benchmark_run(run_dir: Path) -> dict:

@@ -6,7 +6,7 @@ import asyncio
 import json
 import logging
 import os
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from dressage.rollout import multi_segment
 from dressage.rollout.artifacts.writer import DEFAULT_WRITER
@@ -22,9 +22,13 @@ from .tools import (
     SYSTEM_PROMPT,
     extract_assistant_message,
 )
+from .topology import validate_live_topology
 
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    import httpx
 
 
 def _initial_messages(sample: Any) -> list[dict[str, Any]]:
@@ -57,6 +61,21 @@ def _tool_delay_ms() -> int:
 class RepeatMultiStepWhiteboxAgent(WhiteboxAgent):
     name = "repeat_multistep_whitebox_agent"
     session_prefix = "repeat-ms"
+
+    async def validate_topology(
+        self,
+        sample: Any,
+        *,
+        client: httpx.AsyncClient | None = None,
+    ) -> None:
+        metadata = getattr(sample, "metadata", None)
+        await validate_live_topology(
+            metadata if isinstance(metadata, dict) else {},
+            client=client,
+        )
+
+    async def setup(self, sample: Any) -> None:
+        await self.validate_topology(sample)
 
     async def rollout(
         self,

@@ -66,6 +66,13 @@ def _stamp_runtime_metadata(sample: Any, session_id: str, instance_id: str) -> N
 def _agent_session_id(sample: Any, prefix: str) -> str:
     session_id = getattr(sample, "session_id", None)
     if session_id is None:
+        metadata = getattr(sample, "metadata", None)
+        session_id = (
+            metadata.get("dressage_deterministic_session_id")
+            if isinstance(metadata, dict)
+            else None
+        )
+    if session_id is None:
         session_id = uuid.uuid4().hex
     session_id = str(session_id)
     if prefix and not session_id.startswith(f"{prefix}-"):

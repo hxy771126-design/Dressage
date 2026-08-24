@@ -10,6 +10,7 @@ from collections import Counter
 from pathlib import Path
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
 from dressage.recipes.repeat_multistep.agent_whitebox import (
@@ -512,3 +513,65 @@ def test_repeat_runners_forward_request_timeout_through_ray_runtime_env():
             '"DRESSAGE_PROXY_REQUEST_TIMEOUT_SEC": '
             '"${DRESSAGE_PROXY_REQUEST_TIMEOUT_SEC:-300}"'
         ) in runtime_env
+        assert '"SGLANG_ROUTER_URL": "${SGLANG_ROUTER_URL}"' in runtime_env
+
+
+def test_repeat_skew_topology_is_checked_before_rollout(monkeypatch):
+    from dressage.recipes.repeat_multistep.topology import topology_sha256
+
+    worker_urls = [f"http://worker-{index}:30000" for index in range(8)]
+    sample = _sample(1)
+    sample.metadata["target_topology_sha256"] = topology_sha256(worker_urls)
+    monkeypatch.setenv("SGLANG_ROUTER_URL", "http://router.test:8000")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url == httpx.URL("http://router.test:8000/workers")
+        return httpx.Response(
+            200,
+            json={
+                "workers": [
+                    {
+                        "url": url,
+                        "is_healthy": True,
+                        "connection_mode": "http",
+                    }
+                    for url in worker_urls
+                ]
+            },
+        )
+
+    agent = RepeatMultiStepWhiteboxAgent()
+    async_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    asyncio.run(agent.validate_topology(sample, client=async_client))
+    asyncio.run(async_client.aclose())
+
+
+def test_repeat_skew_topology_mismatch_fails_before_first_request(monkeypatch):
+    from dressage.recipes.repeat_multistep.topology import topology_sha256
+
+    sample = _sample(1)
+    sample.metadata["target_topology_sha256"] = topology_sha256(
+        [f"http://expected-{index}:30000" for index in range(8)]
+    )
+    monkeypatch.setenv("SGLANG_ROUTER_URL", "http://router.test:8000")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "workers": [
+                    {
+                        "url": f"http://actual-{index}:30000",
+                        "is_healthy": True,
+                        "connection_mode": "http",
+                    }
+                    for index in range(8)
+                ]
+            },
+        )
+
+    agent = RepeatMultiStepWhiteboxAgent()
+    async_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    with pytest.raises(ValueError, match="topology fingerprint mismatch"):
+        asyncio.run(agent.validate_topology(sample, client=async_client))
+    asyncio.run(async_client.aclose())
