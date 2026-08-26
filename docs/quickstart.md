@@ -42,7 +42,7 @@ Dressage is designed to get you from zero to training with minimal configuration
 ### Use the slime Base Image
 
 ```bash
-slimerl/slime:nightly-dev-20260430b
+slimerl/slime:nightly-dev-20260722a
 ```
 
 ### Clone the Repository
