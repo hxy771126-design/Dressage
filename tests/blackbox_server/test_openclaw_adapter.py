@@ -271,6 +271,8 @@ def test_start_proxy_passes_limits_and_default_temperature_to_rollout_proxy(
                 "sticky_header_name": "X-SMG-Routing-Key",
                 "max_steps": 7,
                 "default_temperature": 0.25,
+                "sampling_mode": "force",
+                "sampling_seed_base": 700,
             },
         }
     )
@@ -293,6 +295,8 @@ def test_start_proxy_passes_limits_and_default_temperature_to_rollout_proxy(
     assert captured["sticky_header_name"] == "X-SMG-Routing-Key"
     assert captured["max_steps"] == 7
     assert captured["default_temperature"] == 0.25
+    assert captured["sampling_mode"] == "force"
+    assert captured["sampling_seed_base"] == 700
 
 
 def test_build_openclaw_config_maps_compaction_options(tmp_path: Path) -> None:

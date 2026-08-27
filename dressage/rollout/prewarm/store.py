@@ -21,9 +21,21 @@ logger = logging.getLogger(__name__)
 
 def ensure_blackbox_session_id(sample: Any) -> str:
     """Ensure *sample* has a ``bbs-`` prefixed session ID and return it."""
-    session_id = getattr(sample, "session_id", None)
-    if session_id is None:
-        session_id = str(uuid.uuid4())
+    metadata = getattr(sample, "metadata", None)
+    deterministic_session_id = (
+        metadata.get("dressage_deterministic_session_id")
+        if isinstance(metadata, dict)
+        else None
+    )
+    if isinstance(deterministic_session_id, str):
+        retry_count = int(metadata.get("dressage_retry_count", 0))
+        session_id = deterministic_session_id
+        if retry_count:
+            session_id = f"{session_id}-retry-{retry_count}"
+    else:
+        session_id = getattr(sample, "session_id", None)
+        if session_id is None:
+            session_id = str(uuid.uuid4())
     session_id = str(session_id)
     if not session_id.startswith("bbs-"):
         session_id = f"bbs-{session_id}"

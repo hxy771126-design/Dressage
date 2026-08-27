@@ -50,6 +50,7 @@ from dressage.rollout.generate.runtime import (
     get_proxy_client,
     maybe_await,
     paddock_env_args_from_metadata,
+    register_rollout_session_context,
 )
 
 logger = logging.getLogger(__name__)
@@ -138,6 +139,10 @@ async def generate(
         )
         paddock = get_paddock_from_env(allow_whitebox_mode=False)
         proxy_client = get_proxy_client()
+        await register_rollout_session_context(
+            proxy_client,
+            session_id=session_id,
+        )
         state = await maybe_await(
             paddock.init(
                 session_id,

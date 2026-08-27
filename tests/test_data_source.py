@@ -144,6 +144,57 @@ class TestDressageDataSource:
                 assert s.index not in indices
                 indices.add(s.index)
 
+    def test_deterministic_blackbox_samples_get_stable_session_ids(self, args):
+        path = _make_jsonl(
+            [
+                {
+                    "prompt": "first",
+                    "agent_mode": "blackbox",
+                    "metadata": {"instance_id": "first"},
+                },
+                {
+                    "prompt": "second",
+                    "agent_mode": "blackbox",
+                    "metadata": {"instance_id": "second"},
+                },
+            ]
+        )
+        args.prompt_data = path
+        args.sglang_enable_deterministic_inference = True
+        try:
+            first, second = [group[0] for group in DressageDataSource(args).get_samples(2)]
+            repeated_first = DressageDataSource(args).get_samples(1)[0][0]
+        finally:
+            os.unlink(path)
+
+        assert getattr(first, "session_id", None) == "bbs-det-42-0"
+        assert first.metadata["dressage_deterministic_session_id"] == "bbs-det-42-0"
+        assert repeated_first.session_id == first.session_id
+        assert getattr(second, "session_id", None) == "bbs-det-42-2"
+        assert second.metadata["dressage_deterministic_session_id"] == "bbs-det-42-2"
+
+    def test_stable_session_ids_do_not_apply_without_deterministic_blackbox_inference(
+        self, args
+    ):
+        path = _make_jsonl(
+            [
+                {"prompt": "blackbox", "agent_mode": "blackbox"},
+                {"prompt": "whitebox", "agent_mode": "whitebox"},
+            ]
+        )
+        args.prompt_data = path
+        try:
+            nondeterministic = DressageDataSource(args).get_samples(1)[0][0]
+            args.sglang_enable_deterministic_inference = True
+            non_blackbox = DressageDataSource(args).get_samples(2)[1][0]
+        finally:
+            os.unlink(path)
+
+        assert getattr(nondeterministic, "session_id", None) is None
+        assert "dressage_deterministic_session_id" not in nondeterministic.metadata
+        assert getattr(non_blackbox, "session_id", None) is None
+        assert "dressage_deterministic_session_id" not in non_blackbox.metadata
+
     def test_buffer_add_and_get(self, args):
         ds = DressageDataSource(args)
         groups = ds.get_samples(2)

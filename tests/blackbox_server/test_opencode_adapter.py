@@ -40,6 +40,13 @@ from blackbox_server.core.models import (
 )
 
 
+def test_proxy_options_accept_deterministic_sampling_override():
+    proxy = ProxyOptions(sampling_mode="force", sampling_seed_base=700)
+
+    assert proxy.sampling_mode == "force"
+    assert proxy.sampling_seed_base == 700
+
+
 def test_convert_opencode_messages_separates_reasoning_and_tools():
     oc_messages = [
         {
@@ -513,7 +520,11 @@ def test_start_proxy_passes_default_temperature_to_rollout_proxy(
         provider_package="@ai-sdk/openai-compatible",
         model_id="qwen35-a3b",
         model_name="Qwen 3.5 35B A3B",
-        proxy={"default_temperature": 0.25},
+        proxy={
+            "default_temperature": 0.25,
+            "sampling_mode": "force",
+            "sampling_seed_base": 700,
+        },
         runtime_dir=str(runtime_dir),
     )
     options = OpencodeBackendOptions(
@@ -522,7 +533,11 @@ def test_start_proxy_passes_default_temperature_to_rollout_proxy(
         provider_package="@ai-sdk/openai-compatible",
         model_id="qwen35-a3b",
         model_name="Qwen 3.5 35B A3B",
-        proxy=ProxyOptions(default_temperature=0.25),
+        proxy=ProxyOptions(
+            default_temperature=0.25,
+            sampling_mode="force",
+            sampling_seed_base=700,
+        ),
     )
 
     monkeypatch.setattr(opencode_module, "RolloutLLMProxy", FakeRolloutLLMProxy)
@@ -542,6 +557,8 @@ def test_start_proxy_passes_default_temperature_to_rollout_proxy(
     assert captured["bound_instance_id"] == "inst-001"
     assert captured["sticky_header_name"] == "X-SMG-Routing-Key"
     assert captured["default_temperature"] == 0.25
+    assert captured["sampling_mode"] == "force"
+    assert captured["sampling_seed_base"] == 700
 
 
 def test_build_opencode_config_includes_model_limit_and_compaction():

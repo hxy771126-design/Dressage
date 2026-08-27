@@ -1,5 +1,5 @@
 ARG DRESSAGE_BASE_PLATFORM=linux/amd64
-FROM --platform=${DRESSAGE_BASE_PLATFORM} slimerl/slime:nightly-dev-20260430b
+FROM --platform=${DRESSAGE_BASE_PLATFORM} slimerl/slime:nightly-dev-20260722a
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 

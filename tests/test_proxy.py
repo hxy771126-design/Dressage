@@ -9,6 +9,7 @@ import re
 import threading
 from array import array
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from fastapi.testclient import TestClient
@@ -51,6 +52,44 @@ from dressage.transport import (
 
 _UNSET = object()
 _STRICT_TOOL_CALL_ID_RE = re.compile(r"^call[0-9a-f]{8}$")
+
+
+@pytest.mark.parametrize("seed", [-(2**63), 2**63 - 1])
+def test_proxy_maps_signed_int64_seed_to_sglang(seed):
+    client, _, _, sglang_client = make_client(make_response("hello"))
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"X-Session-Id": f"sess-seed-{seed}", "X-Instance-Id": "inst"},
+        json={
+            "model": "fake-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "seed": seed,
+        },
+    )
+
+    assert response.status_code == 200
+    assert sglang_client.calls[0]["sampling_params"]["sampling_seed"] == seed
+
+
+@pytest.mark.parametrize("seed", ["700", True, -(2**63) - 1, 2**63])
+def test_proxy_rejects_non_signed_int64_seed_with_http_400(seed):
+    original_client, _, _, sglang_client = make_client(make_response("hello"))
+    client = TestClient(original_client.app, raise_server_exceptions=False)
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"X-Session-Id": "sess-invalid-seed", "X-Instance-Id": "inst"},
+        json={
+            "model": "fake-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "seed": seed,
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {"detail": "seed must be a signed 64-bit integer"}
+    assert sglang_client.calls == []
 
 
 class FakeTokenizer:
@@ -1502,8 +1541,18 @@ def test_discard_session_removes_finalized_cache_and_trajectory_idempotently():
     assert trajectory_store.stats()["total_items"] == 0
 
 
-def test_discard_session_removes_unfinalized_active_session():
+def test_discard_session_removes_unfinalized_active_session(monkeypatch):
     client, session_manager, trajectory_store, _ = make_client(make_response("done"))
+    discarded_contexts = []
+
+    async def discard_session_context(session_id):
+        discarded_contexts.append(session_id)
+
+    monkeypatch.setattr(
+        client.app.state.engine_rebalancer,
+        "discard_session_context",
+        discard_session_context,
+    )
     generated = client.post(
         "/v1/chat/completions",
         headers={
@@ -1528,6 +1577,84 @@ def test_discard_session_removes_unfinalized_active_session():
     assert response.json()["segments_removed"] == 0
     assert session_manager.get_session("discard-active") is None
     assert trajectory_store.stats()["total_items"] == 0
+    assert discarded_contexts == ["discard-active"]
+
+
+def test_finalize_records_request_latency_and_rebalancing_move(monkeypatch):
+    response = make_response("done")
+    response.meta_info.update({"e2e_latency": 1.25, "queue_time": 0.125})
+    client, _, trajectory_store, _ = make_client(response, token_build_mode="tito")
+    rebalancer = client.app.state.engine_rebalancer
+
+    async def acquire(**_kwargs):
+        return SimpleNamespace(
+            worker_url=None,
+            decision=SimpleNamespace(moved=True),
+        )
+
+    async def complete(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(rebalancer, "acquire", acquire)
+    monkeypatch.setattr(rebalancer, "complete", complete)
+
+    generated = client.post(
+        "/v1/chat/completions",
+        headers={"X-Session-Id": "request-metrics", "X-Instance-Id": "instance"},
+        json={"model": "fake-model", "messages": [{"role": "user", "content": "go"}]},
+    )
+    assert generated.status_code == 200
+    finalized = client.post(
+        "/session/finalize",
+        json={"session_id": "request-metrics", "instance_id": "instance"},
+    )
+    assert finalized.status_code == 200
+
+    timeline = trajectory_store.read_trajectory(
+        "request-metrics",
+        segment_view="timeline",
+    )
+    assert len(timeline) == 1
+    assert timeline[0]["extra_info"] | {
+        "request_e2e_latency_seconds": 1.25,
+        "request_queue_seconds": 0.125,
+        "rebalancing_moved": True,
+    } == timeline[0]["extra_info"]
+    lineage = trajectory_store.read_trajectory("request-metrics")
+    assert lineage[0]["extra_info"]["request_metrics"] == [
+        {
+            "step_id": timeline[0]["extra_info"]["step_id"],
+            "request_e2e_latency_seconds": 1.25,
+            "request_queue_seconds": 0.125,
+            "rebalancing_moved": True,
+        }
+    ]
+
+
+def test_finalize_records_request_latency_when_rebalancing_is_off():
+    response = make_response("done")
+    response.meta_info.update({"e2e_latency": 0.75, "queue_time": 0.05})
+    client, _, trajectory_store, _ = make_client(response, token_build_mode="tito")
+
+    generated = client.post(
+        "/v1/chat/completions",
+        headers={"X-Session-Id": "off-request-metrics", "X-Instance-Id": "instance"},
+        json={"model": "fake-model", "messages": [{"role": "user", "content": "go"}]},
+    )
+    assert generated.status_code == 200
+    finalized = client.post(
+        "/session/finalize",
+        json={"session_id": "off-request-metrics", "instance_id": "instance"},
+    )
+    assert finalized.status_code == 200
+
+    extra = trajectory_store.read_trajectory(
+        "off-request-metrics",
+        segment_view="timeline",
+    )[0]["extra_info"]
+    assert extra["request_e2e_latency_seconds"] == 0.75
+    assert extra["request_queue_seconds"] == 0.05
+    assert extra["rebalancing_moved"] is False
 
 
 def test_finalize_write_failure_preserves_active_session_and_empty_store():
@@ -2496,7 +2623,7 @@ def test_sglang_router_client_get_weight_versions_probes_stable_topology():
                     ]
                 },
             )
-        if request.url.path == "/get_weight_version":
+        if request.url.path == "/model_info":
             worker_calls.append(str(request.url))
             return httpx.Response(200, json={"weight_version": "v7"})
         raise AssertionError(f"Unexpected request: {request.method} {request.url}")
@@ -4685,7 +4812,9 @@ def test_transfer_queue_partial_rollout_keeps_incremental_r3_layout():
     assert len(layout["fragments"]) == 1
 
 
-def test_transfer_queue_discard_keeps_native_cleanup_when_remote_clear_fails():
+def test_transfer_queue_discard_keeps_native_cleanup_when_remote_clear_fails(
+    monkeypatch,
+):
     tq = InMemoryTransferQueue()
     runtime = TransferQueueRuntime(
         TransferQueueStore(tq, store_id="test-store"),
@@ -4696,6 +4825,16 @@ def test_transfer_queue_discard_keeps_native_cleanup_when_remote_clear_fails():
         sglang_client=RoutingSGLangClient([make_response("answer")]),
         transfer_queue_runtime=runtime,
         transfer_params=("logprobs",),
+    )
+    discarded_contexts = []
+
+    async def discard_session_context(session_id):
+        discarded_contexts.append(session_id)
+
+    monkeypatch.setattr(
+        client.app.state.engine_rebalancer,
+        "discard_session_context",
+        discard_session_context,
     )
     assert client.post(
         "/v1/chat/completions",
@@ -4716,6 +4855,7 @@ def test_transfer_queue_discard_keeps_native_cleanup_when_remote_clear_fails():
     assert discarded.status_code == 200
     assert session_manager.get_session("sess-tq-discard") is None
     assert tq.data
+    assert discarded_contexts == ["sess-tq-discard"]
 
 
 def test_native_record_step_keeps_missing_session_behavior(monkeypatch):

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 import httpx
+import pytest
 
 from dressage.proxy.proxy_client import ProxyClient
 
@@ -94,3 +96,52 @@ def test_proxy_client_discards_session_with_default_headers():
     assert requests[0].url.path == "/session/discard"
     assert requests[0].headers["authorization"] == "Bearer proxy-secret"
     assert requests[0].read() == b'{"session_id":"failed-session"}'
+
+
+def test_proxy_client_registers_session_context_with_only_session_id():
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"success": True})
+
+    async def run_test() -> None:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler),
+        ) as http_client:
+            client = ProxyClient("http://proxy.test", client=http_client)
+            await client.register_session_context("session-1")
+
+    asyncio.run(run_test())
+
+    assert len(requests) == 1
+    assert requests[0].method == "POST"
+    assert requests[0].url.path == "/v1/session/context"
+    assert json.loads(requests[0].content) == {"session_id": "session-1"}
+
+
+def test_proxy_client_discards_session_context_with_delete_and_checks_status():
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(503, json={"detail": "unavailable"})
+
+    async def run_test() -> None:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler),
+        ) as http_client:
+            client = ProxyClient(
+                "http://proxy.test",
+                client=http_client,
+                default_headers={"Authorization": "Bearer proxy-secret"},
+            )
+            with pytest.raises(httpx.HTTPStatusError):
+                await client.discard_session_context("session-1")
+
+    asyncio.run(run_test())
+
+    assert len(requests) == 1
+    assert requests[0].method == "DELETE"
+    assert requests[0].url.path == "/v1/session/context/session-1"
+    assert requests[0].headers["authorization"] == "Bearer proxy-secret"

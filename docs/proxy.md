@@ -37,6 +37,7 @@ The proxy runs as a standalone FastAPI service (CLI: `dressage-proxy`) and is de
 - **Routing Replay (R3)** — For Mixture-of-Experts (MoE) models, the proxy captures routed expert IDs per generated token via `--use-rollout-routing-replay`. This data is stored as base64-encoded chunks and forwarded to training for faithful MoE routing replay.
 - **Configurable Parsers** — Pluggable tool call and reasoning extraction backends (`local`, `sglang_api`, `hybrid`). Both parser backends default to `sglang_api`; `local` parses model output directly, and `hybrid` tries SGLang first with local fallback. Reasoning parsers extract `<think>` blocks for models like Qwen3.
 - **Version and Context Safety** — Non-partial trajectories are rejected if the model weight version or rollout epoch changes mid-trajectory (`trajectory_version_changed`). Proxy-side context checks return stable `context_overflow` payloads and clamp generation to the exact remaining context budget. `--max-output-tokens` is an optional additional per-request hard cap.
+- **Engine Rebalancing** — Optional turn-boundary routing based on request, token, and queue pressure, with sticky sessions and mandatory failover.
 
 ## 🧱 Core Modules
 
@@ -250,7 +251,7 @@ Output limits are resolved independently for each request:
   single token, and combines it with any request or Proxy cap using `min(...)`.
 - If neither request nor CLI supplies a limit, the remaining context is used.
   If `--context-window` is also absent, the Proxy omits `max_new_tokens` and the
-  backend chooses its default ([SGLang 0.5.12 SamplingParams](https://github.com/sgl-project/sglang/blob/v0.5.12.post1/python/sglang/srt/sampling/sampling_params.py)
+  backend chooses its default ([SGLang 0.5.15.post1 SamplingParams](https://github.com/sgl-project/sglang/blob/v0.5.15.post1/python/sglang/srt/sampling/sampling_params.py)
   defaults to 128).
 
 `--no-dynamic-max-tokens` disables only the context-derived clamp. It does not
@@ -372,6 +373,7 @@ dressage/proxy/
 ├── reasoning_parser.py           # Reasoning content parsing
 ├── proxy_client.py               # Async client for rollout code
 ├── tool_call_ids.py              # Deterministic ID generation
+├── rebalancing/                  # Optional sticky greedy Engine routing
 ├── last_step/                    # Snapshot alignment helpers
 │   └── prompt_assistant_mask.py  # Assistant loss mask builder
 └── tito/                         # TITO tokenizer

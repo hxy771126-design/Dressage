@@ -317,6 +317,17 @@ class DressageDataSource(RolloutDataSourceWithBuffer):
                 s = copy.deepcopy(base_sample)
                 s.group_index = self.sample_group_index
                 s.index = self.sample_index
+                metadata = getattr(s, "metadata", None)
+                if (
+                    getattr(self.args, "sglang_enable_deterministic_inference", False)
+                    and isinstance(metadata, dict)
+                    and metadata.get("agent_mode") == "blackbox"
+                ):
+                    session_id = (
+                        f"bbs-det-{getattr(self.args, 'rollout_seed', 42)}-{s.index}"
+                    )
+                    s.session_id = session_id
+                    metadata["dressage_deterministic_session_id"] = session_id
                 self.sample_index += 1
                 group.append(s)
 

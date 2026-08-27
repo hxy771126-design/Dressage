@@ -223,6 +223,31 @@ def test_session_id_helper_owns_uuid_generation(monkeypatch) -> None:
     assert sample.session_id == "bbs-generated"
 
 
+@pytest.mark.asyncio
+async def test_deterministic_retry_prewarm_start_and_claim_use_same_session_id(
+) -> None:
+    from dressage.rollout.prewarm.store import PrewarmStore
+
+    state = object()
+    paddock = SimpleNamespace(init=AsyncMock(return_value=state))
+    sample = SimpleNamespace(
+        session_id=None,
+        metadata={
+            "dressage_deterministic_session_id": "bbs-det-42-3",
+            "dressage_retry_count": 2,
+        },
+    )
+    store = PrewarmStore()
+
+    session_id = store.start(sample, group_id=9, paddock=paddock, env_args={})
+    handle = await store.claim("bbs-det-42-3-retry-2")
+
+    assert session_id == "bbs-det-42-3-retry-2"
+    assert handle is not None
+    assert handle.session_id == session_id
+    paddock.init.assert_awaited_once_with(session_id, None, {})
+
+
 def test_prewarm_config_is_e2b_only(monkeypatch) -> None:
     from dressage.rollout.prewarm.config import (
         prewarm_ahead,

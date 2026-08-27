@@ -183,6 +183,7 @@ class SGLangRouterClient:
         return_routed_experts: bool = False,
         routing_key: str | None = None,
         request_id: str | None = None,
+        worker_url: str | None = None,
     ) -> SGLangResponse:
         payload = {
             "input_ids": input_ids,
@@ -202,8 +203,9 @@ class SGLangRouterClient:
         if routing_key:
             headers["X-SMG-Routing-Key"] = routing_key
 
+        target_url = (worker_url or self._router_url).rstrip("/")
         response = await self._client.post(
-            f"{self._router_url}/generate", json=payload, headers=headers
+            f"{target_url}/generate", json=payload, headers=headers
         )
         response.raise_for_status()
         data = response.json()
@@ -219,6 +221,7 @@ class SGLangRouterClient:
         *,
         routing_key: str | None = None,
         abort_all: bool = False,
+        worker_url: str | None = None,
     ) -> dict[str, Any]:
         """Signal SGLang to abort an active request by rid.
 
@@ -236,11 +239,20 @@ class SGLangRouterClient:
         successes: list[dict[str, Any]] = []
         errors: list[dict[str, Any]] = []
 
-        try:
-            workers = await self.list_workers()
-        except Exception as exc:
-            workers = []
-            errors.append({"target": f"{self._router_url}/workers", "error": repr(exc)})
+        if worker_url:
+            workers = [
+                SGLangWorkerInfo(
+                    url=worker_url.rstrip("/"),
+                    is_healthy=True,
+                    connection_mode="http",
+                )
+            ]
+        else:
+            try:
+                workers = await self.list_workers()
+            except Exception as exc:
+                workers = []
+                errors.append({"target": f"{self._router_url}/workers", "error": repr(exc)})
 
         for worker in self._candidate_workers(workers):
             target = f"{worker.url}/abort_request"
@@ -387,21 +399,10 @@ class SGLangRouterClient:
             )
 
         async def read(worker: SGLangWorkerInfo) -> tuple[str, str]:
-            response = await asyncio.wait_for(
-                self._client.get(f"{worker.url}/get_weight_version"),
-                timeout=timeout_seconds,
+            version = await self.get_worker_weight_version(
+                worker.url,
+                timeout_seconds=timeout_seconds,
             )
-            response.raise_for_status()
-            data = response.json()
-            if not isinstance(data, dict) or data.get("weight_version") is None:
-                raise ValueError(
-                    f"SGLang worker {worker.url!r} returned no weight_version"
-                )
-            version = str(data["weight_version"]).strip()
-            if not version:
-                raise ValueError(
-                    f"SGLang worker {worker.url!r} returned an empty weight_version"
-                )
             return worker.url, version
 
         pairs = await asyncio.gather(*(read(worker) for worker in workers))
@@ -417,6 +418,80 @@ class SGLangRouterClient:
                 "SGLang worker topology changed during weight-version probing"
             )
         return dict(pairs)
+
+    async def get_worker_weight_version(
+        self,
+        worker_url: str,
+        *,
+        timeout_seconds: float = 5.0,
+    ) -> str:
+        base = worker_url.rstrip("/")
+        last_error: Exception | None = None
+        # v0.5.15 moved weight_version to /model_info. Retain the old endpoint
+        # as a fallback for non-rebalancing deployments on an older baseline.
+        for endpoint in ("/model_info", "/get_weight_version"):
+            try:
+                response = await asyncio.wait_for(
+                    self._client.get(f"{base}{endpoint}"),
+                    timeout=timeout_seconds,
+                )
+                response.raise_for_status()
+                data = response.json()
+                if not isinstance(data, dict) or data.get("weight_version") is None:
+                    raise ValueError(
+                        f"SGLang worker {worker_url!r} returned no weight_version"
+                    )
+                version = str(data["weight_version"]).strip()
+                if not version:
+                    raise ValueError(
+                        f"SGLang worker {worker_url!r} returned an empty weight_version"
+                    )
+                return version
+            except httpx.HTTPStatusError as exc:
+                last_error = exc
+                if exc.response.status_code != 404:
+                    raise
+        assert last_error is not None
+        raise last_error
+
+    async def get_worker_loads(
+        self,
+        worker_url: str,
+        *,
+        timeout_seconds: float = 5.0,
+    ) -> dict[str, Any]:
+        """Read the public SGLang v1 load snapshot for one worker."""
+
+        response = await asyncio.wait_for(
+            self._client.get(
+                f"{worker_url.rstrip('/')}/v1/loads",
+                params={"include": "core,queues"},
+            ),
+            timeout=timeout_seconds,
+        )
+        response.raise_for_status()
+        data = response.json()
+        if not isinstance(data, dict):
+            raise ValueError(f"SGLang worker {worker_url!r} returned invalid loads")
+        return data
+
+    async def get_server_info(
+        self,
+        worker_url: str,
+        *,
+        timeout_seconds: float = 5.0,
+    ) -> dict[str, Any]:
+        """Read existing public deployment metadata without extending SGLang."""
+
+        response = await asyncio.wait_for(
+            self._client.get(f"{worker_url.rstrip('/')}/server_info"),
+            timeout=timeout_seconds,
+        )
+        response.raise_for_status()
+        data = response.json()
+        if not isinstance(data, dict):
+            raise ValueError(f"SGLang worker {worker_url!r} returned invalid server_info")
+        return data
 
     @staticmethod
     def _candidate_workers(workers: list[SGLangWorkerInfo]) -> list[SGLangWorkerInfo]:

@@ -92,6 +92,26 @@ class ProxyClient:
         response.raise_for_status()
         return response.json()
 
+    async def register_session_context(
+        self,
+        session_id: str,
+    ) -> dict:
+        response = await self._client.post(
+            f"{self._proxy_url}/v1/session/context",
+            json={"session_id": session_id},
+            headers=self._headers(),
+        )
+        response.raise_for_status()
+        return response.json()
+
+    async def discard_session_context(self, session_id: str) -> dict:
+        response = await self._client.delete(
+            f"{self._proxy_url}/v1/session/context/{session_id}",
+            headers=self._headers(),
+        )
+        response.raise_for_status()
+        return response.json()
+
     async def read_trajectory(
         self,
         *,

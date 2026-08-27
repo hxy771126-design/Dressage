@@ -19,10 +19,12 @@ from typing import Any, Callable, Literal
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
-from transformers import AutoTokenizer
+from transformers import AutoConfig, AutoTokenizer
 
 from dressage.config import (
     DEFAULT_TOKEN_BUILD_MODEL,
+    log_dir,
+    run_name as default_run_name,
     sglang_router_url as default_sglang_router_url,
     token_build_defaults,
 )
@@ -51,6 +53,7 @@ from .last_step import (
     PromptAssistantMaskBuilder,
     create_default_mask_template_registry,
 )
+from .rebalancing import EngineRebalancer, EngineRebalancingConfig
 from .reasoning_parser import ProxyReasoningParser, canonicalize_reasoning_content
 from .routed_experts import canonicalize_routed_experts
 from .session_manager import Route, Session, SessionFinalizedError, SessionManager, StepRecord
@@ -139,6 +142,50 @@ def _consume_task_exception(task: asyncio.Task[Any]) -> None:
         task.exception()
 
 
+async def _settle_routing_lease(settle: Any) -> None:
+    async def capture_settle_error() -> BaseException | None:
+        try:
+            await settle
+        except asyncio.CancelledError as exc:
+            return exc
+        except Exception as exc:
+            return exc
+        return None
+
+    settle_task = asyncio.create_task(
+        capture_settle_error(),
+        name="dressage-routing-lease-settle",
+    )
+    cancelled_error = None
+    while not settle_task.done():
+        try:
+            await asyncio.shield(settle_task)
+        except asyncio.CancelledError as exc:
+            if cancelled_error is None:
+                cancelled_error = exc
+        except Exception:
+            break
+
+    settle_error = (
+        asyncio.CancelledError() if settle_task.cancelled() else settle_task.result()
+    )
+    if cancelled_error is not None:
+        if settle_error is not None:
+            logger.warning(
+                "routing lease settle failed after caller cancellation",
+                exc_info=(
+                    type(settle_error),
+                    settle_error,
+                    settle_error.__traceback__,
+                ),
+            )
+        raise cancelled_error
+    if isinstance(settle_error, asyncio.CancelledError):
+        raise RuntimeError("routing lease settle was cancelled") from settle_error
+    if settle_error is not None:
+        raise settle_error
+
+
 def _bounded_number(
     *,
     kind: type[int] | type[float],
@@ -184,6 +231,26 @@ _positive_int = _bounded_number(kind=int, minimum=0, exclusive=True)
 _non_negative_int = _bounded_number(kind=int, minimum=0, exclusive=False)
 _non_negative_finite_float = _bounded_number(kind=float, minimum=0, exclusive=False)
 _positive_float = _bounded_number(kind=float, minimum=0, exclusive=True)
+
+
+def _optional_response_duration(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if math.isfinite(parsed) and parsed >= 0 else None
+
+
+def _unit_interval_float(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a number") from exc
+    if not math.isfinite(parsed) or not 0.0 <= parsed <= 1.0:
+        raise argparse.ArgumentTypeError("must be between 0 and 1")
+    return parsed
 
 
 def _real_token_version(value: Any) -> str | None:
@@ -452,6 +519,15 @@ def _build_sampling_params(
         "no_stop_trim": True,
         "spaces_between_special_tokens": False,
     }
+    if "seed" in body:
+        seed = body["seed"]
+        if (
+            not isinstance(seed, int)
+            or isinstance(seed, bool)
+            or not -(2**63) <= seed <= 2**63 - 1
+        ):
+            raise ValueError("seed must be a signed 64-bit integer")
+        sampling_params["sampling_seed"] = seed
     if requested_max_tokens is not None and max_output_tokens is not None:
         sampling_params["max_new_tokens"] = min(
             requested_max_tokens,
@@ -675,6 +751,12 @@ def create_app(
     routed_experts_dtype: Literal["uint8", "uint16", "int32"] = "int32",
     partial_rollout: bool = False,
     max_partial_rollout_preempts: int | None = None,
+    enable_engine_rebalancing: bool = False,
+    engine_rebalancing_config: EngineRebalancingConfig | None = None,
+    engine_rebalancing_model_config: Any | None = None,
+    engine_rebalancing_calibration_benchmark: Any | None = None,
+    engine_rebalancing_snapshot_root: str | os.PathLike[str] | None = None,
+    engine_rebalancing_snapshot_run_name: str = "dressage",
     stream_heartbeat_interval_seconds: float = (
         _DEFAULT_STREAM_HEARTBEAT_INTERVAL_SECONDS
     ),
@@ -813,6 +895,32 @@ def create_app(
     generation_controller = GenerationController(
         sglang_client,
         partial_rollout=partial_rollout,
+    )
+    rebalancing_config = engine_rebalancing_config or EngineRebalancingConfig(
+        enabled=enable_engine_rebalancing
+    )
+    if enable_engine_rebalancing and not rebalancing_config.enabled:
+        rebalancing_config.enabled = True
+    if rebalancing_config.enabled and engine_rebalancing_model_config is None:
+        try:
+            engine_rebalancing_model_config = AutoConfig.from_pretrained(
+                tokenizer_path,
+                trust_remote_code=True,
+            )
+        except Exception:
+            logger.warning(
+                "could not load model config for engine rebalancing; Mooncake paths "
+                "will remain unavailable until a model cache profile is available",
+                exc_info=True,
+            )
+    engine_rebalancer = EngineRebalancer(
+        sglang_client,
+        config=rebalancing_config,
+        model_id=tokenizer_path or token_build_model,
+        model_config=engine_rebalancing_model_config,
+        calibration_benchmark=engine_rebalancing_calibration_benchmark,
+        calibration_snapshot_root=engine_rebalancing_snapshot_root,
+        calibration_snapshot_run_name=engine_rebalancing_snapshot_run_name,
     )
     tito_tokenizer = None
     effective_model_mask_type = model_mask_type
@@ -1182,14 +1290,17 @@ def create_app(
         if transfer_queue_runtime is not None:
             transfer_queue_runtime.start_retention()
         try:
+            await engine_rebalancer.start()
             yield
         finally:
+            await engine_rebalancer.close()
             await generation_controller.shutdown(timeout_seconds=5.0)
             await sglang_client.close()
             if transfer_queue_runtime is not None:
                 await transfer_queue_runtime.close()
 
     app = FastAPI(title="Dressage Proxy", lifespan=lifespan)
+    app.state.engine_rebalancer = engine_rebalancer
 
     chat_template = getattr(tokenizer, "chat_template", None)
     chat_template_fingerprint = (
@@ -1342,6 +1453,9 @@ def create_app(
             "segment_reason": segment["segment_reason"],
             "segment_reasons": segment["segment_reasons"],
             "trajectory_num_segments": segment_count,
+            "request_e2e_latency_seconds": step.request_e2e_latency_seconds,
+            "request_queue_seconds": step.request_queue_seconds,
+            "rebalancing_moved": step.rebalancing_moved,
         }
         if invalid:
             extra_info["snapshot_logprobs_invalid"] = True
@@ -1451,6 +1565,17 @@ def create_app(
             "segment_reason": segment["segment_reason"],
             "segment_reasons": segment["segment_reasons"],
             "trajectory_num_segments": segment_count,
+            "request_metrics": [
+                {
+                    "step_id": step.step_id,
+                    "request_e2e_latency_seconds": (
+                        step.request_e2e_latency_seconds
+                    ),
+                    "request_queue_seconds": step.request_queue_seconds,
+                    "rebalancing_moved": step.rebalancing_moved,
+                }
+                for step in steps
+            ],
         }
         if concat_logprobs_invalid:
             extra_info["tito_logprobs_invalid"] = True
@@ -1982,11 +2107,14 @@ def create_app(
                 lineage_segment_boundary_before = True
             request_logprob_start_len = -1 if token_build_mode == "tito" else 0
             prompt_tokens = len(input_ids)
-            sampling_params = _build_sampling_params(
-                body,
-                max_output_tokens,
-                rollout_temperature,
-            )
+            try:
+                sampling_params = _build_sampling_params(
+                    body,
+                    max_output_tokens,
+                    rollout_temperature,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
             configured_max_tokens = sampling_params.get("max_new_tokens")
             max_tokens = int(configured_max_tokens or 0)
 
@@ -2039,6 +2167,9 @@ def create_app(
                 )
 
             expected_version = request.headers.get("X-Dressage-Expected-Version")
+            require_registered_context = (
+                request.headers.get("X-Dressage-Partial-Rollout") == "1"
+            )
             _raise_if_cross_version_trajectory(
                 session=session,
                 candidate_versions=[
@@ -2048,22 +2179,53 @@ def create_app(
                 partial_rollout=partial_rollout,
             )
             try:
-                router_response = await generation_controller.generate_preemptible(
-                    input_ids=input_ids,
-                    sampling_params=sampling_params,
+                routing_lease = await engine_rebalancer.acquire(
                     session_id=session_id,
-                    instance_id=instance_id,
-                    turn_id=effective_turn_id,
-                    routing_key=session_id,
+                    input_ids=input_ids,
                     expected_version=expected_version,
-                    expected_epoch=(
-                        request_rollout_epoch
-                        if (not partial_rollout and session.steps)
-                        else None
-                    ),
-                    logprob_start_len=request_logprob_start_len,
-                    context_window=context_window,
+                    require_registered_context=require_registered_context,
                 )
+            except RuntimeError as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail={
+                        "error": "engine_rebalancing_unavailable",
+                        "message": str(exc),
+                    },
+                ) from exc
+            try:
+                try:
+                    router_response = await generation_controller.generate_preemptible(
+                        input_ids=input_ids,
+                        sampling_params=sampling_params,
+                        session_id=session_id,
+                        instance_id=instance_id,
+                        turn_id=effective_turn_id,
+                        routing_key=session_id,
+                        worker_url=routing_lease.worker_url,
+                        expected_version=expected_version,
+                        expected_epoch=(
+                            request_rollout_epoch
+                            if (not partial_rollout and session.steps)
+                            else None
+                        ),
+                        logprob_start_len=request_logprob_start_len,
+                        context_window=context_window,
+                    )
+                except BaseException:
+                    try:
+                        await _settle_routing_lease(
+                            engine_rebalancer.fail(routing_lease)
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        logger.warning(
+                            "engine rebalancing failure settle failed; "
+                            "generation error is unaffected",
+                            exc_info=True,
+                        )
+                    raise
             except GenerationVersionMismatch as exc:
                 raise HTTPException(
                     status_code=502,
@@ -2133,6 +2295,20 @@ def create_app(
                     status_code=503,
                     detail={"error": "sglang_upstream_unavailable", "detail": str(exc)},
                 ) from exc
+
+            try:
+                await _settle_routing_lease(
+                    engine_rebalancer.complete(
+                        routing_lease,
+                        committed_tokens=list(router_response.all_token_ids),
+                    )
+                )
+            except Exception:
+                logger.warning(
+                    "engine rebalancing lease settlement failed; "
+                    "generation result is unaffected",
+                    exc_info=True,
+                )
 
             raw_text = router_response.text
             response_token_ids = router_response.output_ids
@@ -2345,6 +2521,13 @@ def create_app(
                 request_version=str(request_version),
                 response_version=str(response_version),
                 tool_call_hook_metadata=tool_call_hook_metadata,
+                request_e2e_latency_seconds=_optional_response_duration(
+                    router_response.meta_info.get("e2e_latency")
+                ),
+                request_queue_seconds=_optional_response_duration(
+                    router_response.meta_info.get("queue_time")
+                ),
+                rebalancing_moved=routing_lease.decision.moved,
             )
 
             if output_overflow:
@@ -2508,6 +2691,7 @@ def create_app(
         if not enable_transfer_queue:
             session_removed = session_manager.discard_session(session_id)
             removed_segments = trajectory_store.pop_trajectory(session_id)
+            await engine_rebalancer.discard_session_context(session_id)
             return {
                 "success": True,
                 "session_id": session_id,
@@ -2546,6 +2730,8 @@ def create_app(
                     logger.exception(
                         "TransferQueue discard failed; retention will reclaim the data"
                     )
+
+            await engine_rebalancer.discard_session_context(session_id)
 
             return {
                 "success": True,
@@ -2698,12 +2884,40 @@ def create_app(
             if finalized is not session:  # defensive; request_lock owns finalize
                 raise RuntimeError("session changed during atomic finalization")
 
+            await engine_rebalancer.finalize_session(session_id)
+
         if tool_call_hook_chain is not None:
             purged = tool_call_hook_chain.purge_session(session_id)
             if purged:
                 finalization_result["tool_call_hook_keys_purged"] = purged
 
         return finalization_result
+
+    @app.post("/v1/session/context")
+    async def register_session_context(request: Request):
+        _check_auth(request)
+        body = await request.json()
+        session_id = str(body.get("session_id") or "").strip()
+        if not session_id:
+            raise HTTPException(status_code=400, detail="session_id is required")
+        await engine_rebalancer.register_session_context(session_id=session_id)
+        return {"success": True, "session_id": session_id}
+
+    @app.delete("/v1/session/context/{session_id}")
+    async def discard_session_context(session_id: str, request: Request):
+        _check_auth(request)
+        await engine_rebalancer.discard_session_context(session_id)
+        return {"success": True, "session_id": session_id}
+
+    @app.get("/v1/engines/load")
+    async def engine_rebalancing_loads(request: Request):
+        _check_auth(request)
+        return await engine_rebalancer.snapshot()
+
+    @app.get("/v1/engines/calibration")
+    async def engine_rebalancing_calibration(request: Request):
+        _check_auth(request)
+        return engine_rebalancer.calibration_snapshot()
 
     @app.post("/trajectory/read")
     async def trajectory_read(request: Request):
@@ -2867,6 +3081,7 @@ def create_app(
                 "use_rollout_routing_replay": use_rollout_routing_replay,
                 "partial_rollout": partial_rollout,
                 "max_partial_rollout_preempts": max_partial_rollout_preempts,
+                "engine_rebalancing": rebalancing_config.snapshot(),
                 "stream_heartbeat_interval_seconds": (
                     stream_heartbeat_interval_seconds
                 ),
@@ -3000,6 +3215,30 @@ def parse_args() -> argparse.Namespace:
         help="Maximum model weight version switches allowed for one partial-rollout session.",
     )
     parser.add_argument(
+        "--enable-engine-rebalancing",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable Proxy-side SGLang engine placement and turn-boundary "
+            "rebalancing. Disabled by default."
+        ),
+    )
+    parser.add_argument(
+        "--engine-rebalancing-min-load-improvement-ratio",
+        type=_unit_interval_float,
+        default=0.10,
+        help=(
+            "Required relative projected Pressure reduction from a healthy "
+            "existing step's owner to a voluntary target Engine."
+        ),
+    )
+    parser.add_argument(
+        "--engine-rebalancing-load-snapshot-poll-interval-ms",
+        type=_positive_int,
+        default=60,
+        help="Milliseconds between background /v1/loads probes per Engine.",
+    )
+    parser.add_argument(
         "--stream-heartbeat-interval-seconds",
         type=_non_negative_finite_float,
         default=_DEFAULT_STREAM_HEARTBEAT_INTERVAL_SECONDS,
@@ -3109,6 +3348,22 @@ def main() -> None:
         routed_experts_dtype=args.routed_experts_dtype,
         partial_rollout=args.dressage_partial_rollout,
         max_partial_rollout_preempts=args.max_partial_rollout_preempts,
+        enable_engine_rebalancing=args.enable_engine_rebalancing,
+        engine_rebalancing_config=EngineRebalancingConfig(
+            enabled=args.enable_engine_rebalancing,
+            load_snapshot_poll_interval_ms=(
+                args.engine_rebalancing_load_snapshot_poll_interval_ms
+            ),
+            min_load_improvement_ratio=(
+                args.engine_rebalancing_min_load_improvement_ratio
+            ),
+        ),
+        engine_rebalancing_snapshot_root=(
+            log_dir() / "proxy" / "rebalancing"
+            if args.enable_engine_rebalancing
+            else None
+        ),
+        engine_rebalancing_snapshot_run_name=default_run_name(),
         stream_heartbeat_interval_seconds=args.stream_heartbeat_interval_seconds,
         enable_transfer_queue=args.enable_transfer_queue,
         transfer_queue_config=args.transfer_queue_config,

@@ -630,6 +630,8 @@ class ClaudeCodeAdapter(BackendAdapter):
             sticky_header_name=options.proxy.sticky_header_name,
             max_steps=options.proxy.max_steps,
             default_temperature=options.proxy.default_temperature,
+            sampling_mode=options.proxy.sampling_mode,
+            sampling_seed_base=options.proxy.sampling_seed_base,
             debug_log_dir=Path(binding_context.binding.runtime_dir) / "logs",
         )
         config = uvicorn.Config(

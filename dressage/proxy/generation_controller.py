@@ -108,6 +108,7 @@ class _ActiveGeneration:
     instance_id: str | None
     turn_id: str | None
     routing_key: str | None
+    worker_url: str | None
     input_ids: list[int]
     generated_ids_at_start: list[int]
     sampling_params: dict[str, Any]
@@ -164,6 +165,7 @@ class GenerationController:
         instance_id: str | None,
         turn_id: str | None,
         routing_key: str | None = None,
+        worker_url: str | None = None,
         expected_version: str | None = None,
         expected_epoch: int | None = None,
         logprob_start_len: int = 0,
@@ -212,6 +214,7 @@ class GenerationController:
                 instance_id=instance_id,
                 turn_id=turn_id,
                 routing_key=routing_key,
+                worker_url=worker_url,
                 input_ids=list(input_ids),
                 generated_ids_at_start=list(generated_ids),
                 sampling_params=dict(chunk_sampling_params),
@@ -242,6 +245,7 @@ class GenerationController:
                     list(input_ids) + list(generated_ids),
                     chunk_sampling_params,
                     routing_key=routing_key,
+                    worker_url=worker_url,
                     request_id=active.request_id,
                     logprob_start_len=chunk_logprob_start_len,
                 )
@@ -674,6 +678,7 @@ class GenerationController:
         sampling_params: dict[str, Any],
         *,
         routing_key: str | None,
+        worker_url: str | None,
         request_id: str,
         logprob_start_len: int,
     ) -> SGLangResponse:
@@ -693,6 +698,8 @@ class GenerationController:
             kwargs["request_id"] = request_id
         if accepts_kwargs or "logprob_start_len" in parameters:
             kwargs["logprob_start_len"] = logprob_start_len
+        if worker_url is not None and (accepts_kwargs or "worker_url" in parameters):
+            kwargs["worker_url"] = worker_url
         return await generate(input_ids, sampling_params, **kwargs)
 
     async def _abort_active_with_timeout(
@@ -707,7 +714,21 @@ class GenerationController:
 
     async def _abort_active(self, active: _ActiveGeneration) -> dict[str, Any]:
         if hasattr(self._sglang_client, "abort_request"):
-            payload = await self._sglang_client.abort_request(active.request_id, routing_key=active.routing_key)
+            abort = self._sglang_client.abort_request
+            try:
+                signature = inspect.signature(abort)
+            except (TypeError, ValueError):
+                signature = None
+            kwargs: dict[str, Any] = {"routing_key": active.routing_key}
+            if signature is not None and (
+                "worker_url" in signature.parameters
+                or any(
+                    item.kind == inspect.Parameter.VAR_KEYWORD
+                    for item in signature.parameters.values()
+                )
+            ):
+                kwargs["worker_url"] = active.worker_url
+            payload = await abort(active.request_id, **kwargs)
         else:
             payload = await self._abort_request_fallback(active.request_id, routing_key=active.routing_key)
         active.abort_payload = payload

@@ -296,6 +296,7 @@ class BlackboxServer:
                     router_api_path=router_api_path,
                     system_prompt_file=system_prompt_file,
                     effective_config=effective_config,
+                    proxy_options=proxy_options,
                 )
                 self._adapter = adapter
                 await self._adapter.initialize(new_binding_context)
@@ -1284,8 +1285,15 @@ class BlackboxServer:
         router_api_path: str,
         system_prompt_file: str | None,
         effective_config: BlackboxServerConfig,
+        proxy_options: ProxyOptions,
     ) -> BindingContext:
-        runtime_id = make_runtime_id()
+        bound_session_id = request.bound_session_id
+        assert bound_session_id is not None
+        runtime_id = (
+            bound_session_id
+            if proxy_options.sampling_mode == "force"
+            else make_runtime_id()
+        )
         runtime_dir = ensure_runtime_dir(effective_config.runtime_root, runtime_id)
         system_prompt = None
         if system_prompt_file is not None:
@@ -1309,7 +1317,7 @@ class BlackboxServer:
             router_raw=request.router,
             router_base_url=router_base_url,
             router_api_path=router_api_path,
-            bound_session_id=request.bound_session_id or "",
+            bound_session_id=bound_session_id,
             bound_instance_id=request.bound_instance_id or "",
             bound_sandbox_id=request.bound_sandbox_id or None,
             system_prompt=system_prompt,

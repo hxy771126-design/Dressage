@@ -151,6 +151,15 @@ async def generate_group(
             for sample in generated
         ):
             await discard_rollout_groups_best_effort([generated, group])
+async def register_rollout_session_context(
+    proxy_client: Any,
+    *,
+    session_id: str,
+) -> None:
+    register = getattr(proxy_client, "register_session_context", None)
+    if not callable(register):
+        return
+    await maybe_await(register(session_id))
 
 
 def get_paddock_from_env(

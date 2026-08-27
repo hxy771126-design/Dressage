@@ -479,6 +479,51 @@ class FakeProxy:
         return {"success": True, "session_id": session_id}
 
 
+class ContextProxy(FakeProxy):
+    def __init__(
+        self,
+        *,
+        register_response_lost: bool = False,
+        finalize_response_lost: bool = False,
+        discard_error: BaseException | None = None,
+        discard_release: asyncio.Event | None = None,
+    ):
+        super().__init__()
+        self.active_contexts: set[str] = set()
+        self.context_calls: list[tuple[str, str]] = []
+        self.register_response_lost = register_response_lost
+        self.finalize_response_lost = finalize_response_lost
+        self.discard_error = discard_error
+        self.discard_release = discard_release
+        self.discard_started = asyncio.Event()
+
+    async def register_session_context(self, session_id):
+        self.context_calls.append(("register", session_id))
+        self.active_contexts.add(session_id)
+        if self.register_response_lost:
+            raise RuntimeError("register response lost")
+        return {"success": True, "session_id": session_id}
+
+    async def finalize_session(self, session_id, *, instance_id=None, label=None):
+        self.context_calls.append(("finalize", session_id))
+        self.active_contexts.discard(session_id)
+        if self.finalize_response_lost:
+            raise RuntimeError("finalize response lost")
+        return await super().finalize_session(
+            session_id, instance_id=instance_id, label=label
+        )
+
+    async def discard_session_context(self, session_id):
+        self.context_calls.append(("discard", session_id))
+        self.discard_started.set()
+        if self.discard_release is not None:
+            await self.discard_release.wait()
+        self.active_contexts.discard(session_id)
+        if self.discard_error is not None:
+            raise self.discard_error
+        return {"success": True, "session_id": session_id}
+
+
 def _rollout_args(
     *,
     max_tokens_per_gpu: int = 8,
@@ -833,8 +878,97 @@ async def _run_blackbox_dispatch_claims_prewarm_handle(monkeypatch):
     )
 
 
+def test_blackbox_dispatch_claims_deterministic_retry_prewarm(monkeypatch):
+    asyncio.run(
+        _run_blackbox_dispatch_claims_deterministic_retry_prewarm(monkeypatch)
+    )
+
+
+async def _run_blackbox_dispatch_claims_deterministic_retry_prewarm(monkeypatch):
+    default_paddock = FakePaddock()
+    prewarmed_paddock = FakePaddock()
+    proxy = FakeProxy()
+    store = prewarm_store.PrewarmStore()
+    sample = SampleLike(
+        session_id=None,
+        metadata={
+            "dressage_deterministic_session_id": "bbs-det-42-3",
+            "dressage_retry_count": 2,
+            "prewarm_requested": True,
+        },
+    )
+
+    started_session_id = store.start(
+        sample,
+        group_id=21,
+        paddock=prewarmed_paddock,
+        env_args={"from": "prewarm"},
+    )
+    monkeypatch.setattr(generate_runtime, "_PADDOCK", default_paddock)
+    monkeypatch.setattr(generate_runtime, "_PROXY_CLIENT", proxy)
+    monkeypatch.setattr(blackbox_dispatch, "claim_prewarm", store.claim)
+
+    result = await blackbox_dispatch.generate(_rollout_args(), sample, {})
+    await paddock_lifecycle.drain_terminate_tasks()
+
+    assert started_session_id == "bbs-det-42-3-retry-2"
+    assert _last_segment_sample(result).status == SampleLike.Status.COMPLETED
+    assert sample.session_id == started_session_id
+    assert sample.metadata["prewarm_hit"] == 1
+    assert default_paddock.calls == []
+    assert prewarmed_paddock.calls[0] == (
+        "init",
+        started_session_id,
+        None,
+        {"from": "prewarm"},
+    )
+    assert prewarmed_paddock.calls[1][0] == "register_agent"
+
+
 def test_blackbox_dispatch_prewarm_miss_uses_new_session_id(monkeypatch):
     asyncio.run(_run_blackbox_dispatch_prewarm_miss_uses_new_session_id(monkeypatch))
+
+
+def test_blackbox_dispatch_uses_deterministic_retry_miss_and_sampling_seed(monkeypatch):
+    asyncio.run(
+        _run_blackbox_dispatch_uses_deterministic_retry_miss_and_sampling_seed(
+            monkeypatch
+        )
+    )
+
+
+async def _run_blackbox_dispatch_uses_deterministic_retry_miss_and_sampling_seed(
+    monkeypatch,
+):
+    paddock = FakePaddock()
+    proxy = FakeProxy()
+
+    async def claim(session_id):
+        assert session_id == "bbs-det-42-3-retry-2"
+        return None
+
+    monkeypatch.setattr(generate_runtime, "_PADDOCK", paddock)
+    monkeypatch.setattr(generate_runtime, "_PROXY_CLIENT", proxy)
+    monkeypatch.setattr(blackbox_dispatch, "claim_prewarm", claim)
+    sample = SampleLike(
+        session_id=None,
+        metadata={
+            "dressage_deterministic_session_id": "bbs-det-42-3",
+            "dressage_retry_count": 2,
+        },
+    )
+
+    result = await blackbox_dispatch.generate(
+        _rollout_args(), sample, {"sampling_seed": 700}
+    )
+    await paddock_lifecycle.drain_terminate_tasks()
+
+    assert _last_segment_sample(result).status == SampleLike.Status.COMPLETED
+    assert sample.session_id == "bbs-det-42-3-retry-2-miss"
+    assert sample.metadata["rollout_sampling_seed"] == 700
+    register_call = next(call for call in paddock.calls if call[0] == "register_agent")
+    assert register_call[2]["backend_options"]["proxy"]["sampling_mode"] == "force"
+    assert register_call[2]["backend_options"]["proxy"]["sampling_seed_base"] == 700
 
 
 async def _run_blackbox_dispatch_prewarm_miss_uses_new_session_id(monkeypatch):
@@ -919,6 +1053,320 @@ async def _run_blackbox_dispatch_failed_prewarm_uses_new_session_id(monkeypatch)
             {"trajectory_id": new_session_id, "instance_id": "7", "drain": True},
         ),
     ]
+
+
+def test_blackbox_dispatch_prewarm_hit_owns_only_final_session_context(monkeypatch):
+    async def scenario():
+        default_paddock = FakePaddock()
+        prewarmed_paddock = FakePaddock()
+        proxy = ContextProxy()
+        state = {"sandbox_url": "http://prewarmed.test"}
+
+        async def claim(session_id):
+            assert session_id == "bbs-hit"
+            return PrewarmHandle(
+                session_id=session_id,
+                group_id=7,
+                paddock=prewarmed_paddock,
+                state=state,
+                env_args={},
+            )
+
+        monkeypatch.setattr(generate_runtime, "_PADDOCK", default_paddock)
+        monkeypatch.setattr(generate_runtime, "_PROXY_CLIENT", proxy)
+        monkeypatch.setattr(blackbox_dispatch, "claim_prewarm", claim)
+
+        result = await blackbox_dispatch.generate(
+            _rollout_args(), SampleLike(session_id="hit"), {}
+        )
+        await paddock_lifecycle.drain_terminate_tasks()
+
+        assert _last_segment_sample(result).status == SampleLike.Status.COMPLETED
+        assert proxy.context_calls == [
+            ("register", "bbs-hit"),
+            ("finalize", "bbs-hit"),
+        ]
+        assert not proxy.active_contexts
+
+    asyncio.run(scenario())
+
+
+def test_blackbox_dispatch_prewarm_miss_never_registers_old_session(monkeypatch):
+    async def scenario():
+        proxy = ContextProxy()
+        paddock = FakePaddock()
+
+        async def claim(session_id):
+            assert session_id == "bbs-old"
+            return None
+
+        monkeypatch.setattr(generate_runtime, "_PADDOCK", paddock)
+        monkeypatch.setattr(generate_runtime, "_PROXY_CLIENT", proxy)
+        monkeypatch.setattr(blackbox_dispatch, "claim_prewarm", claim)
+        monkeypatch.setattr(prewarm_store.uuid, "uuid4", lambda: "new")
+
+        sample = SampleLike(session_id="old")
+        result = await blackbox_dispatch.generate(_rollout_args(), sample, {})
+        await paddock_lifecycle.drain_terminate_tasks()
+
+        assert _last_segment_sample(result).status == SampleLike.Status.COMPLETED
+        assert sample.session_id == "bbs-new"
+        assert proxy.context_calls == [
+            ("register", "bbs-new"),
+            ("finalize", "bbs-new"),
+        ]
+        assert not proxy.active_contexts
+
+    asyncio.run(scenario())
+
+
+def test_blackbox_dispatch_before_agent_failure_does_not_register_context(monkeypatch):
+    async def scenario():
+        proxy = ContextProxy()
+        paddock = FailingExecuteCmdPaddock()
+        monkeypatch.setattr(generate_runtime, "_PADDOCK", paddock)
+        monkeypatch.setattr(generate_runtime, "_PROXY_CLIENT", proxy)
+        sample = SampleLike(
+            metadata={
+                "blackbox_execute_cmds": _blackbox_execute_cmds(
+                    before_agent=[
+                        {"name": "required", "cmd": "exit 2", "required": True}
+                    ]
+                )
+            }
+        )
+
+        result = await blackbox_dispatch.generate(_rollout_args(), sample, {})
+        await paddock_lifecycle.drain_terminate_tasks()
+
+        assert result.status == SampleLike.Status.ABORTED
+        assert proxy.context_calls == []
+        assert not proxy.active_contexts
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("lost_response", ["register", "finalize"])
+def test_blackbox_dispatch_response_loss_discards_server_context(
+    monkeypatch, lost_response
+):
+    async def scenario():
+        proxy = ContextProxy(
+            register_response_lost=lost_response == "register",
+            finalize_response_lost=lost_response == "finalize",
+        )
+        paddock = FakePaddock()
+        monkeypatch.setattr(generate_runtime, "_PADDOCK", paddock)
+        monkeypatch.setattr(generate_runtime, "_PROXY_CLIENT", proxy)
+
+        sample = SampleLike()
+        result = await blackbox_dispatch.generate(_rollout_args(), sample, {})
+        await paddock_lifecycle.drain_terminate_tasks()
+
+        assert result.status == SampleLike.Status.ABORTED
+        assert proxy.context_calls[-1] == ("discard", "bbs-sess-7")
+        assert not proxy.active_contexts
+        if lost_response == "register":
+            assert not [call for call in paddock.calls if call[0] == "call_agent"]
+
+    asyncio.run(scenario())
+
+
+def test_blackbox_dispatch_call_failure_discards_without_masking_error(monkeypatch):
+    class FailingCallPaddock(FakePaddock):
+        async def call_agent(self, state, **kwargs):
+            self.calls.append(("call_agent", state, kwargs))
+            raise RuntimeError("agent boom")
+
+    async def scenario():
+        proxy = ContextProxy(discard_error=RuntimeError("discard boom"))
+        monkeypatch.setattr(generate_runtime, "_PADDOCK", FailingCallPaddock())
+        monkeypatch.setattr(generate_runtime, "_PROXY_CLIENT", proxy)
+        sample = SampleLike()
+
+        result = await blackbox_dispatch.generate(_rollout_args(), sample, {})
+        await paddock_lifecycle.drain_terminate_tasks()
+
+        assert result.status == SampleLike.Status.ABORTED
+        assert "agent boom" in sample.metadata["blackbox_error"]
+        assert "discard boom" in sample.metadata["session_context_discard_error"]
+        assert proxy.context_calls == [
+            ("register", "bbs-sess-7"),
+            ("discard", "bbs-sess-7"),
+        ]
+
+    asyncio.run(scenario())
+
+
+def test_blackbox_dispatch_cleanup_self_cancel_does_not_mask_agent_error(
+    monkeypatch, caplog
+):
+    class FailingCallPaddock(FakePaddock):
+        async def call_agent(self, state, **kwargs):
+            self.calls.append(("call_agent", state, kwargs))
+            raise RuntimeError("agent boom")
+
+    async def scenario():
+        proxy = ContextProxy(
+            discard_error=asyncio.CancelledError("discard self-cancelled")
+        )
+        monkeypatch.setattr(generate_runtime, "_PADDOCK", FailingCallPaddock())
+        monkeypatch.setattr(generate_runtime, "_PROXY_CLIENT", proxy)
+        sample = SampleLike()
+
+        result = await blackbox_dispatch.generate(_rollout_args(), sample, {})
+        await paddock_lifecycle.drain_terminate_tasks()
+
+        assert result.status == SampleLike.Status.ABORTED
+        assert "agent boom" in sample.metadata["blackbox_error"]
+        assert sample.metadata["session_context_discard_error"] == (
+            "discard self-cancelled"
+        )
+
+    with caplog.at_level(
+        logging.WARNING,
+        logger="dressage.rollout.generate.blackbox_dispatch",
+    ):
+        asyncio.run(scenario())
+
+    assert "failed to discard session context" in caplog.text
+    assert "discard self-cancelled" in caplog.text
+
+
+def test_blackbox_dispatch_cancellation_waits_for_context_discard(monkeypatch):
+    class BlockingCallPaddock(FakePaddock):
+        def __init__(self):
+            super().__init__()
+            self.started = asyncio.Event()
+
+        async def call_agent(self, state, **kwargs):
+            self.calls.append(("call_agent", state, kwargs))
+            self.started.set()
+            await asyncio.Event().wait()
+
+    async def scenario():
+        discard_release = asyncio.Event()
+        loop_errors = []
+        asyncio.get_running_loop().set_exception_handler(
+            lambda _loop, context: loop_errors.append(context)
+        )
+        proxy = ContextProxy(
+            discard_release=discard_release,
+            discard_error=RuntimeError("late discard boom"),
+        )
+        paddock = BlockingCallPaddock()
+        monkeypatch.setattr(generate_runtime, "_PADDOCK", paddock)
+        monkeypatch.setattr(generate_runtime, "_PROXY_CLIENT", proxy)
+        sample = SampleLike()
+
+        task = asyncio.create_task(
+            blackbox_dispatch.generate(_rollout_args(), sample, {})
+        )
+        await paddock.started.wait()
+        task.cancel("first")
+        await asyncio.wait_for(proxy.discard_started.wait(), timeout=0.5)
+        assert not task.done()
+        task.cancel("second")
+        await asyncio.sleep(0)
+        assert not task.done()
+        discard_release.set()
+
+        with pytest.raises(asyncio.CancelledError) as cancelled:
+            await task
+        assert cancelled.value.args == ("first",)
+        await asyncio.sleep(0)
+        assert not proxy.active_contexts
+        assert "late discard boom" in sample.metadata[
+            "session_context_discard_error"
+        ]
+        assert loop_errors == []
+
+    asyncio.run(scenario())
+
+
+def test_blackbox_dispatch_preserves_cancel_from_error_logging_during_cleanup(
+    monkeypatch,
+):
+    class FailingCallPaddock(FakePaddock):
+        async def call_agent(self, state, **kwargs):
+            self.calls.append(("call_agent", state, kwargs))
+            raise RuntimeError("agent boom")
+
+    async def scenario():
+        write_error_started = asyncio.Event()
+        discard_release = asyncio.Event()
+        proxy = ContextProxy(discard_release=discard_release)
+        monkeypatch.setattr(generate_runtime, "_PADDOCK", FailingCallPaddock())
+        monkeypatch.setattr(generate_runtime, "_PROXY_CLIENT", proxy)
+
+        async def blocking_write_error(*args, **kwargs):
+            write_error_started.set()
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(
+            blackbox_dispatch._ARTIFACT_WRITER,
+            "write_error",
+            blocking_write_error,
+        )
+
+        task = asyncio.create_task(
+            blackbox_dispatch.generate(_rollout_args(), SampleLike(), {})
+        )
+        await write_error_started.wait()
+        task.cancel("first")
+        await asyncio.wait_for(proxy.discard_started.wait(), timeout=0.5)
+        assert not task.done()
+        task.cancel("second")
+        await asyncio.sleep(0)
+        assert not task.done()
+        discard_release.set()
+
+        with pytest.raises(asyncio.CancelledError) as cancelled:
+            await task
+        assert cancelled.value.args == ("first",)
+        assert not proxy.active_contexts
+
+    asyncio.run(scenario())
+
+
+def test_blackbox_dispatch_propagates_first_cancel_that_occurs_in_cleanup(
+    monkeypatch,
+):
+    class FailingCallPaddock(FakePaddock):
+        async def call_agent(self, state, **kwargs):
+            self.calls.append(("call_agent", state, kwargs))
+            raise RuntimeError("agent boom")
+
+    async def scenario():
+        discard_release = asyncio.Event()
+        proxy = ContextProxy(discard_release=discard_release)
+        monkeypatch.setattr(generate_runtime, "_PADDOCK", FailingCallPaddock())
+        monkeypatch.setattr(generate_runtime, "_PROXY_CLIENT", proxy)
+
+        async def completed_write_error(*args, **kwargs):
+            return None
+
+        monkeypatch.setattr(
+            blackbox_dispatch._ARTIFACT_WRITER,
+            "write_error",
+            completed_write_error,
+        )
+
+        task = asyncio.create_task(
+            blackbox_dispatch.generate(_rollout_args(), SampleLike(), {})
+        )
+        await asyncio.wait_for(proxy.discard_started.wait(), timeout=0.5)
+        task.cancel("cleanup-first")
+        await asyncio.sleep(0)
+        assert not task.done()
+        discard_release.set()
+
+        with pytest.raises(asyncio.CancelledError) as cancelled:
+            await task
+        assert cancelled.value.args == ("cleanup-first",)
+        assert not proxy.active_contexts
+
+    asyncio.run(scenario())
 
 
 def test_blackbox_dispatch_prefixes_generated_session_id(monkeypatch):
